@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -50,6 +52,10 @@ type Store struct {
 	Now  func() time.Time
 }
 
+var ErrCorrupt = errors.New("registry file is corrupt")
+
+var processLocks sync.Map
+
 func New(path string) *Store {
 	return &Store{Path: path, Now: time.Now}
 }
@@ -71,6 +77,16 @@ func (s *Store) Load() (File, error) {
 	if s.Path == "" {
 		return File{}, errors.New("registry path is required")
 	}
+	var file File
+	err := s.withLock(func() error {
+		loaded, err := s.loadUnlocked()
+		file = loaded
+		return err
+	})
+	return file, err
+}
+
+func (s *Store) loadUnlocked() (File, error) {
 	data, err := os.ReadFile(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
 		return File{SchemaVersion: SchemaVersion}, nil
@@ -80,7 +96,7 @@ func (s *Store) Load() (File, error) {
 	}
 	var file File
 	if err := json.Unmarshal(data, &file); err != nil {
-		return File{}, err
+		return File{}, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
 	if file.SchemaVersion == 0 {
 		file.SchemaVersion = SchemaVersion
@@ -96,17 +112,16 @@ func (s *Store) Save(file File) error {
 	if s.Path == "" {
 		return errors.New("registry path is required")
 	}
+	return s.withLock(func() error {
+		return s.saveUnlocked(file)
+	})
+}
+
+func (s *Store) saveUnlocked(file File) error {
 	file.SchemaVersion = SchemaVersion
 	sortEntries(file.Entries)
 
 	dir := filepath.Dir(s.Path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
-
 	tmp, err := os.CreateTemp(dir, ".registry-*.tmp")
 	if err != nil {
 		return err
@@ -124,13 +139,20 @@ func (s *Store) Save(file File) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, s.Path); err != nil {
 		return err
 	}
-	return os.Chmod(s.Path, 0o600)
+	if err := os.Chmod(s.Path, 0o600); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func (s *Store) Upsert(entry Entry) (Entry, error) {
@@ -157,54 +179,62 @@ func (s *Store) Upsert(entry Entry) (Entry, error) {
 		entry.LastAttach = now
 	}
 
-	file, err := s.Load()
-	if err != nil {
-		return Entry{}, err
-	}
-	replaced := false
-	for i := range file.Entries {
-		if file.Entries[i].ID == entry.ID {
-			file.Entries[i] = entry
-			replaced = true
-			break
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
 		}
-	}
-	if !replaced {
-		file.Entries = append(file.Entries, entry)
-	}
-	return entry, s.Save(file)
+		replaced := false
+		for i := range file.Entries {
+			if file.Entries[i].ID == entry.ID {
+				file.Entries[i] = entry
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			file.Entries = append(file.Entries, entry)
+		}
+		return s.saveUnlocked(file)
+	})
+	return entry, err
 }
 
 func (s *Store) UpdateEntry(entry Entry) error {
-	file, err := s.Load()
-	if err != nil {
-		return err
-	}
-	for i := range file.Entries {
-		if file.Entries[i].ID == entry.ID {
-			file.Entries[i] = entry
-			return s.Save(file)
+	return s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
 		}
-	}
-	return fmt.Errorf("registry entry %q not found", entry.ID)
+		for i := range file.Entries {
+			if file.Entries[i].ID == entry.ID {
+				file.Entries[i] = entry
+				return s.saveUnlocked(file)
+			}
+		}
+		return fmt.Errorf("registry entry %q not found", entry.ID)
+	})
 }
 
 func (s *Store) Forget(id string) (bool, error) {
-	file, err := s.Load()
-	if err != nil {
-		return false, err
-	}
-	next := file.Entries[:0]
 	removed := false
-	for _, entry := range file.Entries {
-		if entry.ID == id {
-			removed = true
-			continue
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
 		}
-		next = append(next, entry)
-	}
-	file.Entries = next
-	return removed, s.Save(file)
+		next := file.Entries[:0]
+		for _, entry := range file.Entries {
+			if entry.ID == id {
+				removed = true
+				continue
+			}
+			next = append(next, entry)
+		}
+		file.Entries = next
+		return s.saveUnlocked(file)
+	})
+	return removed, err
 }
 
 func (s *Store) now() time.Time {
@@ -218,4 +248,50 @@ func sortEntries(entries []Entry) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].ID < entries[j].ID
 	})
+}
+
+func (s *Store) withLock(fn func() error) error {
+	if s.Path == "" {
+		return errors.New("registry path is required")
+	}
+	path, err := filepath.Abs(s.Path)
+	if err != nil {
+		return err
+	}
+	mutexValue, _ := processLocks.LoadOrStore(path, &sync.Mutex{})
+	mutex := mutexValue.(*sync.Mutex)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	dir := filepath.Dir(s.Path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+
+	lock, err := os.OpenFile(s.Path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := lock.Chmod(0o600); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	return fn()
+}
+
+func syncDir(dir string) error {
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
 }

@@ -113,7 +113,9 @@ func TestUnverifiedRepairBacksOffWithoutStart(t *testing.T) {
 		err:    errors.New("exit status 1"),
 	}}}
 
-	updated, result := testReconciler(wake, probeAdapter{}, now).Reconcile(context.Background(), testEntry())
+	reconciler := testReconciler(wake, probeAdapter{}, now)
+	reconciler.Jitter = func(delay time.Duration) time.Duration { return delay + delay/10 }
+	updated, result := reconciler.Reconcile(context.Background(), testEntry())
 
 	if result.Action != ActionBackoff {
 		t.Fatalf("action = %q, want %q", result.Action, ActionBackoff)
@@ -129,6 +131,9 @@ func TestUnverifiedRepairBacksOffWithoutStart(t *testing.T) {
 	}
 	if !updated.BackoffUntil.After(now) {
 		t.Fatalf("BackoffUntil = %v, want after %v", updated.BackoffUntil, now)
+	}
+	if got, want := updated.BackoffUntil.Sub(now), 1100*time.Millisecond; got != want {
+		t.Fatalf("BackoffUntil-now = %v, want %v", got, want)
 	}
 }
 
@@ -182,12 +187,34 @@ func TestIdempotenceNoDuplicateStart(t *testing.T) {
 	}
 }
 
+func TestNilWakeBackoffDoesNotReportAMQTouched(t *testing.T) {
+	now := fixedNow()
+
+	updated, result := Reconciler{
+		Adapter:     probeAdapter{},
+		Now:         func() time.Time { return now },
+		BackoffBase: time.Second,
+		Jitter:      func(delay time.Duration) time.Duration { return delay },
+	}.Reconcile(context.Background(), testEntry())
+
+	if result.Action != ActionBackoff {
+		t.Fatalf("action = %q, want %q", result.Action, ActionBackoff)
+	}
+	if result.AMQTouched {
+		t.Fatal("AMQTouched = true, want false")
+	}
+	if updated.State != registry.StateAttached {
+		t.Fatalf("state = %q, want %q", updated.State, registry.StateAttached)
+	}
+}
+
 func testReconciler(wake *fakeWake, adapter probeAdapter, now time.Time) Reconciler {
 	return Reconciler{
 		Wake:        wake,
 		Adapter:     adapter,
 		Now:         func() time.Time { return now },
 		BackoffBase: time.Second,
+		Jitter:      func(delay time.Duration) time.Duration { return delay },
 		InjectVia:   "/bin/amq-keepalive",
 	}
 }

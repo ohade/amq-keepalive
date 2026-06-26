@@ -1,8 +1,10 @@
 package registry
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -88,5 +90,49 @@ func TestStoreForget(t *testing.T) {
 	}
 	if len(loaded.Entries) != 0 {
 		t.Fatalf("entries = %d, want 0", len(loaded.Entries))
+	}
+}
+
+func TestStoreConcurrentUpsertsDoNotLoseEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	store := New(path)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := store.Upsert(Entry{
+				Root:    "/tmp/amq-root",
+				Agent:   "codex",
+				Adapter: "file",
+				Target:  filepath.Join("/tmp", "inbox", string(rune('a'+i))),
+			})
+			if err != nil {
+				t.Errorf("Upsert(%d) error = %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Entries) != 20 {
+		t.Fatalf("entries = %d, want 20", len(loaded.Entries))
+	}
+}
+
+func TestStoreCorruptRegistryReturnsTypedError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	store := New(path)
+
+	_, err := store.Load()
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Load() error = %v, want ErrCorrupt", err)
 	}
 }

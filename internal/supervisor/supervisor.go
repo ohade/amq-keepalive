@@ -2,8 +2,10 @@ package supervisor
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -35,6 +37,7 @@ type Reconciler struct {
 	Now         func() time.Time
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	Jitter      func(time.Duration) time.Duration
 	InjectVia   string
 }
 
@@ -55,7 +58,7 @@ func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (regist
 	}
 
 	if r.Adapter == nil {
-		return r.markBackoff(entry, now, errors.New("adapter is not configured"), ActionBackoff)
+		return r.markBackoff(entry, now, errors.New("adapter is not configured"), ActionBackoff, false)
 	}
 	if err := r.Adapter.Probe(ctx, entry.Target); err != nil {
 		entry.State = registry.StateDetached
@@ -65,7 +68,7 @@ func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (regist
 	}
 
 	if r.Wake == nil {
-		return r.markBackoff(entry, now, errors.New("amq runner is not configured"), ActionBackoff)
+		return r.markBackoff(entry, now, errors.New("amq runner is not configured"), ActionBackoff, false)
 	}
 
 	repair, repairErr := r.Wake.RepairWake(ctx, entry.Root, entry.Agent)
@@ -79,17 +82,17 @@ func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (regist
 		if isMissingWakeTarget(repair, repairErr) {
 			return r.startWake(ctx, entry, now)
 		}
-		return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff)
+		return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff, true)
 	case "error", "":
 		if isMissingWakeTarget(repair, repairErr) {
 			return r.startWake(ctx, entry, now)
 		}
-		return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff)
+		return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff, true)
 	default:
 		if repairErr != nil {
-			return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff)
+			return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff, true)
 		}
-		return r.markBackoff(entry, now, fmt.Errorf("unrecognized amq wake repair status %q", repair.Status), ActionBackoff)
+		return r.markBackoff(entry, now, fmt.Errorf("unrecognized amq wake repair status %q", repair.Status), ActionBackoff, true)
 	}
 }
 
@@ -104,10 +107,10 @@ func (r Reconciler) startWake(ctx context.Context, entry registry.Entry, now tim
 	if err == nil || errors.Is(err, amq.ErrAlreadyRunning) {
 		return markActive(entry, now, ActionStarted), Result{Action: ActionStarted, Started: true, AMQTouched: true}
 	}
-	return r.markBackoff(entry, now, err, ActionStartFailed)
+	return r.markBackoff(entry, now, err, ActionStartFailed, true)
 }
 
-func (r Reconciler) markBackoff(entry registry.Entry, now time.Time, err error, action string) (registry.Entry, Result) {
+func (r Reconciler) markBackoff(entry registry.Entry, now time.Time, err error, action string, amqTouched bool) (registry.Entry, Result) {
 	entry.State = registry.StateAttached
 	entry.FailureCount++
 	entry.BackoffUntil = now.Add(r.backoff(entry.FailureCount))
@@ -115,7 +118,7 @@ func (r Reconciler) markBackoff(entry registry.Entry, now time.Time, err error, 
 	if err != nil {
 		entry.LastError = err.Error()
 	}
-	return entry, Result{Action: action, AMQTouched: action != ActionDetached, Error: err}
+	return entry, Result{Action: action, AMQTouched: amqTouched, Error: err}
 }
 
 func markActive(entry registry.Entry, now time.Time, action string) registry.Entry {
@@ -157,7 +160,40 @@ func (r Reconciler) backoff(failureCount int) time.Duration {
 	if delay > maxDelay {
 		return maxDelay
 	}
-	return delay
+	return r.jitter(delay, maxDelay)
+}
+
+func (r Reconciler) jitter(delay time.Duration, maxDelay time.Duration) time.Duration {
+	if r.Jitter != nil {
+		jittered := r.Jitter(delay)
+		if jittered < 0 {
+			return 0
+		}
+		if jittered > maxDelay {
+			return maxDelay
+		}
+		return jittered
+	}
+	if delay <= 0 {
+		return delay
+	}
+	window := delay / 5
+	if window <= 0 {
+		return delay
+	}
+	span := int64(window*2) + 1
+	offset, err := rand.Int(rand.Reader, big.NewInt(span))
+	if err != nil {
+		return delay
+	}
+	jittered := delay - window + time.Duration(offset.Int64())
+	if jittered < 0 {
+		return 0
+	}
+	if jittered > maxDelay {
+		return maxDelay
+	}
+	return jittered
 }
 
 func isMissingWakeTarget(result amq.WakeRepairResult, err error) bool {
