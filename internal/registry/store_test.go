@@ -1,0 +1,92 @@
+package registry
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestStoreUpsertRoundTripAndPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".amq-keepalive", "registry.json")
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	store := New(path)
+	store.Now = func() time.Time { return now }
+
+	entry, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "file",
+		Target:  "/tmp/inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	if entry.ID == "" {
+		t.Fatal("entry ID is empty")
+	}
+	if entry.State != StateAttached {
+		t.Fatalf("state = %q, want %q", entry.State, StateAttached)
+	}
+	if !entry.LastAttach.Equal(now) {
+		t.Fatalf("LastAttach = %v, want %v", entry.LastAttach, now)
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.SchemaVersion != SchemaVersion {
+		t.Fatalf("schema = %d, want %d", loaded.SchemaVersion, SchemaVersion)
+	}
+	if len(loaded.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(loaded.Entries))
+	}
+	if loaded.Entries[0].ID != entry.ID {
+		t.Fatalf("loaded ID = %q, want %q", loaded.Entries[0].ID, entry.ID)
+	}
+
+	dirInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("dir mode = %v, want 0700", got)
+	}
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat registry: %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("file mode = %v, want 0600", got)
+	}
+}
+
+func TestStoreForget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	store := New(path)
+	entry, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "file",
+		Target:  "/tmp/inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	removed, err := store.Forget(entry.ID)
+	if err != nil {
+		t.Fatalf("Forget() error = %v", err)
+	}
+	if !removed {
+		t.Fatal("Forget() removed = false, want true")
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Entries) != 0 {
+		t.Fatalf("entries = %d, want 0", len(loaded.Entries))
+	}
+}
