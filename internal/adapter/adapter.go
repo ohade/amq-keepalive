@@ -11,6 +11,10 @@ type Adapter interface {
 	Inject(ctx context.Context, target string, payload string) error
 }
 
+type Discoverer interface {
+	Discover(ctx context.Context) (string, error)
+}
+
 type Registry struct {
 	adapters map[string]Adapter
 }
@@ -24,7 +28,7 @@ func NewRegistry(adapters ...Adapter) Registry {
 }
 
 func DefaultRegistry() Registry {
-	return NewRegistry(File{})
+	return NewRegistry(File{}, Ghostty{})
 }
 
 func (r Registry) Get(name string) (Adapter, error) {

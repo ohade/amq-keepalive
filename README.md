@@ -17,9 +17,17 @@ observed and repaired only through `amq wake repair`, `amq wake`, and
 
 ## Current Scope
 
-M0 proves the registry and supervisor contract. It does not install launchd jobs
-and does not include a Ghostty/macOS terminal adapter yet. `install-launchd` and
-`uninstall` are present as explicit M1 placeholders.
+The implemented surface now includes the M0 registry/supervisor proof and the
+first M1 macOS pieces:
+
+- `ghostty` adapter using macOS Accessibility/System Events;
+- `install-launchd` / `uninstall` for a user LaunchAgent supervisor.
+
+The Ghostty adapter targets an existing Ghostty window by title. `attach
+--adapter ghostty` can discover the focused Ghostty window title when `--target`
+is omitted. Injection activates Ghostty, raises the matching window, pastes the
+AMQ payload, and presses Return. This requires macOS Accessibility permission for
+the built binary or the terminal app running it.
 
 ## Example
 
@@ -36,6 +44,32 @@ go build ./cmd/amq-keepalive
 ./amq-keepalive doctor
 ```
 
+Ghostty attach:
+
+```sh
+./amq-keepalive attach --adapter ghostty
+```
+
+LaunchAgent install:
+
+```sh
+./amq-keepalive install-launchd
+```
+
+For a dry plist write without loading the service:
+
+```sh
+./amq-keepalive install-launchd --no-load --plist /tmp/com.ohade.amq-keepalive.plist
+```
+
 For AMQ wake integration, `supervise` starts AMQ with this binary as the
 `--inject-via` executable. AMQ appends the message payload as the final argument,
 and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
+
+## Boundaries
+
+- The tool does not parse AMQ mailbox, lock, presence, or target files.
+- The tool does not launch or resurrect terminal sessions.
+- If a registered Ghostty window cannot be found, the entry is marked detached
+  until the user runs `attach` again.
+- `install-launchd` installs only a per-user LaunchAgent for this supervisor.

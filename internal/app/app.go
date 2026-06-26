@@ -12,6 +12,7 @@ import (
 
 	"github.com/ohade/amq-keepalive/internal/adapter"
 	"github.com/ohade/amq-keepalive/internal/amq"
+	"github.com/ohade/amq-keepalive/internal/launchd"
 	"github.com/ohade/amq-keepalive/internal/registry"
 	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
@@ -45,9 +46,10 @@ func (a App) Run(ctx context.Context, args []string) int {
 		err = a.doctor(args[1:])
 	case "forget":
 		err = a.forget(args[1:])
-	case "install-launchd", "uninstall":
-		fmt.Fprintf(a.Stderr, "%s is planned for M1; M0 does not install machine services\n", args[0])
-		return 3
+	case "install-launchd":
+		err = a.installLaunchd(ctx, args[1:])
+	case "uninstall":
+		err = a.uninstallLaunchd(ctx, args[1:])
 	default:
 		fmt.Fprintf(a.Stderr, "unknown command %q\n", args[0])
 		a.usage()
@@ -76,10 +78,6 @@ func (a App) attach(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *target == "" {
-		return errors.New("--target is required")
-	}
-
 	envCLI := amq.NewCLI(*amqPath)
 	if *root == "" || *me == "" || *baseRoot == "" || *sessionName == "" {
 		env, err := envCLI.Env(ctx)
@@ -104,6 +102,17 @@ func (a App) attach(ctx context.Context, args []string) error {
 	selected, err := adapters.Get(*adapterName)
 	if err != nil {
 		return err
+	}
+	if *target == "" {
+		discoverer, ok := selected.(adapter.Discoverer)
+		if !ok {
+			return errors.New("--target is required")
+		}
+		discovered, err := discoverer.Discover(ctx)
+		if err != nil {
+			return err
+		}
+		*target = discovered
 	}
 	if err := selected.Probe(ctx, *target); err != nil {
 		return err
@@ -250,6 +259,58 @@ func (a App) forget(args []string) error {
 		return err
 	}
 	return printJSON(a.Stdout, map[string]any{"removed": removed})
+}
+
+func (a App) installLaunchd(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("install-launchd", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	label := fs.String("label", launchd.DefaultLabel, "launchd label")
+	plistPath := fs.String("plist", "", "plist path")
+	registryPath := fs.String("registry", mustDefaultRegistryPath(), "registry file path")
+	amqPath := fs.String("amq", "amq", "amq executable path")
+	self := fs.String("self", executablePath(), "amq-keepalive executable path")
+	interval := fs.Duration("interval", 10*time.Second, "supervisor interval")
+	noLoad := fs.Bool("no-load", false, "write plist without loading it")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	opts := launchd.Options{
+		Label:        *label,
+		PlistPath:    *plistPath,
+		BinaryPath:   *self,
+		RegistryPath: *registryPath,
+		AMQPath:      *amqPath,
+		Interval:     *interval,
+		Load:         !*noLoad,
+	}
+	normalized, err := launchd.NormalizeOptions(opts)
+	if err != nil {
+		return err
+	}
+	if err := launchd.Install(ctx, normalized); err != nil {
+		return err
+	}
+	return printJSON(a.Stdout, map[string]any{
+		"label":      normalized.Label,
+		"plist":      normalized.PlistPath,
+		"loaded":     normalized.Load,
+		"supervisor": normalized.BinaryPath,
+	})
+}
+
+func (a App) uninstallLaunchd(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	label := fs.String("label", launchd.DefaultLabel, "launchd label")
+	plistPath := fs.String("plist", "", "plist path")
+	noUnload := fs.Bool("no-unload", false, "remove plist without bootout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := launchd.Uninstall(ctx, *label, *plistPath, !*noUnload); err != nil {
+		return err
+	}
+	return printJSON(a.Stdout, map[string]any{"label": *label, "removed": true, "unloaded": !*noUnload})
 }
 
 func (a App) usage() {
