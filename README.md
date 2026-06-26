@@ -25,9 +25,10 @@ first M1 macOS pieces:
 
 The Ghostty adapter targets an existing Ghostty window by title. `attach
 --adapter ghostty` can discover the focused Ghostty window title when `--target`
-is omitted. Injection activates Ghostty, raises the matching window, pastes the
-AMQ payload, and presses Return. This requires macOS Accessibility permission for
-the built binary or the terminal app running it.
+is omitted. Probe and inject fail closed unless that title matches exactly one
+Ghostty window. Injection activates Ghostty, raises the matching window, pastes
+the AMQ payload, and presses Return. This requires macOS Accessibility
+permission for the built binary or the terminal app running it.
 
 ## Example
 
@@ -70,6 +71,12 @@ and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
 
 - The tool does not parse AMQ mailbox, lock, presence, or target files.
 - The tool does not launch or resurrect terminal sessions.
-- If a registered Ghostty window cannot be found, the entry is marked detached
-  until the user runs `attach` again.
+- If a registered Ghostty window cannot be found, or if the title is ambiguous,
+  the entry is marked detached until the user runs `attach` again.
+- Title-based Ghostty targeting is the M1 compatibility path. A future adapter
+  should prefer a durable unique Ghostty terminal identifier or a tool-controlled
+  unique title marker if Ghostty does not expose suitable IPC.
+- Ghostty injection uses the macOS clipboard briefly for paste delivery. The
+  previous clipboard value is restored, but a user copy during that short window
+  can still be overwritten.
 - `install-launchd` installs only a per-user LaunchAgent for this supervisor.

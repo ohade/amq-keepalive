@@ -113,12 +113,15 @@ on run argv
 		if not (exists process "Ghostty") then error "Ghostty is not running"
 		tell process "Ghostty"
 			if (count of windows) is 0 then error "Ghostty has no windows"
+			set matchCount to 0
 			repeat with candidateWindow in windows
-				if name of candidateWindow is targetTitle then return "ok"
+				if name of candidateWindow is targetTitle then set matchCount to matchCount + 1
 			end repeat
+			if matchCount is 1 then return "ok"
+			if matchCount is 0 then error "no unique Ghostty target: no window titled: " & targetTitle
+			error "ambiguous Ghostty target: " & matchCount & " windows titled: " & targetTitle
 		end tell
 	end tell
-	error "Ghostty window not found: " & targetTitle
 end run
 `
 
@@ -127,6 +130,18 @@ on run argv
 	set targetTitle to item 1 of argv
 	set payload to item 2 of argv
 	set oldClipboard to missing value
+	tell application "System Events"
+		if not (exists process "Ghostty") then error "Ghostty is not running"
+		tell process "Ghostty"
+			if (count of windows) is 0 then error "Ghostty has no windows"
+			set matchCount to 0
+			repeat with candidateWindow in windows
+				if name of candidateWindow is targetTitle then set matchCount to matchCount + 1
+			end repeat
+			if matchCount is 0 then error "no unique Ghostty target: no window titled: " & targetTitle
+			if matchCount is greater than 1 then error "ambiguous Ghostty target: " & matchCount & " windows titled: " & targetTitle
+		end tell
+	end tell
 	try
 		set oldClipboard to the clipboard
 	end try
@@ -139,13 +154,15 @@ on run argv
 			tell process "Ghostty"
 				set frontmost to true
 				set targetWindow to missing value
+				set matchCount to 0
 				repeat with candidateWindow in windows
 					if name of candidateWindow is targetTitle then
+						set matchCount to matchCount + 1
 						set targetWindow to candidateWindow
-						exit repeat
 					end if
 				end repeat
-				if targetWindow is missing value then error "Ghostty window not found: " & targetTitle
+				if matchCount is 0 then error "no unique Ghostty target: no window titled: " & targetTitle
+				if matchCount is greater than 1 then error "ambiguous Ghostty target: " & matchCount & " windows titled: " & targetTitle
 				perform action "AXRaise" of targetWindow
 			end tell
 			delay 0.05

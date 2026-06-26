@@ -70,6 +70,29 @@ func TestGhosttyInjectPassesTargetAndPayloadAsArguments(t *testing.T) {
 	if !strings.Contains(call.args[1], "the clipboard") {
 		t.Fatalf("script does not appear to use clipboard paste: %q", call.args[1])
 	}
+	if !strings.Contains(call.args[1], "ambiguous Ghostty target") {
+		t.Fatalf("script does not fail closed on ambiguity: %q", call.args[1])
+	}
+	if strings.Contains(call.args[1], "exit repeat") {
+		t.Fatalf("script still exits on first matching title: %q", call.args[1])
+	}
+}
+
+func TestGhosttyScriptsFailClosedOnAmbiguousTitles(t *testing.T) {
+	for name, script := range map[string]string{
+		"probe":  ghosttyProbeScript,
+		"inject": ghosttyInjectScript,
+	} {
+		if !strings.Contains(script, "matchCount") {
+			t.Fatalf("%s script does not count matching windows", name)
+		}
+		if !strings.Contains(script, "no unique Ghostty target") {
+			t.Fatalf("%s script does not fail on missing target", name)
+		}
+		if !strings.Contains(script, "ambiguous Ghostty target") {
+			t.Fatalf("%s script does not fail on duplicate target", name)
+		}
+	}
 }
 
 func TestGhosttyErrorsIncludeCommandOutput(t *testing.T) {
