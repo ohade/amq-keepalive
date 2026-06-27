@@ -20,15 +20,18 @@ observed and repaired only through `amq wake repair`, `amq wake`, and
 The implemented surface now includes the M0 registry/supervisor proof and the
 first M1 macOS pieces:
 
-- `ghostty` adapter using macOS Accessibility/System Events;
+- `ghostty` adapter using Ghostty's native macOS AppleScript interface;
 - `install-launchd` / `uninstall` for a user LaunchAgent supervisor.
 
-The Ghostty adapter targets an existing Ghostty window by title. `attach
---adapter ghostty` can discover the focused Ghostty window title when `--target`
-is omitted. Probe and inject fail closed unless that title matches exactly one
-Ghostty window. Injection activates Ghostty, raises the matching window, pastes
-the AMQ payload, and presses Return. This requires macOS Accessibility
-permission for the built binary or the terminal app running it.
+The Ghostty adapter target contract is `ghostty:terminal:<id>`. `attach
+--adapter ghostty` discovers the focused terminal in the selected tab of the
+front Ghostty window when `--target` is omitted. Probe and inject fail closed
+unless that id resolves to exactly one Ghostty terminal. Injection uses Ghostty's
+native `input text` and `send key "enter"` AppleScript commands; it does not use
+window titles, System Events, focus stealing, or the clipboard.
+
+Old title targets are intentionally rejected. Re-run `attach --adapter ghostty`
+to register a terminal-id target.
 
 ## Example
 
@@ -71,12 +74,13 @@ and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
 
 - The tool does not parse AMQ mailbox, lock, presence, or target files.
 - The tool does not launch or resurrect terminal sessions.
-- If a registered Ghostty window cannot be found, or if the title is ambiguous,
-  the entry is marked detached until the user runs `attach` again.
-- Title-based Ghostty targeting is the M1 compatibility path. A future adapter
-  should prefer a durable unique Ghostty terminal identifier or a tool-controlled
-  unique title marker if Ghostty does not expose suitable IPC.
-- Ghostty injection uses the macOS clipboard briefly for paste delivery. The
-  previous clipboard value is restored, but a user copy during that short window
-  can still be overwritten.
+- Adapter targets should use an explicit scheme shape:
+  `<adapter>:<scheme>:<value>`. The M1.5 Ghostty scheme is
+  `ghostty:terminal:<id>`.
+- If a registered Ghostty terminal id cannot be found, the entry is marked
+  `detached` until the user runs `attach --adapter ghostty` again.
+- Ghostty terminal-id persistence across full Ghostty quit/relaunch and machine
+  reboot has not been proven in this non-destructive test pass. Treat a missing
+  id after restart as an expected stale-target condition: `doctor` will show the
+  detached entry and last error, and reattach creates a fresh terminal-id entry.
 - `install-launchd` installs only a per-user LaunchAgent for this supervisor.

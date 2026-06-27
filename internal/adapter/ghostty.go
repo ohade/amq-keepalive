@@ -23,6 +23,8 @@ type Ghostty struct {
 	Runner CommandRunner
 }
 
+const ghosttyTerminalTargetPrefix = "ghostty:terminal:"
+
 func (Ghostty) Name() string {
 	return "ghostty"
 }
@@ -33,24 +35,24 @@ func (g Ghostty) Discover(ctx context.Context) (string, error) {
 	}
 	out, err := g.runner().Run(ctx, "osascript", "-e", ghosttyDiscoverScript)
 	if err != nil {
-		return "", fmt.Errorf("discover Ghostty window: %w: %s", err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("discover Ghostty terminal: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	target := strings.TrimSpace(string(out))
-	if target == "" {
-		return "", errors.New("discover Ghostty window: empty window title")
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		return "", errors.New("discover Ghostty terminal: empty terminal id")
 	}
-	return target, nil
+	return ghosttyTerminalTargetPrefix + id, nil
 }
 
 func (g Ghostty) Probe(ctx context.Context, target string) error {
 	if err := requireDarwin(); err != nil {
 		return err
 	}
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return errors.New("ghostty adapter target is required")
+	id, err := parseGhosttyTerminalTarget(target)
+	if err != nil {
+		return err
 	}
-	out, err := g.runner().Run(ctx, "osascript", "-e", ghosttyProbeScript, target)
+	out, err := g.runner().Run(ctx, "osascript", "-e", ghosttyProbeScript, id)
 	if err != nil {
 		return fmt.Errorf("probe Ghostty target %q: %w: %s", target, err, strings.TrimSpace(string(out)))
 	}
@@ -61,11 +63,11 @@ func (g Ghostty) Inject(ctx context.Context, target string, payload string) erro
 	if err := requireDarwin(); err != nil {
 		return err
 	}
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return errors.New("ghostty adapter target is required")
+	id, err := parseGhosttyTerminalTarget(target)
+	if err != nil {
+		return err
 	}
-	out, err := g.runner().Run(ctx, "osascript", "-e", ghosttyInjectScript, target, payload)
+	out, err := g.runner().Run(ctx, "osascript", "-e", ghosttyInjectScript, id, payload)
 	if err != nil {
 		return fmt.Errorf("inject into Ghostty target %q: %w: %s", target, err, strings.TrimSpace(string(out)))
 	}
@@ -86,94 +88,54 @@ func requireDarwin() error {
 	return nil
 }
 
+func parseGhosttyTerminalTarget(target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", errors.New("ghostty adapter target is required")
+	}
+	id, ok := strings.CutPrefix(target, ghosttyTerminalTargetPrefix)
+	if !ok {
+		return "", fmt.Errorf("unsupported Ghostty target %q; reattach required: run attach --adapter ghostty to register a terminal-id target", target)
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", errors.New("ghostty terminal target is missing an id")
+	}
+	return id, nil
+}
+
 const ghosttyDiscoverScript = `
-tell application "System Events"
-	if not (exists process "Ghostty") then error "Ghostty is not running"
-	tell process "Ghostty"
-		if (count of windows) is 0 then error "Ghostty has no windows"
-		set targetWindow to missing value
-		repeat with candidateWindow in windows
-			try
-				if focused of candidateWindow is true then
-					set targetWindow to candidateWindow
-					exit repeat
-				end if
-			end try
-		end repeat
-		if targetWindow is missing value then set targetWindow to window 1
-		return name of targetWindow
-	end tell
+tell application "Ghostty"
+	if (count of terminals) is 0 then error "Ghostty has no terminals"
+	return id of focused terminal of selected tab of front window
 end tell
 `
 
 const ghosttyProbeScript = `
 on run argv
-	set targetTitle to item 1 of argv
-	tell application "System Events"
-		if not (exists process "Ghostty") then error "Ghostty is not running"
-		tell process "Ghostty"
-			if (count of windows) is 0 then error "Ghostty has no windows"
-			set matchCount to 0
-			repeat with candidateWindow in windows
-				if name of candidateWindow is targetTitle then set matchCount to matchCount + 1
-			end repeat
-			if matchCount is 1 then return "ok"
-			if matchCount is 0 then error "no unique Ghostty target: no window titled: " & targetTitle
-			error "ambiguous Ghostty target: " & matchCount & " windows titled: " & targetTitle
-		end tell
+	set targetID to item 1 of argv
+	tell application "Ghostty"
+		set matches to terminals whose id is targetID
+		set matchCount to count of matches
+		if matchCount is 1 then return "ok"
+		if matchCount is 0 then error "no Ghostty terminal with id: " & targetID
+		error "ambiguous Ghostty terminal id: " & targetID
 	end tell
 end run
 `
 
 const ghosttyInjectScript = `
 on run argv
-	set targetTitle to item 1 of argv
+	set targetID to item 1 of argv
 	set payload to item 2 of argv
-	set oldClipboard to missing value
-	tell application "System Events"
-		if not (exists process "Ghostty") then error "Ghostty is not running"
-		tell process "Ghostty"
-			if (count of windows) is 0 then error "Ghostty has no windows"
-			set matchCount to 0
-			repeat with candidateWindow in windows
-				if name of candidateWindow is targetTitle then set matchCount to matchCount + 1
-			end repeat
-			if matchCount is 0 then error "no unique Ghostty target: no window titled: " & targetTitle
-			if matchCount is greater than 1 then error "ambiguous Ghostty target: " & matchCount & " windows titled: " & targetTitle
-		end tell
+	tell application "Ghostty"
+		set matches to terminals whose id is targetID
+		set matchCount to count of matches
+		if matchCount is 0 then error "no Ghostty terminal with id: " & targetID
+		if matchCount is greater than 1 then error "ambiguous Ghostty terminal id: " & targetID
+		set targetTerminal to item 1 of matches
+		input text payload to targetTerminal
+		send key "enter" to targetTerminal
 	end tell
-	try
-		set oldClipboard to the clipboard
-	end try
-	set the clipboard to payload
-	try
-		tell application "Ghostty" to activate
-		delay 0.05
-		tell application "System Events"
-			if not (exists process "Ghostty") then error "Ghostty is not running"
-			tell process "Ghostty"
-				set frontmost to true
-				set targetWindow to missing value
-				set matchCount to 0
-				repeat with candidateWindow in windows
-					if name of candidateWindow is targetTitle then
-						set matchCount to matchCount + 1
-						set targetWindow to candidateWindow
-					end if
-				end repeat
-				if matchCount is 0 then error "no unique Ghostty target: no window titled: " & targetTitle
-				if matchCount is greater than 1 then error "ambiguous Ghostty target: " & matchCount & " windows titled: " & targetTitle
-				perform action "AXRaise" of targetWindow
-			end tell
-			delay 0.05
-			keystroke "v" using command down
-			delay 0.03
-			key code 36
-		end tell
-	on error errMsg number errNum
-		if oldClipboard is not missing value then set the clipboard to oldClipboard
-		error errMsg number errNum
-	end try
-	if oldClipboard is not missing value then set the clipboard to oldClipboard
 end run
 `
