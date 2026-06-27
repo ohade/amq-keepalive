@@ -22,7 +22,9 @@ The implemented surface now includes the M0 registry/supervisor proof and the
 first M1 macOS pieces:
 
 - `ghostty` adapter using Ghostty's native macOS AppleScript interface;
-- `install-launchd` / `uninstall` for a user LaunchAgent supervisor.
+- `install-launchd` / `uninstall` for a user LaunchAgent supervisor;
+- `install-hook` for registering the SessionStart reattach hook in Claude Code
+  and/or Codex.
 
 The Ghostty adapter target contract is `ghostty:terminal:<id>`. `attach
 --adapter ghostty` discovers the focused terminal in the selected tab of the
@@ -68,22 +70,52 @@ reporting success, so a refused or already-running wake is not silently accepted
 This keeps the registry from accumulating stale terminal ids after a session is
 recreated.
 
-Claude Code SessionStart hook snippet:
+Supported hook install:
+
+```sh
+./amq-keepalive install-hook --agent both
+```
+
+`install-hook` writes an executable wrapper to
+`~/.amq-keepalive/hooks/amq-keepalive-session-start.sh`, backs up existing
+config files before changing them, and appends a SessionStart registration to
+Claude Code's `~/.claude/settings.json` and/or Codex's `~/.codex/hooks.json`.
+It is idempotent: running it again does not duplicate the hook. Use
+`--agent claude` or `--agent codex` to target only one agent, and `--dry-run` to
+print the exact snippets without writing files.
+
+The wrapper bounds the actual `reattach` work with
+`AMQ_KEEPALIVE_TIMEOUT_SECONDS` (default: 10). If Ghostty discovery, probing, or
+AMQ wake startup hangs, the hook logs the timeout and still returns `{}` so
+agent startup continues.
+
+Manual Claude Code SessionStart hook snippet:
 
 ```json
 {
-  "type": "command",
-  "command": "/path/to/amq-keepalive/hooks/amq-keepalive-session-start.sh"
+  "matcher": "*",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' '/absolute/path/to/amq-keepalive-session-start.sh'",
+      "timeout": 15,
+      "statusMessage": "Reattaching AMQ wake..."
+    }
+  ]
 }
 ```
 
-Codex SessionStart hook snippet:
+Manual Codex SessionStart hook snippet:
 
 ```json
 {
-  "command": "/path/to/amq-keepalive/hooks/amq-keepalive-session-start.sh",
-  "timeout": 5000,
-  "type": "command"
+  "hooks": [
+    {
+      "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' '/absolute/path/to/amq-keepalive-session-start.sh'",
+      "timeout": 15000,
+      "type": "command"
+    }
+  ]
 }
 ```
 
@@ -91,10 +123,11 @@ Set `AMQ_KEEPALIVE_BIN=/absolute/path/to/amq-keepalive` if the binary is not on
 `PATH`. The hook also supports `AMQ_KEEPALIVE_ADAPTER`, `AMQ_KEEPALIVE_TARGET`,
 `AMQ_KEEPALIVE_REGISTRY`, `AMQ_KEEPALIVE_AMQ`, `AMQ_KEEPALIVE_SELF`,
 `AMQ_KEEPALIVE_ROOT`, `AMQ_KEEPALIVE_BASE_ROOT`, `AMQ_KEEPALIVE_SESSION`,
-`AMQ_KEEPALIVE_ME`, and `AMQ_KEEPALIVE_NO_START=1` for test/dry-run wiring.
-Leave `AMQ_KEEPALIVE_SELF` unset unless you need to force a specific absolute
-injector path. The hook always prints `{}` so agent startup continues even if
-reattach fails; failures are logged to `~/.amq-keepalive/session-start.log`.
+`AMQ_KEEPALIVE_ME`, `AMQ_KEEPALIVE_TIMEOUT_SECONDS`, and
+`AMQ_KEEPALIVE_NO_START=1` for test/dry-run wiring. Leave
+`AMQ_KEEPALIVE_SELF` unset unless you need to force a specific absolute injector
+path. The hook always prints `{}` so agent startup continues even if reattach
+fails; failures are logged to `~/.amq-keepalive/session-start.log`.
 
 LaunchAgent install:
 

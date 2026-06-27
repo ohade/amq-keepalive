@@ -14,6 +14,7 @@ import (
 
 	"github.com/ohade/amq-keepalive/internal/adapter"
 	"github.com/ohade/amq-keepalive/internal/amq"
+	"github.com/ohade/amq-keepalive/internal/hookinstall"
 	"github.com/ohade/amq-keepalive/internal/launchd"
 	"github.com/ohade/amq-keepalive/internal/registry"
 	"github.com/ohade/amq-keepalive/internal/supervisor"
@@ -52,6 +53,8 @@ func (a App) Run(ctx context.Context, args []string) int {
 		err = a.forget(args[1:])
 	case "install-launchd":
 		err = a.installLaunchd(ctx, args[1:])
+	case "install-hook":
+		err = a.installHook(args[1:])
 	case "uninstall":
 		err = a.uninstallLaunchd(ctx, args[1:])
 	default:
@@ -366,6 +369,34 @@ func (a App) installLaunchd(ctx context.Context, args []string) error {
 	})
 }
 
+func (a App) installHook(args []string) error {
+	fs := flag.NewFlagSet("install-hook", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	agent := fs.String("agent", hookinstall.AgentBoth, "agent config to update: claude, codex, or both")
+	scriptPath := fs.String("script", "", "installed hook script path")
+	binaryPath := fs.String("bin", executablePath(), "amq-keepalive binary path")
+	claudeConfig := fs.String("claude-config", "", "Claude settings.json path")
+	codexConfig := fs.String("codex-config", "", "Codex hooks.json path")
+	timeout := fs.Duration("timeout", hookinstall.DefaultTimeout, "self-timeout for reattach work inside the hook")
+	dryRun := fs.Bool("dry-run", false, "print install plan without writing files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	result, err := hookinstall.Install(hookinstall.Options{
+		Agent:        *agent,
+		ScriptPath:   *scriptPath,
+		BinaryPath:   *binaryPath,
+		ClaudeConfig: *claudeConfig,
+		CodexConfig:  *codexConfig,
+		Timeout:      *timeout,
+		DryRun:       *dryRun,
+	})
+	if err != nil {
+		return err
+	}
+	return printJSON(a.Stdout, result)
+}
+
 func (a App) uninstallLaunchd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
@@ -382,7 +413,7 @@ func (a App) uninstallLaunchd(ctx context.Context, args []string) error {
 }
 
 func (a App) usage() {
-	fmt.Fprintln(a.Stderr, "usage: amq-keepalive <attach|reattach|supervise|inject|doctor|forget|install-launchd|uninstall> [options]")
+	fmt.Fprintln(a.Stderr, "usage: amq-keepalive <attach|reattach|supervise|inject|doctor|forget|install-launchd|install-hook|uninstall> [options]")
 }
 
 func mustDefaultRegistryPath() string {

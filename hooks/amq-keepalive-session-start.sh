@@ -18,6 +18,7 @@ BASE_ROOT="${AMQ_KEEPALIVE_BASE_ROOT:-}"
 SESSION_NAME="${AMQ_KEEPALIVE_SESSION:-}"
 ME="${AMQ_KEEPALIVE_ME:-}"
 LOG_PATH="${AMQ_KEEPALIVE_LOG:-$HOME/.amq-keepalive/session-start.log}"
+TIMEOUT_SECONDS="${AMQ_KEEPALIVE_TIMEOUT_SECONDS:-10}"
 
 if [[ "${AMQ_KEEPALIVE_DISABLED:-0}" == "1" ]]; then
     printf '{}\n'
@@ -54,10 +55,51 @@ args=(reattach --adapter "$ADAPTER" --amq "$AMQ_BIN")
 [[ -n "$ME" ]] && args+=(--me "$ME")
 [[ "${AMQ_KEEPALIVE_NO_START:-0}" == "1" ]] && args+=(--no-start)
 
-if "$BIN" "${args[@]}" >> "$LOG_PATH" 2>&1; then
+run_reattach() {
+    "$BIN" "${args[@]}" >> "$LOG_PATH" 2>&1
+}
+
+if [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$TIMEOUT_SECONDS" -gt 0 ]]; then
+    timeout_marker="${TMPDIR:-/tmp}/amq-keepalive-timeout.$$"
+    rm -f "$timeout_marker" 2>/dev/null || true
+
+    (
+        trap 'exit 143' TERM
+        run_reattach
+    ) 2>> "$LOG_PATH" &
+    reattach_pid=$!
+    (
+        sleep "$TIMEOUT_SECONDS"
+        if kill -0 "$reattach_pid" 2>/dev/null; then
+            : > "$timeout_marker" 2>/dev/null || true
+            pkill -TERM -P "$reattach_pid" 2>/dev/null || true
+            kill -TERM "$reattach_pid" 2>/dev/null || true
+            sleep 1
+            pkill -KILL -P "$reattach_pid" 2>/dev/null || true
+            kill -KILL "$reattach_pid" 2>/dev/null || true
+        fi
+    ) &
+    watchdog_pid=$!
+
+    wait "$reattach_pid" 2>/dev/null
+    status=$?
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+
+    if [[ -f "$timeout_marker" ]]; then
+        rm -f "$timeout_marker" 2>/dev/null || true
+        log "reattach timed out after ${TIMEOUT_SECONDS}s adapter=$ADAPTER"
+        printf '{}\n'
+        exit 0
+    fi
+else
+    run_reattach
+    status=$?
+fi
+
+if [[ "$status" -eq 0 ]]; then
     log "reattach ok adapter=$ADAPTER"
 else
-    status=$?
     log "reattach failed status=$status adapter=$ADAPTER"
 fi
 
