@@ -156,6 +156,60 @@ func (s *Store) saveUnlocked(file File) error {
 }
 
 func (s *Store) Upsert(entry Entry) (Entry, error) {
+	prepared, err := s.prepareEntry(entry)
+	if err != nil {
+		return Entry{}, err
+	}
+
+	err = s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		replaced := false
+		for i := range file.Entries {
+			if file.Entries[i].ID == prepared.ID {
+				file.Entries[i] = prepared
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			file.Entries = append(file.Entries, prepared)
+		}
+		return s.saveUnlocked(file)
+	})
+	return prepared, err
+}
+
+func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
+	prepared, err := s.prepareEntry(entry)
+	if err != nil {
+		return Entry{}, nil, err
+	}
+
+	var removed []Entry
+	err = s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		next := make([]Entry, 0, len(file.Entries)+1)
+		for _, existing := range file.Entries {
+			if existing.Root == prepared.Root && existing.Agent == prepared.Agent && existing.Adapter == prepared.Adapter {
+				removed = append(removed, existing)
+				continue
+			}
+			next = append(next, existing)
+		}
+		next = append(next, prepared)
+		file.Entries = next
+		return s.saveUnlocked(file)
+	})
+	return prepared, removed, err
+}
+
+func (s *Store) prepareEntry(entry Entry) (Entry, error) {
 	now := s.now()
 	if entry.Root == "" {
 		return Entry{}, errors.New("entry root is required")
@@ -178,26 +232,7 @@ func (s *Store) Upsert(entry Entry) (Entry, error) {
 	if entry.LastAttach.IsZero() {
 		entry.LastAttach = now
 	}
-
-	err := s.withLock(func() error {
-		file, err := s.loadUnlocked()
-		if err != nil {
-			return err
-		}
-		replaced := false
-		for i := range file.Entries {
-			if file.Entries[i].ID == entry.ID {
-				file.Entries[i] = entry
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			file.Entries = append(file.Entries, entry)
-		}
-		return s.saveUnlocked(file)
-	})
-	return entry, err
+	return entry, nil
 }
 
 func (s *Store) UpdateEntry(entry Entry) error {

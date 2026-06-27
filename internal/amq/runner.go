@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
 var ErrAlreadyRunning = errors.New("amq wake already running")
+
+const defaultWakeReadyTimeout = 2 * time.Second
 
 type Env struct {
 	SchemaVersion int               `json:"schema_version"`
@@ -44,6 +48,7 @@ type StartWakeRequest struct {
 	InjectVia string
 	Adapter   string
 	Target    string
+	Timeout   time.Duration
 }
 
 type CLI struct {
@@ -106,6 +111,13 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	}
 
 	args := []string{"wake"}
+	readyDir, err := os.MkdirTemp("", "amq-keepalive-wake-*")
+	if err != nil {
+		return fmt.Errorf("create wake readiness directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(readyDir) }()
+	readyFile := filepath.Join(readyDir, "ready")
+
 	if req.Root != "" {
 		args = append(args, "-root", req.Root)
 	}
@@ -117,6 +129,7 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		"-inject-arg", "inject",
 		"-inject-arg", req.Adapter,
 		"-inject-arg", req.Target,
+		"-ready-file", readyFile,
 	)
 
 	cmd := exec.CommandContext(ctx, c.Path, args...)
@@ -128,8 +141,15 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		}
 		return err
 	}
-	if cmd.Process != nil {
-		return cmd.Process.Release()
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	if err := waitForWakeReady(ctx, done, readyFile, req.Timeout); err != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return err
 	}
 	return nil
 }
@@ -161,6 +181,45 @@ func parseWakeRepair(data []byte) (WakeRepairResult, error) {
 	}
 	result.Status = strings.TrimSpace(result.Status)
 	return result, nil
+}
+
+func waitForWakeReady(ctx context.Context, done <-chan error, readyFile string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultWakeReadyTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if wakeReadyFileExists(readyFile) {
+			return nil
+		}
+		select {
+		case err := <-done:
+			if wakeReadyFileExists(readyFile) {
+				return nil
+			}
+			if err == nil {
+				return errors.New("amq wake exited before becoming ready")
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "already") {
+				return ErrAlreadyRunning
+			}
+			return fmt.Errorf("amq wake exited before becoming ready: %w", err)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timed out after %s waiting for amq wake readiness", timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+func wakeReadyFileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func stringField(raw map[string]any, key string) string {

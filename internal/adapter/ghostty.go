@@ -95,7 +95,7 @@ func parseGhosttyTerminalTarget(target string) (string, error) {
 	}
 	id, ok := strings.CutPrefix(target, ghosttyTerminalTargetPrefix)
 	if !ok {
-		return "", fmt.Errorf("unsupported Ghostty target %q; reattach required: run attach --adapter ghostty to register a terminal-id target", target)
+		return "", fmt.Errorf("unsupported Ghostty target %q; reattach required: run reattach --adapter ghostty to register a terminal-id target", target)
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {

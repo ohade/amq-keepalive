@@ -11,8 +11,10 @@ import (
 )
 
 type fakeWake struct {
-	repairs []repairResult
-	starts  []amq.StartWakeRequest
+	repairs     []repairResult
+	repairCalls int
+	starts      []amq.StartWakeRequest
+	startErr    error
 }
 
 type repairResult struct {
@@ -21,6 +23,7 @@ type repairResult struct {
 }
 
 func (f *fakeWake) RepairWake(ctx context.Context, root, me string) (amq.WakeRepairResult, error) {
+	f.repairCalls++
 	if len(f.repairs) == 0 {
 		return amq.WakeRepairResult{Status: "already-running"}, nil
 	}
@@ -31,7 +34,7 @@ func (f *fakeWake) RepairWake(ctx context.Context, root, me string) (amq.WakeRep
 
 func (f *fakeWake) StartWake(ctx context.Context, req amq.StartWakeRequest) error {
 	f.starts = append(f.starts, req)
-	return nil
+	return f.startErr
 }
 
 type probeAdapter struct {
@@ -103,6 +106,48 @@ func TestStaleRepairDoesNotStartWake(t *testing.T) {
 	}
 	if updated.State != registry.StateActive {
 		t.Fatalf("state = %q, want %q", updated.State, registry.StateActive)
+	}
+}
+
+func TestStartFreshStartsWithoutRepair(t *testing.T) {
+	now := fixedNow()
+	wake := &fakeWake{repairs: []repairResult{{
+		result: amq.WakeRepairResult{Status: "already-running"},
+	}}}
+
+	updated, result := testReconciler(wake, probeAdapter{}, now).StartFresh(context.Background(), testEntry())
+
+	if wake.repairCalls != 0 {
+		t.Fatalf("repairCalls = %d, want 0", wake.repairCalls)
+	}
+	if len(wake.starts) != 1 {
+		t.Fatalf("starts = %d, want 1", len(wake.starts))
+	}
+	if result.Action != ActionStarted {
+		t.Fatalf("action = %q, want %q", result.Action, ActionStarted)
+	}
+	if updated.State != registry.StateActive {
+		t.Fatalf("state = %q, want %q", updated.State, registry.StateActive)
+	}
+}
+
+func TestStartFreshDoesNotAcceptAlreadyRunningAsSuccess(t *testing.T) {
+	now := fixedNow()
+	wake := &fakeWake{startErr: amq.ErrAlreadyRunning}
+
+	updated, result := testReconciler(wake, probeAdapter{}, now).StartFresh(context.Background(), testEntry())
+
+	if result.Action != ActionStartFailed {
+		t.Fatalf("action = %q, want %q", result.Action, ActionStartFailed)
+	}
+	if !errors.Is(result.Error, amq.ErrAlreadyRunning) {
+		t.Fatalf("error = %v, want ErrAlreadyRunning", result.Error)
+	}
+	if updated.State != registry.StateAttached {
+		t.Fatalf("state = %q, want %q", updated.State, registry.StateAttached)
+	}
+	if updated.LastSupervisorDecision != ActionStartFailed {
+		t.Fatalf("LastSupervisorDecision = %q, want %q", updated.LastSupervisorDecision, ActionStartFailed)
 	}
 }
 

@@ -7,7 +7,8 @@ M0 is intentionally small:
 
 - one static Go binary;
 - a private registry under `~/.amq-keepalive/`;
-- explicit `attach`, `supervise`, `inject`, `doctor`, and `forget` commands;
+- explicit `attach`, `reattach`, `supervise`, `inject`, `doctor`, and `forget`
+  commands;
 - a fake `file` adapter for deterministic tests;
 - supervisor logic that only talks to AMQ through the public `amq` CLI.
 
@@ -30,8 +31,8 @@ unless that id resolves to exactly one Ghostty terminal. Injection uses Ghostty'
 native `input text` and `send key "enter"` AppleScript commands; it does not use
 window titles, System Events, focus stealing, or the clipboard.
 
-Old title targets are intentionally rejected. Re-run `attach --adapter ghostty`
-to register a terminal-id target.
+Old title targets are intentionally rejected. Re-run `reattach --adapter ghostty`
+from the current session to register a fresh terminal-id target.
 
 ## Example
 
@@ -53,6 +54,47 @@ Ghostty attach:
 ```sh
 ./amq-keepalive attach --adapter ghostty
 ```
+
+Session-start reattach:
+
+```sh
+./amq-keepalive reattach --adapter ghostty
+```
+
+`reattach` is the reboot-safe path: it discovers the current adapter target,
+replaces any prior entry for the same AMQ root, agent, and adapter, and then
+starts wake for the fresh target. Startup waits for AMQ's readiness marker before
+reporting success, so a refused or already-running wake is not silently accepted.
+This keeps the registry from accumulating stale terminal ids after a session is
+recreated.
+
+Claude Code SessionStart hook snippet:
+
+```json
+{
+  "type": "command",
+  "command": "/path/to/amq-keepalive/hooks/amq-keepalive-session-start.sh"
+}
+```
+
+Codex SessionStart hook snippet:
+
+```json
+{
+  "command": "/path/to/amq-keepalive/hooks/amq-keepalive-session-start.sh",
+  "timeout": 5000,
+  "type": "command"
+}
+```
+
+Set `AMQ_KEEPALIVE_BIN=/absolute/path/to/amq-keepalive` if the binary is not on
+`PATH`. The hook also supports `AMQ_KEEPALIVE_ADAPTER`, `AMQ_KEEPALIVE_TARGET`,
+`AMQ_KEEPALIVE_REGISTRY`, `AMQ_KEEPALIVE_AMQ`, `AMQ_KEEPALIVE_SELF`,
+`AMQ_KEEPALIVE_ROOT`, `AMQ_KEEPALIVE_BASE_ROOT`, `AMQ_KEEPALIVE_SESSION`,
+`AMQ_KEEPALIVE_ME`, and `AMQ_KEEPALIVE_NO_START=1` for test/dry-run wiring.
+Leave `AMQ_KEEPALIVE_SELF` unset unless you need to force a specific absolute
+injector path. The hook always prints `{}` so agent startup continues even if
+reattach fails; failures are logged to `~/.amq-keepalive/session-start.log`.
 
 LaunchAgent install:
 
@@ -78,9 +120,14 @@ and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
   `<adapter>:<scheme>:<value>`. The M1.5 Ghostty scheme is
   `ghostty:terminal:<id>`.
 - If a registered Ghostty terminal id cannot be found, the entry is marked
-  `detached` until the user runs `attach --adapter ghostty` again.
-- Ghostty terminal-id persistence across full Ghostty quit/relaunch and machine
-  reboot has not been proven in this non-destructive test pass. Treat a missing
-  id after restart as an expected stale-target condition: `doctor` will show the
-  detached entry and last error, and reattach creates a fresh terminal-id entry.
+  `detached` until the user runs `reattach --adapter ghostty` again or the
+  SessionStart hook reattaches the recreated session.
+- Reboot survival comes from reattaching on session start, not from assuming a
+  terminal id survives process or machine restart. The recreated session
+  registers its current target.
+- `reattach` updates the registry target and starts wake for that target when no
+  valid wake is already running. If an old wake process is still live with a
+  previous target, AMQ currently has no safe retarget command, so reattach fails
+  closed and logs the failure instead of pretending the old process was updated.
+  Stale/dead wake locks are handled by starting wake for the fresh target.
 - `install-launchd` installs only a per-user LaunchAgent for this supervisor.

@@ -52,23 +52,8 @@ func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (regist
 	now := r.now()
 	entry.LastSeenBySupervisor = now
 
-	if !entry.BackoffUntil.IsZero() && now.Before(entry.BackoffUntil) {
-		entry.LastSupervisorDecision = ActionBackoff
-		return entry, Result{Action: ActionBackoff}
-	}
-
-	if r.Adapter == nil {
-		return r.markBackoff(entry, now, errors.New("adapter is not configured"), ActionBackoff, false)
-	}
-	if err := r.Adapter.Probe(ctx, entry.Target); err != nil {
-		entry.State = registry.StateDetached
-		entry.LastError = err.Error()
-		entry.LastSupervisorDecision = ActionDetached
-		return entry, Result{Action: ActionDetached, Error: err}
-	}
-
-	if r.Wake == nil {
-		return r.markBackoff(entry, now, errors.New("amq runner is not configured"), ActionBackoff, false)
+	if blocked, result, ok := r.checkLocalReadiness(ctx, entry, now); ok {
+		return blocked, result
 	}
 
 	repair, repairErr := r.Wake.RepairWake(ctx, entry.Root, entry.Agent)
@@ -80,12 +65,12 @@ func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (regist
 		return markActive(entry, now, ActionRepaired), Result{Action: ActionRepaired, AMQTouched: true}
 	case "refused":
 		if isMissingWakeTarget(repair, repairErr) {
-			return r.startWake(ctx, entry, now)
+			return r.startWake(ctx, entry, now, true)
 		}
 		return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff, true)
 	case "error", "":
 		if isMissingWakeTarget(repair, repairErr) {
-			return r.startWake(ctx, entry, now)
+			return r.startWake(ctx, entry, now, true)
 		}
 		return r.markBackoff(entry, now, combineRepairError(repair, repairErr), ActionBackoff, true)
 	default:
@@ -96,7 +81,42 @@ func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (regist
 	}
 }
 
-func (r Reconciler) startWake(ctx context.Context, entry registry.Entry, now time.Time) (registry.Entry, Result) {
+func (r Reconciler) StartFresh(ctx context.Context, entry registry.Entry) (registry.Entry, Result) {
+	now := r.now()
+	entry.LastSeenBySupervisor = now
+
+	if blocked, result, ok := r.checkLocalReadiness(ctx, entry, now); ok {
+		return blocked, result
+	}
+
+	return r.startWake(ctx, entry, now, false)
+}
+
+func (r Reconciler) checkLocalReadiness(ctx context.Context, entry registry.Entry, now time.Time) (registry.Entry, Result, bool) {
+	if !entry.BackoffUntil.IsZero() && now.Before(entry.BackoffUntil) {
+		entry.LastSupervisorDecision = ActionBackoff
+		return entry, Result{Action: ActionBackoff}, true
+	}
+
+	if r.Adapter == nil {
+		updated, result := r.markBackoff(entry, now, errors.New("adapter is not configured"), ActionBackoff, false)
+		return updated, result, true
+	}
+	if err := r.Adapter.Probe(ctx, entry.Target); err != nil {
+		entry.State = registry.StateDetached
+		entry.LastError = err.Error()
+		entry.LastSupervisorDecision = ActionDetached
+		return entry, Result{Action: ActionDetached, Error: err}, true
+	}
+
+	if r.Wake == nil {
+		updated, result := r.markBackoff(entry, now, errors.New("amq runner is not configured"), ActionBackoff, false)
+		return updated, result, true
+	}
+	return entry, Result{}, false
+}
+
+func (r Reconciler) startWake(ctx context.Context, entry registry.Entry, now time.Time, allowAlreadyRunning bool) (registry.Entry, Result) {
 	err := r.Wake.StartWake(ctx, amq.StartWakeRequest{
 		Root:      entry.Root,
 		Me:        entry.Agent,
@@ -104,7 +124,7 @@ func (r Reconciler) startWake(ctx context.Context, entry registry.Entry, now tim
 		Adapter:   entry.Adapter,
 		Target:    entry.Target,
 	})
-	if err == nil || errors.Is(err, amq.ErrAlreadyRunning) {
+	if err == nil || (allowAlreadyRunning && errors.Is(err, amq.ErrAlreadyRunning)) {
 		return markActive(entry, now, ActionStarted), Result{Action: ActionStarted, Started: true, AMQTouched: true}
 	}
 	return r.markBackoff(entry, now, err, ActionStartFailed, true)

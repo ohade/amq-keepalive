@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ohade/amq-keepalive/internal/adapter"
@@ -38,6 +40,8 @@ func (a App) Run(ctx context.Context, args []string) int {
 	switch args[0] {
 	case "attach":
 		err = a.attach(ctx, args[1:])
+	case "reattach":
+		err = a.reattach(ctx, args[1:])
 	case "supervise":
 		err = a.supervise(ctx, args[1:])
 	case "inject":
@@ -62,8 +66,39 @@ func (a App) Run(ctx context.Context, args []string) int {
 	return 0
 }
 
+type registerOptions struct {
+	RegistryPath string
+	AdapterName  string
+	Target       string
+	Root         string
+	BaseRoot     string
+	SessionName  string
+	Me           string
+	AMQPath      string
+	Self         string
+	NoStart      bool
+	Replace      bool
+}
+
+type registerResult struct {
+	Entry          registry.Entry   `json:"entry"`
+	RemovedEntries []registry.Entry `json:"removed_entries,omitempty"`
+}
+
 func (a App) attach(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
+	return a.register(ctx, args, false)
+}
+
+func (a App) reattach(ctx context.Context, args []string) error {
+	return a.register(ctx, args, true)
+}
+
+func (a App) register(ctx context.Context, args []string, replace bool) error {
+	commandName := "attach"
+	if replace {
+		commandName = "reattach"
+	}
+	fs := flag.NewFlagSet(commandName, flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 	registryPath := fs.String("registry", mustDefaultRegistryPath(), "registry file path")
 	adapterName := fs.String("adapter", "file", "adapter name")
@@ -78,32 +113,49 @@ func (a App) attach(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	envCLI := amq.NewCLI(*amqPath)
-	if *root == "" || *me == "" || *baseRoot == "" || *sessionName == "" {
+	return a.registerWithOptions(ctx, registerOptions{
+		RegistryPath: *registryPath,
+		AdapterName:  *adapterName,
+		Target:       *target,
+		Root:         *root,
+		BaseRoot:     *baseRoot,
+		SessionName:  *sessionName,
+		Me:           *me,
+		AMQPath:      *amqPath,
+		Self:         *self,
+		NoStart:      *noStart,
+		Replace:      replace,
+	})
+}
+
+func (a App) registerWithOptions(ctx context.Context, opts registerOptions) error {
+	envCLI := amq.NewCLI(opts.AMQPath)
+	if opts.Root == "" || opts.Me == "" || opts.BaseRoot == "" || opts.SessionName == "" {
 		env, err := envCLI.Env(ctx)
-		if err != nil && (*root == "" || *me == "") {
+		if err != nil && (opts.Root == "" || opts.Me == "") {
 			return err
 		}
-		if *root == "" {
-			*root = env.Root
+		if opts.Root == "" {
+			opts.Root = env.Root
 		}
-		if *baseRoot == "" {
-			*baseRoot = env.BaseRoot
+		if opts.BaseRoot == "" {
+			opts.BaseRoot = env.BaseRoot
 		}
-		if *sessionName == "" {
-			*sessionName = env.SessionName
+		if opts.SessionName == "" {
+			opts.SessionName = env.SessionName
 		}
-		if *me == "" {
-			*me = env.Me
+		if opts.Me == "" {
+			opts.Me = env.Me
 		}
 	}
+	opts.Root, opts.BaseRoot = normalizeAMQPaths(opts.Root, opts.BaseRoot, opts.SessionName)
 
 	adapters := adapter.DefaultRegistry()
-	selected, err := adapters.Get(*adapterName)
+	selected, err := adapters.Get(opts.AdapterName)
 	if err != nil {
 		return err
 	}
-	if *target == "" {
+	if opts.Target == "" {
 		discoverer, ok := selected.(adapter.Discoverer)
 		if !ok {
 			return errors.New("--target is required")
@@ -112,32 +164,45 @@ func (a App) attach(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		*target = discovered
+		opts.Target = discovered
 	}
-	if err := selected.Probe(ctx, *target); err != nil {
+	if err := selected.Probe(ctx, opts.Target); err != nil {
 		return err
 	}
 
-	store := registry.New(*registryPath)
-	entry, err := store.Upsert(registry.Entry{
-		Root:        *root,
-		BaseRoot:    *baseRoot,
-		SessionName: *sessionName,
-		Agent:       *me,
-		Adapter:     *adapterName,
-		Target:      *target,
+	store := registry.New(opts.RegistryPath)
+	next := registry.Entry{
+		Root:        opts.Root,
+		BaseRoot:    opts.BaseRoot,
+		SessionName: opts.SessionName,
+		Agent:       opts.Me,
+		Adapter:     opts.AdapterName,
+		Target:      opts.Target,
 		State:       registry.StateAttached,
-	})
+	}
+	var entry registry.Entry
+	var removed []registry.Entry
+	if opts.Replace {
+		entry, removed, err = store.ReplaceSessionAdapter(next)
+	} else {
+		entry, err = store.Upsert(next)
+	}
 	if err != nil {
 		return err
 	}
-	if !*noStart {
+	if !opts.NoStart {
 		reconciler := supervisor.Reconciler{
 			Wake:      envCLI,
 			Adapter:   selected,
-			InjectVia: *self,
+			InjectVia: opts.Self,
 		}
-		updated, result := reconciler.Reconcile(ctx, entry)
+		var updated registry.Entry
+		var result supervisor.Result
+		if opts.Replace {
+			updated, result = reconciler.StartFresh(ctx, entry)
+		} else {
+			updated, result = reconciler.Reconcile(ctx, entry)
+		}
 		if err := store.UpdateEntry(updated); err != nil {
 			return err
 		}
@@ -145,6 +210,9 @@ func (a App) attach(ctx context.Context, args []string) error {
 		if result.Error != nil && result.Action != supervisor.ActionDetached {
 			return result.Error
 		}
+	}
+	if opts.Replace {
+		return printJSON(a.Stdout, registerResult{Entry: entry, RemovedEntries: removed})
 	}
 	return printJSON(a.Stdout, entry)
 }
@@ -314,7 +382,7 @@ func (a App) uninstallLaunchd(ctx context.Context, args []string) error {
 }
 
 func (a App) usage() {
-	fmt.Fprintln(a.Stderr, "usage: amq-keepalive <attach|supervise|inject|doctor|forget|install-launchd|uninstall> [options]")
+	fmt.Fprintln(a.Stderr, "usage: amq-keepalive <attach|reattach|supervise|inject|doctor|forget|install-launchd|uninstall> [options]")
 }
 
 func mustDefaultRegistryPath() string {
@@ -337,4 +405,31 @@ func printJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+func normalizeAMQPaths(root, baseRoot, sessionName string) (string, string) {
+	root = strings.TrimSpace(root)
+	baseRoot = strings.TrimSpace(baseRoot)
+	sessionName = strings.TrimSpace(sessionName)
+
+	if baseRoot != "" && !filepath.IsAbs(baseRoot) {
+		if abs, err := filepath.Abs(baseRoot); err == nil {
+			baseRoot = abs
+		}
+	}
+	if root == "" || filepath.IsAbs(root) {
+		return root, baseRoot
+	}
+	if baseRoot != "" && filepath.IsAbs(baseRoot) {
+		if sessionName != "" && filepath.Base(root) == sessionName {
+			return filepath.Join(baseRoot, sessionName), baseRoot
+		}
+		if filepath.Base(root) == filepath.Base(baseRoot) {
+			return baseRoot, baseRoot
+		}
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		return abs, baseRoot
+	}
+	return root, baseRoot
 }

@@ -93,6 +93,75 @@ func TestStoreForget(t *testing.T) {
 	}
 }
 
+func TestStoreReplaceSessionAdapterRemovesOnlyMatchingEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	store := New(path)
+
+	replaceMe, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "file",
+		Target:  "/tmp/old-inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("Upsert(replaceMe) error = %v", err)
+	}
+	keepDifferentAgent, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "claude",
+		Adapter: "file",
+		Target:  "/tmp/claude-inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("Upsert(keepDifferentAgent) error = %v", err)
+	}
+	keepDifferentAdapter, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "other",
+		Target:  "/tmp/other-inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("Upsert(keepDifferentAdapter) error = %v", err)
+	}
+
+	next, removed, err := store.ReplaceSessionAdapter(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "file",
+		Target:  "/tmp/new-inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("ReplaceSessionAdapter() error = %v", err)
+	}
+	if next.Target != "/tmp/new-inbox.txt" {
+		t.Fatalf("Target = %q, want new target", next.Target)
+	}
+	if len(removed) != 1 || removed[0].ID != replaceMe.ID {
+		t.Fatalf("removed = %#v, want only %q", removed, replaceMe.ID)
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(loaded.Entries))
+	}
+	ids := map[string]bool{}
+	for _, entry := range loaded.Entries {
+		ids[entry.ID] = true
+		if entry.ID == replaceMe.ID {
+			t.Fatalf("old matching entry still present: %#v", entry)
+		}
+	}
+	for _, want := range []string{keepDifferentAgent.ID, keepDifferentAdapter.ID, next.ID} {
+		if !ids[want] {
+			t.Fatalf("entry %q missing after replace; entries=%#v", want, loaded.Entries)
+		}
+	}
+}
+
 func TestStoreConcurrentUpsertsDoNotLoseEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	store := New(path)
