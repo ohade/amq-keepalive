@@ -1,8 +1,11 @@
 package hookinstall
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,9 +137,99 @@ func TestEmbeddedScriptMatchesRepositoryHook(t *testing.T) {
 	}
 }
 
+func TestSessionStartScriptNormalizesInvalidTimeoutAndReturns(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeSessionStartScript(t, dir)
+	binaryPath := writeExecutableBody(t, filepath.Join(dir, "amq-keepalive"), "#!/bin/sh\nsleep 5\n")
+	logPath := filepath.Join(dir, "session-start.log")
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"AMQ_KEEPALIVE_BIN="+binaryPath,
+		"AMQ_KEEPALIVE_LOG="+logPath,
+		"AMQ_KEEPALIVE_TIMEOUT_SECONDS=0",
+		"AMQ_KEEPALIVE_DEFAULT_TIMEOUT_SECONDS=1",
+		"AMQ_KEEPALIVE_STDIN_TIMEOUT_SECONDS=1",
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("hook run error = %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("hook took %s, want bounded return", elapsed)
+	}
+	if got := stdout.String(); got != "{}\n" {
+		t.Fatalf("stdout = %q, want empty hook response", got)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "invalid timeout 0; using 1s") {
+		t.Fatalf("log missing invalid timeout normalization:\n%s", logText)
+	}
+	if !strings.Contains(logText, "reattach timed out after 1s") {
+		t.Fatalf("log missing timeout:\n%s", logText)
+	}
+}
+
+func TestSessionStartScriptDoesNotBlockOnOpenStdin(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeSessionStartScript(t, dir)
+	binaryPath := writeExecutableBody(t, filepath.Join(dir, "amq-keepalive"), "#!/bin/sh\nexit 0\n")
+	logPath := filepath.Join(dir, "session-start.log")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", scriptPath)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe() error = %v", err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	cmd.Stdin = reader
+	cmd.Env = append(os.Environ(),
+		"AMQ_KEEPALIVE_BIN="+binaryPath,
+		"AMQ_KEEPALIVE_LOG="+logPath,
+		"AMQ_KEEPALIVE_TIMEOUT_SECONDS=2",
+		"AMQ_KEEPALIVE_STDIN_TIMEOUT_SECONDS=1",
+	)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	start := time.Now()
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("hook run error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("hook took %s, want stdin read bounded", elapsed)
+	}
+	if got := stdout.String(); got != "{}\n" {
+		t.Fatalf("stdout = %q, want empty hook response", got)
+	}
+}
+
 func writeExecutable(t *testing.T, path string) string {
 	t.Helper()
-	mustWrite(t, path, []byte("#!/bin/sh\nexit 0\n"))
+	return writeExecutableBody(t, path, "#!/bin/sh\nexit 0\n")
+}
+
+func writeSessionStartScript(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "hook.sh")
+	return writeExecutableBody(t, path, SessionStartScript)
+}
+
+func writeExecutableBody(t *testing.T, path string, body string) string {
+	t.Helper()
+	mustWrite(t, path, []byte(body))
 	if err := os.Chmod(path, 0o755); err != nil {
 		t.Fatalf("chmod executable: %v", err)
 	}

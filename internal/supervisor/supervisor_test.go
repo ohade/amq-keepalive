@@ -63,6 +63,9 @@ func TestNoLockStartsWake(t *testing.T) {
 	if len(wake.starts) != 1 {
 		t.Fatalf("starts = %d, want 1", len(wake.starts))
 	}
+	if wake.starts[0].Timeout != 7*time.Second {
+		t.Fatalf("start timeout = %s, want 7s", wake.starts[0].Timeout)
+	}
 	if updated.State != registry.StateActive {
 		t.Fatalf("state = %q, want %q", updated.State, registry.StateActive)
 	}
@@ -261,6 +264,7 @@ func testReconciler(wake *fakeWake, adapter probeAdapter, now time.Time) Reconci
 		BackoffBase: time.Second,
 		Jitter:      func(delay time.Duration) time.Duration { return delay },
 		InjectVia:   "/bin/amq-keepalive",
+		WakeTimeout: 7 * time.Second,
 	}
 }
 

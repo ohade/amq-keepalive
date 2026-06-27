@@ -67,6 +67,7 @@ func (g Ghostty) Inject(ctx context.Context, target string, payload string) erro
 	if err != nil {
 		return err
 	}
+	payload = sanitizePayloadForSubmit(payload)
 	out, err := g.runner().Run(ctx, "osascript", "-e", ghosttyInjectScript, id, payload)
 	if err != nil {
 		return fmt.Errorf("inject into Ghostty target %q: %w: %s", target, err, strings.TrimSpace(string(out)))
@@ -102,6 +103,10 @@ func parseGhosttyTerminalTarget(target string) (string, error) {
 		return "", errors.New("ghostty terminal target is missing an id")
 	}
 	return id, nil
+}
+
+func sanitizePayloadForSubmit(payload string) string {
+	return strings.TrimRight(payload, "\r\n")
 }
 
 const ghosttyDiscoverScript = `

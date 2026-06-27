@@ -28,7 +28,6 @@ const SessionStartScript = `#!/usr/bin/env bash
 
 set -u
 
-INPUT="$(cat 2>/dev/null || true)"
 BIN="${AMQ_KEEPALIVE_BIN:-amq-keepalive}"
 ADAPTER="${AMQ_KEEPALIVE_ADAPTER:-ghostty}"
 TARGET="${AMQ_KEEPALIVE_TARGET:-}"
@@ -40,7 +39,9 @@ BASE_ROOT="${AMQ_KEEPALIVE_BASE_ROOT:-}"
 SESSION_NAME="${AMQ_KEEPALIVE_SESSION:-}"
 ME="${AMQ_KEEPALIVE_ME:-}"
 LOG_PATH="${AMQ_KEEPALIVE_LOG:-$HOME/.amq-keepalive/session-start.log}"
-TIMEOUT_SECONDS="${AMQ_KEEPALIVE_TIMEOUT_SECONDS:-10}"
+DEFAULT_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_DEFAULT_TIMEOUT_SECONDS:-10}"
+TIMEOUT_SECONDS="${AMQ_KEEPALIVE_TIMEOUT_SECONDS:-$DEFAULT_TIMEOUT_SECONDS}"
+STDIN_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_STDIN_TIMEOUT_SECONDS:-1}"
 
 if [[ "${AMQ_KEEPALIVE_DISABLED:-0}" == "1" ]]; then
     printf '{}\n'
@@ -52,6 +53,25 @@ mkdir -p "$(dirname "$LOG_PATH")" 2>/dev/null || true
 log() {
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$LOG_PATH" 2>/dev/null || true
 }
+
+if ! [[ "$DEFAULT_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$DEFAULT_TIMEOUT_SECONDS" -gt 0 ]]; then
+    DEFAULT_TIMEOUT_SECONDS=10
+fi
+if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$TIMEOUT_SECONDS" -gt 0 ]]; then
+    log "invalid timeout ${TIMEOUT_SECONDS}; using ${DEFAULT_TIMEOUT_SECONDS}s"
+    TIMEOUT_SECONDS="$DEFAULT_TIMEOUT_SECONDS"
+fi
+if ! [[ "$STDIN_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$STDIN_TIMEOUT_SECONDS" -gt 0 ]]; then
+    STDIN_TIMEOUT_SECONDS=1
+fi
+
+read_hook_input() {
+    local line=""
+    IFS= read -r -t "$STDIN_TIMEOUT_SECONDS" line || true
+    printf '%s' "$line"
+}
+
+INPUT="$(read_hook_input 2>/dev/null || true)"
 
 CWD=""
 if command -v jq >/dev/null 2>&1 && [[ -n "$INPUT" ]]; then
@@ -81,42 +101,38 @@ run_reattach() {
     "$BIN" "${args[@]}" >> "$LOG_PATH" 2>&1
 }
 
-if [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$TIMEOUT_SECONDS" -gt 0 ]]; then
-    timeout_marker="${TMPDIR:-/tmp}/amq-keepalive-timeout.$$"
-    rm -f "$timeout_marker" 2>/dev/null || true
+timeout_marker="${TMPDIR:-/tmp}/amq-keepalive-timeout.$$"
+rm -f "$timeout_marker" 2>/dev/null || true
 
-    (
-        trap 'exit 143' TERM
-        run_reattach
-    ) 2>> "$LOG_PATH" &
-    reattach_pid=$!
-    (
-        sleep "$TIMEOUT_SECONDS"
-        if kill -0 "$reattach_pid" 2>/dev/null; then
-            : > "$timeout_marker" 2>/dev/null || true
-            pkill -TERM -P "$reattach_pid" 2>/dev/null || true
-            kill -TERM "$reattach_pid" 2>/dev/null || true
-            sleep 1
-            pkill -KILL -P "$reattach_pid" 2>/dev/null || true
-            kill -KILL "$reattach_pid" 2>/dev/null || true
-        fi
-    ) &
-    watchdog_pid=$!
-
-    wait "$reattach_pid" 2>/dev/null
-    status=$?
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
-
-    if [[ -f "$timeout_marker" ]]; then
-        rm -f "$timeout_marker" 2>/dev/null || true
-        log "reattach timed out after ${TIMEOUT_SECONDS}s adapter=$ADAPTER"
-        printf '{}\n'
-        exit 0
-    fi
-else
+(
+    trap 'exit 143' TERM
     run_reattach
-    status=$?
+) 2>> "$LOG_PATH" &
+reattach_pid=$!
+(
+    sleep "$TIMEOUT_SECONDS"
+    if kill -0 "$reattach_pid" 2>/dev/null; then
+        : > "$timeout_marker" 2>/dev/null || true
+        pkill -TERM -P "$reattach_pid" 2>/dev/null || true
+        kill -TERM "$reattach_pid" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -P "$reattach_pid" 2>/dev/null || true
+        kill -KILL "$reattach_pid" 2>/dev/null || true
+    fi
+) &
+watchdog_pid=$!
+
+wait "$reattach_pid" 2>/dev/null
+status=$?
+pkill -TERM -P "$watchdog_pid" 2>/dev/null || true
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+
+if [[ -f "$timeout_marker" ]]; then
+    rm -f "$timeout_marker" 2>/dev/null || true
+    log "reattach timed out after ${TIMEOUT_SECONDS}s adapter=$ADAPTER"
+    printf '{}\n'
+    exit 0
 fi
 
 if [[ "$status" -eq 0 ]]; then
@@ -126,6 +142,7 @@ else
 fi
 
 printf '{}\n'
+exit 0
 `
 
 type Options struct {

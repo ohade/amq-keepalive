@@ -299,10 +299,7 @@ func (s *Store) withLock(fn func() error) error {
 	defer mutex.Unlock()
 
 	dir := filepath.Dir(s.Path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := ensureRegistryDir(dir); err != nil {
 		return err
 	}
 
@@ -320,6 +317,20 @@ func (s *Store) withLock(fn func() error) error {
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
 	return fn()
+}
+
+func ensureRegistryDir(dir string) error {
+	_, err := os.Stat(dir)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
 }
 
 func syncDir(dir string) error {

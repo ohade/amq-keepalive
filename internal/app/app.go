@@ -79,6 +79,7 @@ type registerOptions struct {
 	Me           string
 	AMQPath      string
 	Self         string
+	WakeTimeout  time.Duration
 	NoStart      bool
 	Replace      bool
 }
@@ -112,6 +113,7 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 	me := fs.String("me", "", "AMQ agent handle")
 	amqPath := fs.String("amq", "amq", "amq executable path")
 	self := fs.String("self", executablePath(), "amq-keepalive executable path for --inject-via")
+	wakeTimeout := fs.Duration("wake-ready-timeout", 10*time.Second, "maximum time to wait for amq wake readiness")
 	noStart := fs.Bool("no-start", false, "register without starting/reconciling wake")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -126,6 +128,7 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 		Me:           *me,
 		AMQPath:      *amqPath,
 		Self:         *self,
+		WakeTimeout:  *wakeTimeout,
 		NoStart:      *noStart,
 		Replace:      replace,
 	})
@@ -195,9 +198,10 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 	}
 	if !opts.NoStart {
 		reconciler := supervisor.Reconciler{
-			Wake:      envCLI,
-			Adapter:   selected,
-			InjectVia: opts.Self,
+			Wake:        envCLI,
+			Adapter:     selected,
+			InjectVia:   opts.Self,
+			WakeTimeout: opts.WakeTimeout,
 		}
 		var updated registry.Entry
 		var result supervisor.Result
@@ -228,12 +232,13 @@ func (a App) supervise(ctx context.Context, args []string) error {
 	self := fs.String("self", executablePath(), "amq-keepalive executable path for --inject-via")
 	once := fs.Bool("once", false, "run one supervisor pass")
 	interval := fs.Duration("interval", 10*time.Second, "supervisor interval")
+	wakeTimeout := fs.Duration("wake-ready-timeout", 10*time.Second, "maximum time to wait for amq wake readiness")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	runOnce := func() error {
-		return a.superviseOnce(ctx, *registryPath, amq.NewCLI(*amqPath), *self)
+		return a.superviseOnce(ctx, *registryPath, amq.NewCLI(*amqPath), *self, *wakeTimeout)
 	}
 	if *once {
 		return runOnce()
@@ -252,7 +257,7 @@ func (a App) supervise(ctx context.Context, args []string) error {
 	}
 }
 
-func (a App) superviseOnce(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string) error {
+func (a App) superviseOnce(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration) error {
 	store := registry.New(registryPath)
 	file, err := store.Load()
 	if err != nil {
@@ -273,9 +278,10 @@ func (a App) superviseOnce(ctx context.Context, registryPath string, wake superv
 			continue
 		}
 		reconciler := supervisor.Reconciler{
-			Wake:      wake,
-			Adapter:   selected,
-			InjectVia: self,
+			Wake:        wake,
+			Adapter:     selected,
+			InjectVia:   self,
+			WakeTimeout: wakeTimeout,
 		}
 		updated, result := reconciler.Reconcile(ctx, entry)
 		if err := store.UpdateEntry(updated); err != nil {

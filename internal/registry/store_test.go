@@ -93,6 +93,33 @@ func TestStoreForget(t *testing.T) {
 	}
 }
 
+func TestStoreDoesNotChmodExistingCustomRegistryDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "custom")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+	store := New(filepath.Join(dir, "registry.json"))
+	_, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "file",
+		Target:  "/tmp/inbox.txt",
+	})
+	if err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("dir mode = %v, want existing 0755 preserved", got)
+	}
+}
+
 func TestStoreReplaceSessionAdapterRemovesOnlyMatchingEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	store := New(path)

@@ -35,7 +35,7 @@ printf ready > "$ready"
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
-		Timeout:   time.Second,
+		Timeout:   5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("StartWake() error = %v", err)
@@ -73,13 +73,39 @@ exit 7
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
-		Timeout:   time.Second,
+		Timeout:   5 * time.Second,
 	})
 	if err == nil {
 		t.Fatal("StartWake() error = nil, want readiness failure")
 	}
 	if !strings.Contains(err.Error(), "amq wake exited before becoming ready") {
 		t.Fatalf("error = %v, want readiness failure", err)
+	}
+}
+
+func TestStartWakeTimesOutWhenReadyFileNeverAppears(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+sleep 10
+`)
+
+	start := time.Now()
+	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root:      "/tmp/amq-root",
+		Me:        "codex",
+		InjectVia: "/tmp/amq-keepalive",
+		Adapter:   "ghostty",
+		Target:    "ghostty:terminal:abc",
+		Timeout:   500 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("StartWake() error = nil, want readiness timeout")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %v, want timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("StartWake took %s, want timeout branch to return promptly", elapsed)
 	}
 }
 

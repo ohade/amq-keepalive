@@ -15,7 +15,7 @@ import (
 
 var ErrAlreadyRunning = errors.New("amq wake already running")
 
-const defaultWakeReadyTimeout = 2 * time.Second
+const defaultWakeReadyTimeout = 10 * time.Second
 
 type Env struct {
 	SchemaVersion int               `json:"schema_version"`
@@ -145,9 +145,10 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	go func() {
 		done <- cmd.Wait()
 	}()
-	if err := waitForWakeReady(ctx, done, readyFile, req.Timeout); err != nil {
-		if cmd.Process != nil {
+	if processDone, err := waitForWakeReady(ctx, done, readyFile, req.Timeout); err != nil {
+		if !processDone && cmd.Process != nil {
 			_ = cmd.Process.Kill()
+			<-done
 		}
 		return err
 	}
@@ -183,7 +184,7 @@ func parseWakeRepair(data []byte) (WakeRepairResult, error) {
 	return result, nil
 }
 
-func waitForWakeReady(ctx context.Context, done <-chan error, readyFile string, timeout time.Duration) error {
+func waitForWakeReady(ctx context.Context, done <-chan error, readyFile string, timeout time.Duration) (bool, error) {
 	if timeout <= 0 {
 		timeout = defaultWakeReadyTimeout
 	}
@@ -194,24 +195,24 @@ func waitForWakeReady(ctx context.Context, done <-chan error, readyFile string, 
 
 	for {
 		if wakeReadyFileExists(readyFile) {
-			return nil
+			return false, nil
 		}
 		select {
 		case err := <-done:
 			if wakeReadyFileExists(readyFile) {
-				return nil
+				return true, nil
 			}
 			if err == nil {
-				return errors.New("amq wake exited before becoming ready")
+				return true, errors.New("amq wake exited before becoming ready")
 			}
 			if strings.Contains(strings.ToLower(err.Error()), "already") {
-				return ErrAlreadyRunning
+				return true, ErrAlreadyRunning
 			}
-			return fmt.Errorf("amq wake exited before becoming ready: %w", err)
+			return true, fmt.Errorf("amq wake exited before becoming ready: %w", err)
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("timed out after %s waiting for amq wake readiness", timeout)
+			return false, fmt.Errorf("timed out after %s waiting for amq wake readiness", timeout)
 		case <-ticker.C:
 		}
 	}

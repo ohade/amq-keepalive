@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -140,6 +141,9 @@ func Install(ctx context.Context, opts Options) error {
 	if err := os.MkdirAll(filepath.Dir(opts.StdoutPath), 0o755); err != nil {
 		return err
 	}
+	if err := ensureExistingPlistOwned(opts.PlistPath, opts.Label); err != nil {
+		return err
+	}
 	if err := writeFileAtomic(opts.PlistPath, BuildPlist(opts), 0o644); err != nil {
 		return err
 	}
@@ -163,6 +167,11 @@ func Uninstall(ctx context.Context, label string, plistPath string, unload bool)
 			return err
 		}
 		plistPath = path
+	}
+	if err := ensureExistingPlistOwned(plistPath, label); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if unload {
 		_ = runLaunchctl(ctx, "bootout", serviceTarget(label))
@@ -231,6 +240,30 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return os.Chmod(path, mode)
 }
 
+func ensureExistingPlistOwned(path, label string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !isOwnedPlist(data, label) {
+		return fmt.Errorf("refusing to modify non-amq-keepalive launchd plist %s", path)
+	}
+	return nil
+}
+
+func isOwnedPlist(data []byte, label string) bool {
+	return bytes.Contains(data, []byte("<key>Label</key>")) &&
+		bytes.Contains(data, []byte("<string>"+label+"</string>")) &&
+		bytes.Contains(data, []byte("<key>ProgramArguments</key>")) &&
+		bytes.Contains(data, []byte("<string>supervise</string>")) &&
+		bytes.Contains(data, []byte("<string>--registry</string>")) &&
+		bytes.Contains(data, []byte("<string>--amq</string>")) &&
+		bytes.Contains(data, []byte("<string>--self</string>"))
+}
+
 func runLaunchctl(ctx context.Context, args ...string) error {
 	out, err := exec.CommandContext(ctx, "launchctl", args...).CombinedOutput()
 	if err != nil {
@@ -281,7 +314,13 @@ func writeKeyDict(buf *bytes.Buffer, key string, values map[string]string) {
 	buf.WriteString("\t<key>")
 	xml.EscapeText(buf, []byte(key))
 	buf.WriteString("</key>\n\t<dict>\n")
-	for dictKey, value := range values {
+	keys := make([]string, 0, len(values))
+	for dictKey := range values {
+		keys = append(keys, dictKey)
+	}
+	sort.Strings(keys)
+	for _, dictKey := range keys {
+		value := values[dictKey]
 		buf.WriteString("\t\t<key>")
 		xml.EscapeText(buf, []byte(dictKey))
 		buf.WriteString("</key>\n\t\t<string>")

@@ -39,6 +39,7 @@ type Reconciler struct {
 	BackoffMax  time.Duration
 	Jitter      func(time.Duration) time.Duration
 	InjectVia   string
+	WakeTimeout time.Duration
 }
 
 type Result struct {
@@ -123,6 +124,7 @@ func (r Reconciler) startWake(ctx context.Context, entry registry.Entry, now tim
 		InjectVia: r.InjectVia,
 		Adapter:   entry.Adapter,
 		Target:    entry.Target,
+		Timeout:   r.WakeTimeout,
 	})
 	if err == nil || (allowAlreadyRunning && errors.Is(err, amq.ErrAlreadyRunning)) {
 		return markActive(entry, now, ActionStarted), Result{Action: ActionStarted, Started: true, AMQTouched: true}

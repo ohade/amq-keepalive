@@ -31,7 +31,9 @@ The Ghostty adapter target contract is `ghostty:terminal:<id>`. `attach
 front Ghostty window when `--target` is omitted. Probe and inject fail closed
 unless that id resolves to exactly one Ghostty terminal. Injection uses Ghostty's
 native `input text` and `send key "enter"` AppleScript commands; it does not use
-window titles, System Events, focus stealing, or the clipboard.
+window titles, System Events, focus stealing, or the clipboard. Trailing CR/LF
+characters are trimmed before the explicit Enter key is sent, so newline-ended
+AMQ payloads do not double-submit.
 
 Old title targets are intentionally rejected. Re-run `reattach --adapter ghostty`
 from the current session to register a fresh terminal-id target.
@@ -68,7 +70,8 @@ replaces any prior entry for the same AMQ root, agent, and adapter, and then
 starts wake for the fresh target. Startup waits for AMQ's readiness marker before
 reporting success, so a refused or already-running wake is not silently accepted.
 This keeps the registry from accumulating stale terminal ids after a session is
-recreated.
+recreated. Use `--wake-ready-timeout` on `attach`, `reattach`, or `supervise` to
+adjust the readiness wait; the default is 10 seconds.
 
 Supported hook install:
 
@@ -87,7 +90,9 @@ print the exact snippets without writing files.
 The wrapper bounds the actual `reattach` work with
 `AMQ_KEEPALIVE_TIMEOUT_SECONDS` (default: 10). If Ghostty discovery, probing, or
 AMQ wake startup hangs, the hook logs the timeout and still returns `{}` so
-agent startup continues.
+agent startup continues. Invalid or non-positive timeout overrides are normalized
+back to the default. The hook also bounds the initial stdin read so a host that
+leaves stdin open cannot stall startup before the reattach watchdog begins.
 
 Manual Claude Code SessionStart hook snippet:
 
@@ -141,6 +146,11 @@ For a dry plist write without loading the service:
 ./amq-keepalive install-launchd --no-load --plist /tmp/com.ohade.amq-keepalive.plist
 ```
 
+`install-launchd` and `uninstall` refuse to overwrite or remove an existing
+plist unless it already looks like an `amq-keepalive supervise` LaunchAgent with
+the requested label. This protects unrelated user LaunchAgents when `--plist` is
+customized.
+
 For AMQ wake integration, `supervise` starts AMQ with this binary as the
 `--inject-via` executable. AMQ appends the message payload as the final argument,
 and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
@@ -164,3 +174,5 @@ and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
   closed and logs the failure instead of pretending the old process was updated.
   Stale/dead wake locks are handled by starting wake for the fresh target.
 - `install-launchd` installs only a per-user LaunchAgent for this supervisor.
+- Custom `--registry` parent directories keep their existing permissions; files
+  created by this tool are still written with private registry/lock modes.

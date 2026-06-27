@@ -110,6 +110,20 @@ func TestGhosttyInjectPassesTerminalIDAndPayloadAsArguments(t *testing.T) {
 	}
 }
 
+func TestGhosttyInjectTrimsTrailingLineBreaksBeforeEnter(t *testing.T) {
+	skipNonDarwin(t)
+	runner := &fakeCommandRunner{}
+	payload := "AMQ [team-upgrader_v3]: message from claude\nline two\r\n\n"
+	err := (Ghostty{Runner: runner}).Inject(context.Background(), "ghostty:terminal:terminal-1", payload)
+	if err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+	call := runner.calls[0]
+	if got, want := call.args[len(call.args)-1], "AMQ [team-upgrader_v3]: message from claude\nline two"; got != want {
+		t.Fatalf("payload arg = %q, want %q", got, want)
+	}
+}
+
 func TestGhosttyScriptsFailClosedOnTerminalIDs(t *testing.T) {
 	for name, script := range map[string]string{
 		"probe":  ghosttyProbeScript,
