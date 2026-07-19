@@ -204,7 +204,7 @@ func BuildPlist(opts Options) []byte {
 	writeKeyString(&buf, "StandardOutPath", opts.StdoutPath)
 	writeKeyString(&buf, "StandardErrorPath", opts.StderrPath)
 	writeKeyDict(&buf, "EnvironmentVariables", map[string]string{
-		"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+		"PATH": "/Applications/cmux.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
 	})
 	buf.WriteString("</dict>\n")
 	buf.WriteString("</plist>\n")
