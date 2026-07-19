@@ -2,8 +2,11 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
+
+var ErrTargetNotFound = errors.New("adapter target not found")
 
 type Adapter interface {
 	Name() string
@@ -13,6 +16,10 @@ type Adapter interface {
 
 type Discoverer interface {
 	Discover(ctx context.Context) (string, error)
+}
+
+type TargetNormalizer interface {
+	NormalizeTarget(target string) (string, error)
 }
 
 type Registry struct {
@@ -28,7 +35,7 @@ func NewRegistry(adapters ...Adapter) Registry {
 }
 
 func DefaultRegistry() Registry {
-	return NewRegistry(File{}, Ghostty{})
+	return NewRegistry(File{}, Ghostty{}, Cmux{})
 }
 
 func (r Registry) Get(name string) (Adapter, error) {
