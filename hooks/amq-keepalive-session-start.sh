@@ -7,7 +7,7 @@
 set -u
 
 BIN="${AMQ_KEEPALIVE_BIN:-amq-keepalive}"
-ADAPTER="${AMQ_KEEPALIVE_ADAPTER:-ghostty}"
+ADAPTER="${AMQ_KEEPALIVE_ADAPTER:-}"
 TARGET="${AMQ_KEEPALIVE_TARGET:-}"
 REGISTRY="${AMQ_KEEPALIVE_REGISTRY:-}"
 AMQ_BIN="${AMQ_KEEPALIVE_AMQ:-amq}"
@@ -20,6 +20,18 @@ LOG_PATH="${AMQ_KEEPALIVE_LOG:-$HOME/.amq-keepalive/session-start.log}"
 DEFAULT_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_DEFAULT_TIMEOUT_SECONDS:-10}"
 TIMEOUT_SECONDS="${AMQ_KEEPALIVE_TIMEOUT_SECONDS:-$DEFAULT_TIMEOUT_SECONDS}"
 STDIN_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_STDIN_TIMEOUT_SECONDS:-1}"
+WAKE_TIMEOUT_MILLISECONDS="${AMQ_KEEPALIVE_WAKE_TIMEOUT_MILLISECONDS:-}"
+
+if [[ -z "$ADAPTER" ]]; then
+    if [[ -n "${CMUX_SURFACE_ID:-}" ]]; then
+        ADAPTER="cmux"
+    else
+        ADAPTER="ghostty"
+    fi
+fi
+if [[ "$ADAPTER" == "cmux" && -z "$TARGET" && -n "${CMUX_SURFACE_ID:-}" ]]; then
+    TARGET="cmux:surface:${CMUX_SURFACE_ID}"
+fi
 
 if [[ "${AMQ_KEEPALIVE_DISABLED:-0}" == "1" ]]; then
     printf '{}\n'
@@ -41,6 +53,27 @@ if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$TIMEOUT_SECONDS" -gt 0 ]]; then
 fi
 if ! [[ "$STDIN_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$STDIN_TIMEOUT_SECONDS" -gt 0 ]]; then
     STDIN_TIMEOUT_SECONDS=1
+fi
+
+outer_timeout_milliseconds=$((TIMEOUT_SECONDS * 1000))
+default_wake_timeout_milliseconds=$((outer_timeout_milliseconds - 2000))
+if [[ "$default_wake_timeout_milliseconds" -le 0 ]]; then
+    default_wake_timeout_milliseconds=$((outer_timeout_milliseconds / 2))
+fi
+if [[ "$default_wake_timeout_milliseconds" -le 0 ]]; then
+    default_wake_timeout_milliseconds=100
+fi
+if ! [[ "$WAKE_TIMEOUT_MILLISECONDS" =~ ^[0-9]+$ && "$WAKE_TIMEOUT_MILLISECONDS" -gt 0 ]]; then
+    [[ -n "$WAKE_TIMEOUT_MILLISECONDS" ]] && log "invalid wake timeout ${WAKE_TIMEOUT_MILLISECONDS}ms; using ${default_wake_timeout_milliseconds}ms"
+    WAKE_TIMEOUT_MILLISECONDS="$default_wake_timeout_milliseconds"
+fi
+if [[ "$WAKE_TIMEOUT_MILLISECONDS" -ge "$outer_timeout_milliseconds" ]]; then
+    clamped_wake_timeout_milliseconds=$((outer_timeout_milliseconds - 500))
+    if [[ "$clamped_wake_timeout_milliseconds" -le 0 ]]; then
+        clamped_wake_timeout_milliseconds=100
+    fi
+    log "wake timeout ${WAKE_TIMEOUT_MILLISECONDS}ms must be shorter than outer ${outer_timeout_milliseconds}ms; using ${clamped_wake_timeout_milliseconds}ms"
+    WAKE_TIMEOUT_MILLISECONDS="$clamped_wake_timeout_milliseconds"
 fi
 
 read_hook_input() {
@@ -65,7 +98,7 @@ if ! command -v "$BIN" >/dev/null 2>&1; then
     exit 0
 fi
 
-args=(reattach --adapter "$ADAPTER" --amq "$AMQ_BIN")
+args=(reattach --adapter "$ADAPTER" --amq "$AMQ_BIN" --wake-ready-timeout "${WAKE_TIMEOUT_MILLISECONDS}ms")
 [[ -n "${AMQ_KEEPALIVE_SELF:-}" ]] && args+=(--self "$SELF_BIN")
 [[ -n "$TARGET" ]] && args+=(--target "$TARGET")
 [[ -n "$REGISTRY" ]] && args+=(--registry "$REGISTRY")
@@ -97,7 +130,7 @@ reattach_pid=$!
         pkill -KILL -P "$reattach_pid" 2>/dev/null || true
         kill -KILL "$reattach_pid" 2>/dev/null || true
     fi
-) &
+) >/dev/null 2>&1 &
 watchdog_pid=$!
 
 wait "$reattach_pid" 2>/dev/null
@@ -108,15 +141,15 @@ wait "$watchdog_pid" 2>/dev/null || true
 
 if [[ -f "$timeout_marker" ]]; then
     rm -f "$timeout_marker" 2>/dev/null || true
-    log "reattach timed out after ${TIMEOUT_SECONDS}s adapter=$ADAPTER"
+    log "reattach timed out after ${TIMEOUT_SECONDS}s adapter=$ADAPTER target=${TARGET:-auto}"
     printf '{}\n'
     exit 0
 fi
 
 if [[ "$status" -eq 0 ]]; then
-    log "reattach ok adapter=$ADAPTER"
+    log "reattach ok adapter=$ADAPTER target=${TARGET:-auto}"
 else
-    log "reattach failed status=$status adapter=$ADAPTER"
+    log "reattach failed status=$status adapter=$ADAPTER target=${TARGET:-auto}"
 fi
 
 printf '{}\n'

@@ -53,6 +53,7 @@ printf ready > "$ready"
 		"-inject-arg\ninject\n",
 		"-inject-arg\nghostty\n",
 		"-inject-arg\nghostty:terminal:abc\n",
+		"--accept-existing-wake\n",
 		"-ready-file\n",
 	} {
 		if !strings.Contains(args, want) {
@@ -80,6 +81,48 @@ exit 7
 	}
 	if !strings.Contains(err.Error(), "amq wake exited before becoming ready") {
 		t.Fatalf("error = %v, want readiness failure", err)
+	}
+}
+
+func TestRetireWakePassesExactSavedTargetIdentity(t *testing.T) {
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.log")
+	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '%s\n' "$@" > "$AMQ_KEEPALIVE_ARGS_LOG"
+printf '%s\n' '{"status":"retired","agent":"codex","root":"/tmp/amq-root","pid":4242}'
+`)
+
+	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
+		Root:      "/tmp/amq-root",
+		Me:        "codex",
+		InjectVia: "/tmp/amq-keepalive",
+		Adapter:   "cmux",
+		Target:    "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3",
+	})
+	if err != nil {
+		t.Fatalf("RetireWake() error = %v", err)
+	}
+	if result.Status != "retired" || result.PID != 4242 {
+		t.Fatalf("result = %#v", result)
+	}
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("read args log: %v", err)
+	}
+	args := string(data)
+	for _, want := range []string{
+		"wake\nretire\n-json\n",
+		"-root\n/tmp/amq-root\n",
+		"-me\ncodex\n",
+		"-inject-via\n/tmp/amq-keepalive\n",
+		"-inject-arg\ninject\n",
+		"-inject-arg\ncmux\n",
+		"-inject-arg\ncmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3\n",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("args log missing %q:\n%s", want, args)
+		}
 	}
 }
 

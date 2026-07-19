@@ -38,6 +38,15 @@ type WakeRepairResult struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type WakeRetireResult struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+	Agent  string `json:"agent,omitempty"`
+	Root   string `json:"root,omitempty"`
+	PID    int    `json:"pid,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
 func (r WakeRepairResult) Text() string {
 	return strings.TrimSpace(strings.Join([]string{r.Status, r.Reason, r.Message, r.Error}, " "))
 }
@@ -49,6 +58,14 @@ type StartWakeRequest struct {
 	Adapter   string
 	Target    string
 	Timeout   time.Duration
+}
+
+type RetireWakeRequest struct {
+	Root      string
+	Me        string
+	InjectVia string
+	Adapter   string
+	Target    string
 }
 
 type CLI struct {
@@ -99,6 +116,47 @@ func (c CLI) RepairWake(ctx context.Context, root, me string) (WakeRepairResult,
 	return result, err
 }
 
+func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (WakeRetireResult, error) {
+	if req.InjectVia == "" {
+		return WakeRetireResult{}, errors.New("inject-via executable is required")
+	}
+	if req.Adapter == "" {
+		return WakeRetireResult{}, errors.New("adapter is required")
+	}
+	if req.Target == "" {
+		return WakeRetireResult{}, errors.New("target is required")
+	}
+	args := []string{"wake", "retire", "-json"}
+	if req.Root != "" {
+		args = append(args, "-root", req.Root)
+	}
+	if req.Me != "" {
+		args = append(args, "-me", req.Me)
+	}
+	args = append(args,
+		"-inject-via", req.InjectVia,
+		"-inject-arg", "inject",
+		"-inject-arg", req.Adapter,
+		"-inject-arg", req.Target,
+	)
+	stdout, stderr, err := c.run(ctx, args...)
+	var result WakeRetireResult
+	if parseErr := json.Unmarshal(stdout, &result); parseErr != nil {
+		if err != nil {
+			return WakeRetireResult{Status: "error", Error: strings.TrimSpace(stderr)},
+				fmt.Errorf("amq wake retire failed: %w: %s", err, strings.TrimSpace(stderr))
+		}
+		return WakeRetireResult{}, fmt.Errorf("parse amq wake retire: %w", parseErr)
+	}
+	if result.Error == "" && len(stderr) > 0 {
+		result.Error = strings.TrimSpace(stderr)
+	}
+	if err != nil {
+		return result, fmt.Errorf("amq wake retire failed: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	return result, nil
+}
+
 func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	if req.InjectVia == "" {
 		return errors.New("inject-via executable is required")
@@ -129,6 +187,7 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		"-inject-arg", "inject",
 		"-inject-arg", req.Adapter,
 		"-inject-arg", req.Target,
+		"--accept-existing-wake",
 		"-ready-file", readyFile,
 	)
 

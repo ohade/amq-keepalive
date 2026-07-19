@@ -38,6 +38,7 @@ func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 		"<key>RunAtLoad</key>",
 		"<true/>",
 		"<key>KeepAlive</key>",
+		"/Applications/cmux.app/Contents/Resources/bin:/opt/homebrew/bin",
 	} {
 		if !bytes.Contains(plist, []byte(want)) {
 			t.Fatalf("plist missing %q:\n%s", want, plist)

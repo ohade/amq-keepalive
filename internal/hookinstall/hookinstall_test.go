@@ -202,7 +202,9 @@ func TestSessionStartScriptDoesNotBlockOnOpenStdin(t *testing.T) {
 		"AMQ_KEEPALIVE_STDIN_TIMEOUT_SECONDS=1",
 	)
 	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	start := time.Now()
 	if err := cmd.Run(); err != nil {
@@ -214,11 +216,160 @@ func TestSessionStartScriptDoesNotBlockOnOpenStdin(t *testing.T) {
 	if got := stdout.String(); got != "{}\n" {
 		t.Fatalf("stdout = %q, want empty hook response", got)
 	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want silent quick success", got)
+	}
+}
+
+func TestSessionStartScriptAutoSelectsExactCmuxSurfaceAndLogsFailure(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeSessionStartScript(t, dir)
+	argsPath := filepath.Join(dir, "args.log")
+	binaryPath := writeExecutableBody(t, filepath.Join(dir, "amq-keepalive"), `#!/bin/sh
+printf '%s\n' "$@" > "$AMQ_KEEPALIVE_CAPTURE"
+echo 'existing wake target differs' >&2
+exit 7
+`)
+	logPath := filepath.Join(dir, "session-start.log")
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Stdin = strings.NewReader("{}\n")
+	cmd.Env = append(withoutEnv(os.Environ(),
+		"AMQ_KEEPALIVE_ADAPTER",
+		"AMQ_KEEPALIVE_TARGET",
+		"CMUX_SURFACE_ID",
+	),
+		"AMQ_KEEPALIVE_BIN="+binaryPath,
+		"AMQ_KEEPALIVE_CAPTURE="+argsPath,
+		"AMQ_KEEPALIVE_LOG="+logPath,
+		"AMQ_KEEPALIVE_TIMEOUT_SECONDS=2",
+		"CMUX_SURFACE_ID=F901D722-6789-4BBB-9818-C4E97F20BEB3",
+	)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("hook run error = %v", err)
+	}
+	if got := stdout.String(); got != "{}\n" {
+		t.Fatalf("stdout = %q, want empty hook response", got)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	argsText := string(argsData)
+	for _, want := range []string{
+		"reattach\n",
+		"--adapter\ncmux\n",
+		"--wake-ready-timeout\n1000ms\n",
+		"--target\ncmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3\n",
+	} {
+		if !strings.Contains(argsText, want) {
+			t.Fatalf("args missing %q:\n%s", want, argsText)
+		}
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "existing wake target differs") ||
+		!strings.Contains(logText, "reattach failed status=7 adapter=cmux target=cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3") {
+		t.Fatalf("log does not expose target mismatch:\n%s", logText)
+	}
+}
+
+func TestSessionStartScriptFallsBackToGhosttyOutsideCmux(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeSessionStartScript(t, dir)
+	argsPath := filepath.Join(dir, "args.log")
+	binaryPath := writeExecutableBody(t, filepath.Join(dir, "amq-keepalive"), `#!/bin/sh
+printf '%s\n' "$@" > "$AMQ_KEEPALIVE_CAPTURE"
+`)
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Stdin = strings.NewReader("{}\n")
+	cmd.Env = append(withoutEnv(os.Environ(),
+		"AMQ_KEEPALIVE_ADAPTER",
+		"AMQ_KEEPALIVE_TARGET",
+		"CMUX_SURFACE_ID",
+	),
+		"AMQ_KEEPALIVE_BIN="+binaryPath,
+		"AMQ_KEEPALIVE_CAPTURE="+argsPath,
+		"AMQ_KEEPALIVE_LOG="+filepath.Join(dir, "session-start.log"),
+		"AMQ_KEEPALIVE_TIMEOUT_SECONDS=2",
+	)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("hook run error = %v", err)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	argsText := string(argsData)
+	if !strings.Contains(argsText, "--adapter\nghostty\n") {
+		t.Fatalf("args do not fall back to Ghostty:\n%s", argsText)
+	}
+	if strings.Contains(argsText, "--target\n") {
+		t.Fatalf("fallback unexpectedly supplied a target:\n%s", argsText)
+	}
+}
+
+func TestSessionStartScriptClampsInnerWakeTimeoutBelowOuterWatchdog(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := writeSessionStartScript(t, dir)
+	argsPath := filepath.Join(dir, "args.log")
+	logPath := filepath.Join(dir, "session-start.log")
+	binaryPath := writeExecutableBody(t, filepath.Join(dir, "amq-keepalive"), `#!/bin/sh
+printf '%s\n' "$@" > "$AMQ_KEEPALIVE_CAPTURE"
+`)
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Stdin = strings.NewReader("{}\n")
+	cmd.Env = append(os.Environ(),
+		"AMQ_KEEPALIVE_BIN="+binaryPath,
+		"AMQ_KEEPALIVE_CAPTURE="+argsPath,
+		"AMQ_KEEPALIVE_LOG="+logPath,
+		"AMQ_KEEPALIVE_TIMEOUT_SECONDS=2",
+		"AMQ_KEEPALIVE_WAKE_TIMEOUT_MILLISECONDS=2000",
+	)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("hook run error = %v", err)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if !strings.Contains(string(argsData), "--wake-ready-timeout\n1500ms\n") {
+		t.Fatalf("inner timeout was not clamped below outer watchdog:\n%s", argsData)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(logData), "wake timeout 2000ms must be shorter than outer 2000ms; using 1500ms") {
+		t.Fatalf("clamp was not logged:\n%s", logData)
+	}
 }
 
 func writeExecutable(t *testing.T, path string) string {
 	t.Helper()
 	return writeExecutableBody(t, path, "#!/bin/sh\nexit 0\n")
+}
+
+func withoutEnv(env []string, keys ...string) []string {
+	blocked := map[string]bool{}
+	for _, key := range keys {
+		blocked[key] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		key, _, _ := strings.Cut(item, "=")
+		if !blocked[key] {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func writeSessionStartScript(t *testing.T, dir string) string {

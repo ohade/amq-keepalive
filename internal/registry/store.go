@@ -196,7 +196,9 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 		}
 		next := make([]Entry, 0, len(file.Entries)+1)
 		for _, existing := range file.Entries {
-			if existing.Root == prepared.Root && existing.Agent == prepared.Agent && existing.Adapter == prepared.Adapter {
+			// AMQ permits one wake process per root and agent. Reattach therefore
+			// replaces the old registration even when the terminal adapter changed.
+			if existing.Root == prepared.Root && existing.Agent == prepared.Agent {
 				removed = append(removed, existing)
 				continue
 			}
@@ -252,16 +254,36 @@ func (s *Store) UpdateEntry(entry Entry) error {
 }
 
 func (s *Store) Forget(id string) (bool, error) {
-	removed := false
+	removed, err := s.ForgetMany([]string{id})
+	return removed == 1, err
+}
+
+func (s *Store) ForgetMany(ids []string) (int, error) {
+	wanted := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+	removed := 0
 	err := s.withLock(func() error {
 		file, err := s.loadUnlocked()
 		if err != nil {
 			return err
 		}
+		found := 0
+		for _, entry := range file.Entries {
+			if _, ok := wanted[entry.ID]; ok {
+				found++
+			}
+		}
+		if found != len(wanted) {
+			return fmt.Errorf("found %d of %d registry entries requested for removal", found, len(wanted))
+		}
 		next := file.Entries[:0]
 		for _, entry := range file.Entries {
-			if entry.ID == id {
-				removed = true
+			if _, ok := wanted[entry.ID]; ok {
+				removed++
 				continue
 			}
 			next = append(next, entry)

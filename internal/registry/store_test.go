@@ -93,6 +93,47 @@ func TestStoreForget(t *testing.T) {
 	}
 }
 
+func TestStoreForgetManyRemovesRequestedEntriesInOneSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	store := New(path)
+	var ids []string
+	for _, agent := range []string{"codex", "claude", "observer"} {
+		entry, err := store.Upsert(Entry{Root: "/tmp/amq-root", Agent: agent, Adapter: "file", Target: "/tmp/" + agent})
+		if err != nil {
+			t.Fatalf("Upsert(%s): %v", agent, err)
+		}
+		ids = append(ids, entry.ID)
+	}
+	removed, err := store.ForgetMany(ids[:2])
+	if err != nil || removed != 2 {
+		t.Fatalf("ForgetMany removed=%d err=%v", removed, err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.Entries) != 1 || loaded.Entries[0].Agent != "observer" {
+		t.Fatalf("entries=%#v, want observer only", loaded.Entries)
+	}
+}
+
+func TestStoreForgetManyRefusesPartialMatchWithoutRemovingAnything(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	store := New(path)
+	entry, err := store.Upsert(Entry{Root: "/tmp/amq-root", Agent: "codex", Adapter: "file", Target: "/tmp/codex"})
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	removed, err := store.ForgetMany([]string{entry.ID, "missing-id"})
+	if err == nil || removed != 0 {
+		t.Fatalf("ForgetMany removed=%d err=%v, want refusal", removed, err)
+	}
+	loaded, loadErr := store.Load()
+	if loadErr != nil || len(loaded.Entries) != 1 || loaded.Entries[0].ID != entry.ID {
+		t.Fatalf("registry changed after partial-match refusal: entries=%#v err=%v", loaded.Entries, loadErr)
+	}
+}
+
 func TestStoreDoesNotChmodExistingCustomRegistryDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "custom")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -120,7 +161,7 @@ func TestStoreDoesNotChmodExistingCustomRegistryDir(t *testing.T) {
 	}
 }
 
-func TestStoreReplaceSessionAdapterRemovesOnlyMatchingEntries(t *testing.T) {
+func TestStoreReplaceSessionAdapterRemovesAllEntriesForRootAndAgent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	store := New(path)
 
@@ -142,47 +183,51 @@ func TestStoreReplaceSessionAdapterRemovesOnlyMatchingEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Upsert(keepDifferentAgent) error = %v", err)
 	}
-	keepDifferentAdapter, err := store.Upsert(Entry{
+	replaceDifferentAdapter, err := store.Upsert(Entry{
 		Root:    "/tmp/amq-root",
 		Agent:   "codex",
-		Adapter: "other",
-		Target:  "/tmp/other-inbox.txt",
+		Adapter: "ghostty",
+		Target:  "ghostty:terminal:old",
 	})
 	if err != nil {
-		t.Fatalf("Upsert(keepDifferentAdapter) error = %v", err)
+		t.Fatalf("Upsert(replaceDifferentAdapter) error = %v", err)
 	}
 
 	next, removed, err := store.ReplaceSessionAdapter(Entry{
 		Root:    "/tmp/amq-root",
 		Agent:   "codex",
-		Adapter: "file",
-		Target:  "/tmp/new-inbox.txt",
+		Adapter: "cmux",
+		Target:  "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3",
 	})
 	if err != nil {
 		t.Fatalf("ReplaceSessionAdapter() error = %v", err)
 	}
-	if next.Target != "/tmp/new-inbox.txt" {
-		t.Fatalf("Target = %q, want new target", next.Target)
+	if next.Adapter != "cmux" {
+		t.Fatalf("Adapter = %q, want cmux", next.Adapter)
 	}
-	if len(removed) != 1 || removed[0].ID != replaceMe.ID {
-		t.Fatalf("removed = %#v, want only %q", removed, replaceMe.ID)
+	removedIDs := map[string]bool{}
+	for _, entry := range removed {
+		removedIDs[entry.ID] = true
+	}
+	if len(removed) != 2 || !removedIDs[replaceMe.ID] || !removedIDs[replaceDifferentAdapter.ID] {
+		t.Fatalf("removed = %#v, want old file and Ghostty entries", removed)
 	}
 
 	loaded, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(loaded.Entries) != 3 {
-		t.Fatalf("entries = %d, want 3", len(loaded.Entries))
+	if len(loaded.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(loaded.Entries))
 	}
 	ids := map[string]bool{}
 	for _, entry := range loaded.Entries {
 		ids[entry.ID] = true
-		if entry.ID == replaceMe.ID {
+		if entry.ID == replaceMe.ID || entry.ID == replaceDifferentAdapter.ID {
 			t.Fatalf("old matching entry still present: %#v", entry)
 		}
 	}
-	for _, want := range []string{keepDifferentAgent.ID, keepDifferentAdapter.ID, next.ID} {
+	for _, want := range []string{keepDifferentAgent.ID, next.ID} {
 		if !ids[want] {
 			t.Fatalf("entry %q missing after replace; entries=%#v", want, loaded.Entries)
 		}
@@ -217,6 +262,45 @@ func TestStoreConcurrentUpsertsDoNotLoseEntries(t *testing.T) {
 	}
 	if len(loaded.Entries) != 20 {
 		t.Fatalf("entries = %d, want 20", len(loaded.Entries))
+	}
+}
+
+func TestStoreConcurrentSameTargetReplacementsConverge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	store := New(path)
+	if _, err := store.Upsert(Entry{
+		Root:    "/tmp/amq-root",
+		Agent:   "codex",
+		Adapter: "ghostty",
+		Target:  "ghostty:terminal:old",
+	}); err != nil {
+		t.Fatalf("Upsert(old) error = %v", err)
+	}
+
+	const target = "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := store.ReplaceSessionAdapter(Entry{
+				Root:    "/tmp/amq-root",
+				Agent:   "codex",
+				Adapter: "cmux",
+				Target:  target,
+			}); err != nil {
+				t.Errorf("ReplaceSessionAdapter() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Entries) != 1 || loaded.Entries[0].Adapter != "cmux" || loaded.Entries[0].Target != target {
+		t.Fatalf("entries = %#v, want one converged cmux registration", loaded.Entries)
 	}
 }
 
