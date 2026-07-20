@@ -106,7 +106,7 @@ func NormalizeOptions(opts Options) (Options, error) {
 		opts.RegistryPath = abs
 	}
 	if opts.Interval <= 0 {
-		opts.Interval = 10 * time.Second
+		opts.Interval = time.Minute
 	}
 	if opts.PlistPath == "" {
 		path, err := DefaultPlistPath(opts.Label)
