@@ -125,6 +125,7 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		args = append(args, "-me", req.Me)
 	}
 	args = append(args,
+		"--baseline-existing",
 		"-inject-via", req.InjectVia,
 		"-inject-arg", "inject",
 		"-inject-arg", req.Adapter,

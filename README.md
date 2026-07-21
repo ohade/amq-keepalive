@@ -103,7 +103,10 @@ is marked active, so there is no post-readiness commit window that can orphan a
 live wake. Use
 `--wake-ready-timeout` on `attach`, `reattach`, or `supervise` to adjust the
 readiness wait; the default is 10 seconds. This requires an AMQ build that
-supports `--accept-existing-wake` target verification.
+supports `--accept-existing-wake` target verification and
+`--baseline-existing`. The baseline keeps messages already waiting in
+`inbox/new` unread, emits no receipts for them, and allows only later arrivals
+to trigger terminal injection for the newly attached wake.
 
 For a launcher recreating a terminal, add `--retire-detached`. This opt-in path
 looks up the prior registration for the same AMQ root and agent. If its adapter
