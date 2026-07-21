@@ -50,6 +50,7 @@ printf ready > "$ready"
 		"wake\n",
 		"-root\n/tmp/amq-root\n",
 		"-me\ncodex\n",
+		"--baseline-existing\n",
 		"-inject-via\n/tmp/amq-keepalive\n",
 		"-inject-arg\ninject\n",
 		"-inject-arg\nghostty\n",
