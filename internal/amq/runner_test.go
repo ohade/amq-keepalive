@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -462,6 +463,7 @@ printf '{"schema":1,"status":"%s","reason_code":"%s","root":"%s","agent":"codex"
 	mutation.Check = false
 	mutation.Generation = checked.Generation
 	mutation.TargetDigest = checked.TargetDigest
+	mutation.ManualPreflightReason = checked.ReasonCode
 	retired, err := cli.RetireWake(context.Background(), mutation)
 	if err != nil || retired.Status != "retired" || retired.ReasonCode != "manual_retired" {
 		t.Fatalf("manual mutation result=%#v err=%v", retired, err)
@@ -726,6 +728,86 @@ func TestAMQProducerGoldenFixtures(t *testing.T) {
 			t.Fatalf("manual refusal producer fixture %s result=%#v err=%v", fixture, result, err)
 		}
 	}
+
+	for _, fixture := range []struct {
+		name, status, reason string
+	}{
+		{"wake-retire-manual-absent-check-v1.json", "eligible", ManualAbsentEligibleReason},
+		{"wake-retire-manual-absent-mutation-v1.json", "retired", ManualAbsentRetiredReason},
+	} {
+		data, err := os.ReadFile(filepath.Join("testdata", fixture.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := parseManualRetireResult(data)
+		if err != nil || result.Status != fixture.status || result.ReasonCode != fixture.reason || result.Generation == "" || result.TargetDigest == "" {
+			t.Fatalf("manual absent producer fixture %s result=%#v err=%v", fixture.name, result, err)
+		}
+	}
+	refusedData, err := os.ReadFile(filepath.Join("testdata", "wake-retire-manual-absent-refused-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused, err := parseManualRetireResult(refusedData)
+	if err != nil || refused.Status != "refused" || refused.ReasonCode != "manual_absent_refused" {
+		t.Fatalf("manual absent refusal producer fixture result=%#v err=%v", refused, err)
+	}
+	if _, err := parseRetireResult(refusedData); err == nil {
+		t.Fatal("automated parser accepted a manual missing-lock refusal")
+	}
+}
+
+func TestManualMissingLockContractIsPhaseAndBindingExact(t *testing.T) {
+	root := t.TempDir()
+	base := RetireWakeRequest{Root: root, Me: "worker", Check: true, Manual: true}
+	result := RetireWakeResult{Schema: 1, Status: "eligible", ReasonCode: ManualAbsentEligibleReason, Root: root, Agent: "worker", Generation: "generation-1", TargetDigest: "sha256:target-1"}
+	if err := validateRetireEcho(base, result); err != nil {
+		t.Fatalf("absent preflight rejected: %v", err)
+	}
+	mutation := base
+	mutation.Check = false
+	mutation.Generation, mutation.TargetDigest = result.Generation, result.TargetDigest
+	mutation.ManualPreflightReason = result.ReasonCode
+	retired := result
+	retired.Status, retired.ReasonCode = "retired", ManualAbsentRetiredReason
+	if err := validateRetireEcho(mutation, retired); err != nil {
+		t.Fatalf("absent mutation rejected: %v", err)
+	}
+	payload := []byte(fmt.Sprintf(`{"schema":1,"status":"eligible","reason_code":%q,"root":%q,"agent":"worker","lock":"/tmp/lock","target":"/tmp/target","generation":"generation-1","target_digest":"sha256:target-1"}`, ManualAbsentEligibleReason, root))
+	if _, err := parseRetireResult(payload); err == nil {
+		t.Fatal("automated parser accepted a manual missing-lock reason")
+	}
+	automated := bytes.Replace(payload, []byte(ManualAbsentEligibleReason), []byte("owner_gone"), 1)
+	if _, err := parseManualRetireResult(automated); err == nil {
+		t.Fatal("manual parser accepted an automated eligibility reason")
+	}
+	for name, mutate := range map[string]func(*RetireWakeRequest, *RetireWakeResult){
+		"mutation code during check": func(_ *RetireWakeRequest, got *RetireWakeResult) {
+			got.Status, got.ReasonCode = "retired", ManualAbsentRetiredReason
+		},
+		"ordinary completion after absent check": func(_ *RetireWakeRequest, got *RetireWakeResult) {
+			got.Status, got.ReasonCode = "retired", ManualRetiredReason
+		},
+		"lock tombstone after absent check": func(_ *RetireWakeRequest, got *RetireWakeResult) {
+			got.Status, got.ReasonCode = "already_retired", "tombstone_match"
+		},
+		"binding mismatch": func(_ *RetireWakeRequest, got *RetireWakeResult) { got.Generation = "generation-2" },
+		"unknown preflight": func(req *RetireWakeRequest, _ *RetireWakeResult) {
+			req.ManualPreflightReason = "manual_future_eligible"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, got := mutation, retired
+			if name == "mutation code during check" {
+				req = base
+				got = result
+			}
+			mutate(&req, &got)
+			if err := validateRetireEcho(req, got); err == nil {
+				t.Fatalf("phase/code/binding mismatch accepted: req=%#v result=%#v", req, got)
+			}
+		})
+	}
 }
 
 func TestAMQBinaryProducerContracts(t *testing.T) {
@@ -877,6 +959,7 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	}
 	manualRequest.Check = false
 	manualRequest.Generation, manualRequest.TargetDigest = checked.Generation, checked.TargetDigest
+	manualRequest.ManualPreflightReason = checked.ReasonCode
 	retired, err := NewCLI(contractBin).RetireWake(context.Background(), manualRequest)
 	if err != nil || retired.Status != "retired" {
 		t.Fatalf("verified-snapshot real AMQ retirement result=%#v err=%v", retired, err)
@@ -892,6 +975,100 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	proofMismatch, err := parseManualRetireResult(proofMismatchData)
 	if err != nil || proofMismatch.Status != "refused" || proofMismatch.ReasonCode != "manual_retirement_proof_mismatch" {
 		t.Fatalf("real AMQ manual proof mismatch producer result=%#v err=%v output=%s", proofMismatch, err, proofMismatchData)
+	}
+}
+
+func TestAMQBinaryManualAbsentProducerContract(t *testing.T) {
+	bin := os.Getenv("AMQ_BIN")
+	if bin == "" {
+		t.Skip("set AMQ_BIN to run the cross-repository missing-lock producer contract")
+	}
+	root := filepath.Join(t.TempDir(), "amq-root")
+	if output, err := exec.Command(bin, "--no-update-check", "init", "--root", root, "--agents", "worker").CombinedOutput(); err != nil {
+		t.Fatalf("initialize AMQ missing-lock contract root: %v\n%s", err, output)
+	}
+	canonicalRoot, err := canonicalPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractBin := filepath.Join(root, "amq")
+	binData, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contractBin, binData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	injector := filepath.Join(root, "injector")
+	if err := os.WriteFile(injector, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := filepath.Join(root, "ready.json")
+	resultPath := filepath.Join(root, "result.json")
+	wake := exec.Command(contractBin, "--no-update-check", "wake",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
+		"--inject-arg", "inject", "--inject-arg", "file", "--inject-arg", "legacy-target",
+		"--ready-file", readyPath, "--result-file", resultPath,
+	)
+	var wakeOutput bytes.Buffer
+	wake.Stdout, wake.Stderr = &wakeOutput, &wakeOutput
+	if err := wake.Start(); err != nil {
+		t.Fatalf("start AMQ missing-lock setup wake: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- wake.Wait() }()
+	stopped := false
+	t.Cleanup(func() {
+		if stopped || wake.Process == nil {
+			return
+		}
+		_ = wake.Process.Kill()
+		<-done
+	})
+	waitForFile(t, readyPath, 5*time.Second)
+	if err := wake.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("stop AMQ missing-lock setup wake: %v", err)
+	}
+	select {
+	case <-done:
+		stopped = true
+	case <-time.After(5 * time.Second):
+		t.Fatalf("AMQ missing-lock setup wake did not stop; output=%s", wakeOutput.String())
+	}
+	lockPath := filepath.Join(canonicalRoot, "agents", "worker", ".wake.lock")
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("AMQ wake lock survived graceful stop: %v", err)
+	}
+	if output, err := exec.Command(contractBin, "--no-update-check", "presence", "set", "--root", canonicalRoot, "--me", "worker", "--status", "active").CombinedOutput(); err != nil {
+		t.Fatalf("publish legacy blank-generation presence: %v\n%s", err, output)
+	}
+	amqIdentity, err := executable.Capture(contractBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectIdentity, err := executable.Capture(injector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := RetireWakeRequest{
+		Root: canonicalRoot, Me: "worker", InjectVia: injector, Adapter: "file", Target: "legacy-target",
+		Manual: true, Check: true, Timeout: 5 * time.Second,
+		ExpectedAMQIdentity: amqIdentity, ExpectedInjectIdentity: injectIdentity,
+	}
+	checked, err := NewCLI(contractBin).RetireWake(context.Background(), request)
+	if err != nil || checked.Status != "eligible" || checked.ReasonCode != ManualAbsentEligibleReason || checked.Generation == "" || checked.TargetDigest == "" {
+		t.Fatalf("real missing-lock preflight result=%#v err=%v", checked, err)
+	}
+	request.Check = false
+	request.Generation, request.TargetDigest = checked.Generation, checked.TargetDigest
+	request.ManualPreflightReason = checked.ReasonCode
+	retired, err := NewCLI(contractBin).RetireWake(context.Background(), request)
+	if err != nil || retired.Status != "retired" || retired.ReasonCode != ManualAbsentRetiredReason || retired.Generation != checked.Generation || retired.TargetDigest != checked.TargetDigest {
+		t.Fatalf("real missing-lock mutation result=%#v err=%v", retired, err)
+	}
+	replayed, err := NewCLI(contractBin).RetireWake(context.Background(), request)
+	if err != nil || replayed.Status != "retired" || replayed.ReasonCode != ManualAbsentRetiredReason || replayed.Generation != checked.Generation || replayed.TargetDigest != checked.TargetDigest {
+		t.Fatalf("real missing-lock replay result=%#v err=%v", replayed, err)
 	}
 }
 
@@ -971,7 +1148,13 @@ func TestParseRetireResultStatusContract(t *testing.T) {
 }
 
 func TestParseManualRetireResultAcceptsExactProducerRefusalEnums(t *testing.T) {
-	for _, reason := range []string{"manual_binding_mismatch", "manual_retirement_proof_mismatch"} {
+	for _, reason := range []string{
+		"manual_mode_required", "manual_mode_conflict", "manual_binding_required",
+		"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
+		"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
+		"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
+		"manual_retirement_proof_mismatch", "manual_absent_refused",
+	} {
 		t.Run(reason, func(t *testing.T) {
 			body := fmt.Sprintf(`{"schema":1,"status":"refused","reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox","generation":"generation-1","target_digest":"sha256:target-1"}`, reason)
 			result, err := parseManualRetireResult([]byte(body))

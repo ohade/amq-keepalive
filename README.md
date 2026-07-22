@@ -171,6 +171,23 @@ the registry save, the pending intent blocks reattach and automatic GC for that
 root; repeating the exact confirmed command accepts only AMQ's matching
 idempotent receipt and cannot signal that wake twice. Missing, raw, unverified,
 changed, or mismatched wakes remain unresolved and are reported loudly.
+
+An absent `.wake.lock` is eligible only after two independent checks. Keepalive
+first proves through the selected adapter that the external target is absent.
+AMQ separately proves that no managed wake lock exists and that its securely
+saved target and presence evidence exactly match the requested transport. AMQ
+returns a stable synthetic generation/digest binding for its evidence;
+keepalive persists its distinct
+`manual_absent_eligible` phase and accepts only the paired
+`manual_absent_retired` mutation, including the same exact idempotent result on
+crash replay. Lock-backed retirement keeps its existing exact tombstone replay.
+This is evidence
+that no managed wake exists, not permission to guess: a live or ambiguous
+adapter target remains blocked by keepalive, while a changed saved target,
+malformed AMQ state, or any binding drift fails closed in AMQ. This explicit
+command does not weaken owner-bound automatic GC or make legacy retirement
+automatic.
+
 While any member remains pending, the complete canonical root is frozen:
 sibling registration/reconciliation, retention purges, and root GC artifacts
 remain byte-equivalent. Only enrollment in the same exact plan or an exact

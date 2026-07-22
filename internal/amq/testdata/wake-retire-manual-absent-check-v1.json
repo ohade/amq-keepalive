@@ -1,0 +1,1 @@
+{"schema":1,"status":"eligible","reason_code":"manual_absent_eligible","agent":"worker","root":"/tmp/amq-contract","lock":"/tmp/amq-contract/agents/worker/.wake.lock","target":"/tmp/amq-contract/agents/worker/.wake.target","generation":"generation-absent-1","target_digest":"sha256:target-absent-1","reason":"saved target is securely bound and the managed wake lock is absent"}

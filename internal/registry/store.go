@@ -85,6 +85,7 @@ type ManualRetirementIntent struct {
 	TimeoutNanos   int64               `json:"timeout_nanos"`
 	Generation     string              `json:"generation"`
 	TargetDigest   string              `json:"target_digest"`
+	ReasonCode     string              `json:"reason_code"`
 	StartedAt      time.Time           `json:"started_at"`
 }
 
@@ -94,12 +95,13 @@ func (i ManualRetirementIntent) Active() bool { return i.PlanID != "" }
 // intent is cleared. It lets partial-plan replay skip already persisted
 // members without signaling AMQ again.
 type ManualRetirementReceipt struct {
-	PlanID       string    `json:"plan_id"`
-	RowDigest    string    `json:"row_digest"`
-	Generation   string    `json:"generation"`
-	TargetDigest string    `json:"target_digest"`
-	CompletedAt  time.Time `json:"completed_at"`
-	ReasonCode   string    `json:"reason_code"`
+	PlanID              string    `json:"plan_id"`
+	RowDigest           string    `json:"row_digest"`
+	Generation          string    `json:"generation"`
+	TargetDigest        string    `json:"target_digest"`
+	CompletedAt         time.Time `json:"completed_at"`
+	PreflightReasonCode string    `json:"preflight_reason_code"`
+	ReasonCode          string    `json:"reason_code"`
 }
 
 func (r ManualRetirementReceipt) Active() bool { return r.PlanID != "" }
@@ -1248,13 +1250,14 @@ func validateRegistryFile(file File) error {
 				intent.Target != entry.Target || intent.AMQExecutable == "" || intent.InjectVia == "" ||
 				!intent.AMQIdentity.Complete() || !intent.InjectIdentity.Complete() ||
 				intent.AMQExecutable != intent.AMQIdentity.Path || intent.InjectVia != intent.InjectIdentity.Path || intent.TimeoutNanos <= 0 ||
-				intent.Generation == "" || intent.TargetDigest == "" || intent.StartedAt.IsZero() {
+				intent.Generation == "" || intent.TargetDigest == "" || !validManualPreflightReason(intent.ReasonCode) || intent.StartedAt.IsZero() {
 				return fmt.Errorf("registry entry %q has an invalid pending manual retirement intent", entry.ID)
 			}
 		}
 		if receipt := entry.ManualRetirementReceipt; receipt.Active() {
-			validReason := receipt.ReasonCode == "manual_retired" || receipt.ReasonCode == "tombstone_match"
-			validOutcome := (receipt.ReasonCode == "manual_retired" && entry.RetirementOutcome == "retired") ||
+			validReason := manualCompletionMatches(receipt.PreflightReasonCode, receipt.ReasonCode) ||
+				(receipt.PreflightReasonCode == "manual_eligible" && receipt.ReasonCode == "tombstone_match")
+			validOutcome := (validManualCompletionReason(receipt.ReasonCode) && entry.RetirementOutcome == "retired") ||
 				(receipt.ReasonCode == "tombstone_match" && entry.RetirementOutcome == "already_retired")
 			if entry.State != StateRetired || !validSHA256Hex(receipt.PlanID) || !validSHA256Hex(receipt.RowDigest) ||
 				receipt.Generation == "" || receipt.TargetDigest == "" || receipt.CompletedAt.IsZero() || !validReason || !validOutcome ||
@@ -1320,11 +1323,12 @@ func validateManualRetirementCompletion(before, after Entry) error {
 		return errors.New("pending intent may only transition to a retired row with an exact receipt")
 	}
 	if receipt.PlanID != intent.PlanID || receipt.RowDigest != intent.RowDigest ||
-		receipt.Generation != intent.Generation || receipt.TargetDigest != intent.TargetDigest {
+		receipt.Generation != intent.Generation || receipt.TargetDigest != intent.TargetDigest ||
+		receipt.PreflightReasonCode != intent.ReasonCode {
 		return errors.New("completion receipt does not match the pending plan, row, generation, and target digest")
 	}
-	validCompletion := (receipt.ReasonCode == "manual_retired" && after.RetirementOutcome == "retired") ||
-		(receipt.ReasonCode == "tombstone_match" && after.RetirementOutcome == "already_retired")
+	validCompletion := (manualCompletionMatches(intent.ReasonCode, receipt.ReasonCode) && after.RetirementOutcome == "retired") ||
+		(intent.ReasonCode == "manual_eligible" && receipt.ReasonCode == "tombstone_match" && after.RetirementOutcome == "already_retired")
 	if !validCompletion || after.RetirementReason != receipt.ReasonCode || after.RetiredAt.IsZero() ||
 		!after.RetiredAt.Equal(receipt.CompletedAt) || after.LastGCDecision != "retired" || after.LastGCReason != receipt.ReasonCode {
 		return errors.New("completion receipt lacks exact manual retirement semantics")
@@ -1348,6 +1352,19 @@ func validateManualRetirementCompletion(before, after Entry) error {
 		return errors.New("completion changed fields outside the exact retirement disposition")
 	}
 	return nil
+}
+
+func validManualPreflightReason(reason string) bool {
+	return reason == "manual_eligible" || reason == "manual_absent_eligible"
+}
+
+func validManualCompletionReason(reason string) bool {
+	return reason == "manual_retired" || reason == "manual_absent_retired"
+}
+
+func manualCompletionMatches(preflight, completion string) bool {
+	return preflight == "manual_eligible" && completion == "manual_retired" ||
+		preflight == "manual_absent_eligible" && completion == "manual_absent_retired"
 }
 
 // validateManualRetirementRootFreeze is the final persistence boundary for a

@@ -183,6 +183,23 @@ func (a App) retireSessionWithOptions(ctx context.Context, opts retireSessionOpt
 			member.pending = pendingEntry.ManualRetirementIntent
 		}
 
+		// The adapter target is external to AMQ's metadata transaction. Narrow
+		// that unavoidable race by re-proving the whole plan absent after every
+		// exact intent is durable and immediately before the first mutation.
+		// A failure leaves the root frozen by those intents for a safe retry.
+		for _, member := range current.Members {
+			if member.receipt.Active() {
+				continue
+			}
+			probeErr := selected.Probe(ctx, member.Target)
+			switch {
+			case probeErr == nil:
+				return fmt.Errorf("manual retirement target reappeared for agent %s after durable enrollment; no wake retirement signals were sent and the root remains pending", member.Agent)
+			case !errors.Is(probeErr, adapter.ErrTargetNotFound):
+				return fmt.Errorf("manual retirement target absence became ambiguous for agent %s after durable enrollment; no wake retirement signals were sent and the root remains pending: %w", member.Agent, probeErr)
+			}
+		}
+
 		for index := range current.Members {
 			member := &current.Members[index]
 			if member.receipt.Active() {
@@ -341,7 +358,8 @@ func manualRetireSessionRequest(plan retireSessionPlan, member retireSessionPlan
 	return amq.RetireWakeRequest{
 		Root: plan.Root, Me: member.Agent, InjectVia: plan.InjectVia, Adapter: plan.Adapter, Target: member.Target,
 		Generation: binding.Generation, TargetDigest: binding.TargetDigest,
-		Manual: true, Check: check, Timeout: time.Duration(plan.TimeoutNanos),
+		ManualPreflightReason: binding.ReasonCode,
+		Manual:                true, Check: check, Timeout: time.Duration(plan.TimeoutNanos),
 		ExpectedAMQIdentity: plan.AMQIdentity, ExpectedInjectIdentity: plan.InjectIdentity,
 	}
 }
@@ -351,7 +369,8 @@ func manualRetirementIntent(plan retireSessionPlan, member retireSessionPlanMemb
 		PlanID: plan.PlanID, RowDigest: member.RowDigest, Root: plan.Root, Agent: member.Agent,
 		Adapter: plan.Adapter, Target: member.Target, AMQExecutable: plan.AMQExecutable, InjectVia: plan.InjectVia,
 		AMQIdentity: plan.AMQIdentity, InjectIdentity: plan.InjectIdentity,
-		TimeoutNanos: plan.TimeoutNanos, Generation: binding.Generation, TargetDigest: binding.TargetDigest, StartedAt: now,
+		TimeoutNanos: plan.TimeoutNanos, Generation: binding.Generation, TargetDigest: binding.TargetDigest,
+		ReasonCode: binding.ReasonCode, StartedAt: now,
 	}
 }
 
@@ -360,18 +379,18 @@ func manualIntentMatchesPlan(intent registry.ManualRetirementIntent, plan retire
 		intent.Agent == member.Agent && intent.Adapter == plan.Adapter && intent.Target == member.Target &&
 		intent.AMQExecutable == plan.AMQExecutable && intent.InjectVia == plan.InjectVia &&
 		intent.AMQIdentity == plan.AMQIdentity && intent.InjectIdentity == plan.InjectIdentity && intent.TimeoutNanos == plan.TimeoutNanos &&
-		intent.Generation != "" && intent.TargetDigest != ""
+		intent.Generation != "" && intent.TargetDigest != "" && validManualPreflightReason(intent.ReasonCode)
 }
 
 func retireResultFromIntent(intent registry.ManualRetirementIntent) amq.RetireWakeResult {
 	return amq.RetireWakeResult{
-		Schema: 1, Status: "eligible", ReasonCode: "manual_eligible", Root: intent.Root, Agent: intent.Agent,
+		Schema: 1, Status: "eligible", ReasonCode: intent.ReasonCode, Root: intent.Root, Agent: intent.Agent,
 		Generation: intent.Generation, TargetDigest: intent.TargetDigest,
 	}
 }
 
 func validateManualRetireSessionCheck(root, agent string, result amq.RetireWakeResult) error {
-	if result.Schema != 1 || result.Status != "eligible" || result.ReasonCode != "manual_eligible" {
+	if result.Schema != 1 || result.Status != "eligible" || !validManualPreflightReason(result.ReasonCode) {
 		return fmt.Errorf("unexpected manual preflight contract: schema=%d status=%q reason_code=%q", result.Schema, result.Status, result.ReasonCode)
 	}
 	if result.Generation == "" || result.TargetDigest == "" {
@@ -381,8 +400,8 @@ func validateManualRetireSessionCheck(root, agent string, result amq.RetireWakeR
 }
 
 func validateManualRetireSessionMutation(root, agent string, checked, retired amq.RetireWakeResult) error {
-	validCompletion := retired.Status == "retired" && retired.ReasonCode == "manual_retired" ||
-		retired.Status == "already_retired" && retired.ReasonCode == "tombstone_match"
+	validCompletion := retired.Status == "retired" && validManualCompletion(checked.ReasonCode, retired.ReasonCode) ||
+		checked.ReasonCode == amq.ManualEligibleReason && retired.Status == "already_retired" && retired.ReasonCode == "tombstone_match"
 	if retired.Schema != 1 || !validCompletion {
 		return fmt.Errorf("unexpected manual retirement contract: schema=%d status=%q reason_code=%q", retired.Schema, retired.Status, retired.ReasonCode)
 	}
@@ -390,6 +409,15 @@ func validateManualRetireSessionMutation(root, agent string, checked, retired am
 		return errors.New("manual retirement result does not match its exact preflight generation/digest")
 	}
 	return validateRetireSessionIdentity(root, agent, retired)
+}
+
+func validManualPreflightReason(reason string) bool {
+	return reason == amq.ManualEligibleReason || reason == amq.ManualAbsentEligibleReason
+}
+
+func validManualCompletion(preflight, completion string) bool {
+	return preflight == amq.ManualEligibleReason && completion == amq.ManualRetiredReason ||
+		preflight == amq.ManualAbsentEligibleReason && completion == amq.ManualAbsentRetiredReason
 }
 
 func validateRetireSessionIdentity(root, agent string, result amq.RetireWakeResult) error {
@@ -420,7 +448,7 @@ func retiredLegacySessionEntry(entry registry.Entry, rowDigest string, now time.
 	entry.ManualRetirementReceipt = registry.ManualRetirementReceipt{
 		PlanID: entry.ManualRetirementIntent.PlanID, RowDigest: rowDigest,
 		Generation: result.Generation, TargetDigest: result.TargetDigest,
-		CompletedAt: now, ReasonCode: result.ReasonCode,
+		CompletedAt: now, PreflightReasonCode: entry.ManualRetirementIntent.ReasonCode, ReasonCode: result.ReasonCode,
 	}
 	entry.ManualRetirementIntent = registry.ManualRetirementIntent{}
 	return entry
