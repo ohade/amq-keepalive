@@ -17,10 +17,12 @@ func TestStoreUpsertRoundTripAndPermissions(t *testing.T) {
 	store.Now = func() time.Time { return now }
 
 	entry, err := store.Upsert(Entry{
-		Root:    "/tmp/amq-root",
-		Agent:   "codex",
-		Adapter: "file",
-		Target:  "/tmp/inbox.txt",
+		Root:           "/tmp/amq-root",
+		Agent:          "codex",
+		Adapter:        "file",
+		Target:         "/tmp/inbox.txt",
+		BaselineFile:   "/tmp/wake-baseline.json",
+		BaselineDigest: "sha256:abc",
 	})
 	if err != nil {
 		t.Fatalf("Upsert() error = %v", err)
@@ -47,6 +49,9 @@ func TestStoreUpsertRoundTripAndPermissions(t *testing.T) {
 	}
 	if loaded.Entries[0].ID != entry.ID {
 		t.Fatalf("loaded ID = %q, want %q", loaded.Entries[0].ID, entry.ID)
+	}
+	if loaded.Entries[0].BaselineFile != entry.BaselineFile || loaded.Entries[0].BaselineDigest != entry.BaselineDigest {
+		t.Fatalf("baseline binding did not round trip: %+v", loaded.Entries[0])
 	}
 
 	dirInfo, err := os.Stat(filepath.Dir(path))

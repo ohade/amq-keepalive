@@ -83,6 +83,8 @@ type registerOptions struct {
 	RegistryPath   string
 	AdapterName    string
 	Target         string
+	BaselineFile   string
+	BaselineDigest string
 	Root           string
 	BaseRoot       string
 	SessionName    string
@@ -118,6 +120,7 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 	registryPath := fs.String("registry", mustDefaultRegistryPath(), "registry file path")
 	adapterName := fs.String("adapter", "file", "adapter name")
 	target := fs.String("target", "", "adapter target")
+	baselineFile := fs.String("baseline-file", "", "pre-launch unread-floor manifest from amq coop exec --defer-wake")
 	root := fs.String("root", "", "AMQ root")
 	baseRoot := fs.String("base-root", "", "AMQ base root")
 	sessionName := fs.String("session", "", "AMQ session name")
@@ -134,6 +137,7 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 		RegistryPath:   *registryPath,
 		AdapterName:    *adapterName,
 		Target:         *target,
+		BaselineFile:   *baselineFile,
 		Root:           *root,
 		BaseRoot:       *baseRoot,
 		SessionName:    *sessionName,
@@ -168,6 +172,17 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 		}
 	}
 	opts.Root, opts.BaseRoot = normalizeAMQPaths(opts.Root, opts.BaseRoot, opts.SessionName)
+	if opts.BaselineFile != "" {
+		opts.BaselineFile = filepath.Clean(strings.TrimSpace(opts.BaselineFile))
+		if !filepath.IsAbs(opts.BaselineFile) {
+			return errors.New("--baseline-file must be absolute")
+		}
+		digest, err := amq.BaselineDigest(opts.BaselineFile)
+		if err != nil {
+			return fmt.Errorf("--baseline-file: %w", err)
+		}
+		opts.BaselineDigest = digest
+	}
 
 	adapters := adapter.DefaultRegistry()
 	selected, err := adapters.Get(opts.AdapterName)
@@ -194,14 +209,16 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 	}
 	store := registry.New(opts.RegistryPath)
 	next := registry.Entry{
-		ID:          registry.EntryID(opts.Root, opts.Me, opts.AdapterName, opts.Target),
-		Root:        opts.Root,
-		BaseRoot:    opts.BaseRoot,
-		SessionName: opts.SessionName,
-		Agent:       opts.Me,
-		Adapter:     opts.AdapterName,
-		Target:      opts.Target,
-		State:       registry.StateAttached,
+		ID:             registry.EntryID(opts.Root, opts.Me, opts.AdapterName, opts.Target),
+		Root:           opts.Root,
+		BaseRoot:       opts.BaseRoot,
+		SessionName:    opts.SessionName,
+		Agent:          opts.Me,
+		Adapter:        opts.AdapterName,
+		Target:         opts.Target,
+		BaselineFile:   opts.BaselineFile,
+		BaselineDigest: opts.BaselineDigest,
+		State:          registry.StateAttached,
 	}
 	reconciler := supervisor.Reconciler{
 		Wake:        envCLI,

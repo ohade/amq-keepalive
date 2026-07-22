@@ -66,6 +66,23 @@ func TestReconcileEnsuresRegistryTarget(t *testing.T) {
 	}
 }
 
+func TestReconcilePreservesExactBaselineBinding(t *testing.T) {
+	now := fixedNow()
+	wake := &fakeWake{}
+	entry := testEntry()
+	entry.BaselineFile = "/tmp/wake-baseline.json"
+	entry.BaselineDigest = "sha256:abc"
+
+	_, result := testReconciler(wake, probeAdapter{}, now).Reconcile(context.Background(), entry)
+	if result.Error != nil || len(wake.starts) != 1 {
+		t.Fatalf("result=%+v starts=%#v", result, wake.starts)
+	}
+	request := wake.starts[0]
+	if request.BaselineFile != entry.BaselineFile || request.BaselineDigest != entry.BaselineDigest {
+		t.Fatalf("baseline binding changed before wake start: %#v", request)
+	}
+}
+
 func TestReconcileNeverRepairsPersistedTargetBeforeEnsuringRegistryTarget(t *testing.T) {
 	now := fixedNow()
 	wake := &fakeWake{}

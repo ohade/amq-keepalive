@@ -64,6 +64,74 @@ printf ready > "$ready"
 	}
 }
 
+func TestStartWakePassesExactRegisteredBaseline(t *testing.T) {
+	dir := t.TempDir()
+	baseline := filepath.Join(dir, "wake-baseline.json")
+	if err := os.WriteFile(baseline, []byte("manifest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := BaselineDigest(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argsLog := filepath.Join(dir, "args.log")
+	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '%s\n' "$@" > "$AMQ_KEEPALIVE_ARGS_LOG"
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-ready-file" ]; then printf ready > "$arg"; fi
+  previous="$arg"
+done
+`)
+	if err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
+		Adapter: "cmux", Target: "cmux:surface:abc", BaselineFile: baseline,
+		BaselineDigest: digest, Timeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(data)
+	if !strings.Contains(args, "--baseline-file\n"+baseline+"\n") ||
+		!strings.Contains(args, "--replace-existing-baseline\n") ||
+		strings.Contains(args, "--baseline-existing\n") {
+		t.Fatalf("wake args do not carry exact baseline:\n%s", args)
+	}
+}
+
+func TestStartWakeRejectsChangedOrUnsafeBaselineBeforeExec(t *testing.T) {
+	dir := t.TempDir()
+	baseline := filepath.Join(dir, "wake-baseline.json")
+	if err := os.WriteFile(baseline, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := BaselineDigest(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(baseline, []byte("second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = NewCLI(filepath.Join(dir, "must-not-run")).StartWake(context.Background(), StartWakeRequest{
+		InjectVia: "/tmp/amq-keepalive", Adapter: "cmux", Target: "cmux:surface:abc",
+		BaselineFile: baseline, BaselineDigest: digest,
+	})
+	if err == nil || !strings.Contains(err.Error(), "digest changed") {
+		t.Fatalf("changed baseline error = %v", err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(baseline, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BaselineDigest(link); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlink baseline error = %v", err)
+	}
+}
+
 func TestStartWakeFailsWhenProcessExitsBeforeReady(t *testing.T) {
 	dir := t.TempDir()
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
