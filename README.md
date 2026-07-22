@@ -246,9 +246,13 @@ Before enabling automatic GC against an existing user registry:
 3. canary one disposable owner-bound session with a five-minute grace, verify
    its queued mailbox remains intact, and confirm only its exact wake and row
    retire;
-4. enable `supervise --auto-gc` only after that canary; rollback by restoring
-   `--auto-gc=false`, stopping the daemon, and restoring the saved registry if
-   local state must be reverted.
+4. enable `supervise --auto-gc` only after that canary. Before the first AMQ
+   retirement mutation, rollback may stop the daemon, restore
+   `--auto-gc=false`, and restore the saved registry. After any retirement has
+   succeeded, never restore a stale pre-retirement registry: keep the new
+   lifecycle implementation installed and replay or reconcile the exact
+   pending batch to a durable receipt. That point is roll-forward-only because
+   AMQ process state cannot be recreated by copying registry bytes.
 
 Retired rows are diagnostic evidence for at least 24 hours, not permanent audit
 history. They are purged only after retention by an exact compare-and-swap.
