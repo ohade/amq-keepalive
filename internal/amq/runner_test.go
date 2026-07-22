@@ -3,6 +3,7 @@ package amq
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -755,6 +756,20 @@ func TestAMQProducerGoldenFixtures(t *testing.T) {
 	if _, err := parseRetireResult(refusedData); err == nil {
 		t.Fatal("automated parser accepted a manual missing-lock refusal")
 	}
+	for _, fixture := range []string{
+		"wake-retire-manual-legacy-lock-blank-generation-v1.json",
+		"wake-retire-manual-legacy-lock-blank-target-digest-v1.json",
+	} {
+		legacyData, err := os.ReadFile(filepath.Join("testdata", fixture))
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacy, err := parseManualRetireResult(legacyData)
+		if err != nil || legacy.Status != "refused" || legacy.ReasonCode != "manual_legacy_lock_unbound" || legacy.PID == 0 ||
+			(legacy.Generation == "") == (legacy.TargetDigest == "") {
+			t.Fatalf("manual unbound legacy-lock producer fixture %s result=%#v err=%v", fixture, legacy, err)
+		}
+	}
 }
 
 func TestManualMissingLockContractIsPhaseAndBindingExact(t *testing.T) {
@@ -1072,6 +1087,99 @@ func TestAMQBinaryManualAbsentProducerContract(t *testing.T) {
 	}
 }
 
+func TestAMQBinaryManualLegacyLockRefusalContract(t *testing.T) {
+	bin := os.Getenv("AMQ_BIN")
+	if bin == "" {
+		t.Skip("set AMQ_BIN to run the cross-repository legacy-lock refusal contract")
+	}
+	root := filepath.Join(t.TempDir(), "amq-root")
+	if output, err := exec.Command(bin, "--no-update-check", "init", "--root", root, "--agents", "worker").CombinedOutput(); err != nil {
+		t.Fatalf("initialize AMQ legacy-lock contract root: %v\n%s", err, output)
+	}
+	canonicalRoot, err := canonicalPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractBin := filepath.Join(root, "amq")
+	binData, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contractBin, binData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	injector := filepath.Join(root, "injector")
+	if err := os.WriteFile(injector, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := filepath.Join(root, "ready.json")
+	wake := exec.Command(contractBin, "--no-update-check", "wake",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
+		"--inject-arg", "inject", "--inject-arg", "file", "--inject-arg", "legacy-target",
+		"--ready-file", readyPath,
+	)
+	var wakeOutput bytes.Buffer
+	wake.Stdout, wake.Stderr = &wakeOutput, &wakeOutput
+	if err := wake.Start(); err != nil {
+		t.Fatalf("start AMQ legacy-lock setup wake: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- wake.Wait() }()
+	stopped := false
+	t.Cleanup(func() {
+		if stopped || wake.Process == nil {
+			return
+		}
+		_ = wake.Process.Kill()
+		<-done
+	})
+	waitForFile(t, readyPath, 5*time.Second)
+	if err := wake.Process.Kill(); err != nil {
+		t.Fatalf("kill AMQ legacy-lock setup wake: %v", err)
+	}
+	select {
+	case <-done:
+		stopped = true
+	case <-time.After(5 * time.Second):
+		t.Fatalf("AMQ legacy-lock setup wake did not stop; output=%s", wakeOutput.String())
+	}
+	lockPath := filepath.Join(canonicalRoot, "agents", "worker", ".wake.lock")
+	lockData, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read generated wake lock: %v", err)
+	}
+	var lock map[string]any
+	if err := json.Unmarshal(lockData, &lock); err != nil {
+		t.Fatalf("decode generated wake lock: %v", err)
+	}
+	lock["generation"] = ""
+	lockData, err = json.Marshal(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, append(lockData, '\n'), 0o600); err != nil {
+		t.Fatalf("write temporary legacy wake lock fixture: %v", err)
+	}
+	amqIdentity, err := executable.Capture(contractBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectIdentity, err := executable.Capture(injector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, retireErr := NewCLI(contractBin).RetireWake(context.Background(), RetireWakeRequest{
+		Root: canonicalRoot, Me: "worker", InjectVia: injector, Adapter: "file", Target: "legacy-target",
+		Manual: true, Check: true, Timeout: 5 * time.Second,
+		ExpectedAMQIdentity: amqIdentity, ExpectedInjectIdentity: injectIdentity,
+	})
+	var structured *WakeStartError
+	if retireErr == nil || !errors.As(retireErr, &structured) || result.Status != "refused" ||
+		result.ReasonCode != "manual_legacy_lock_unbound" || result.Generation != "" || result.TargetDigest == "" {
+		t.Fatalf("real legacy-lock refusal result=%#v err=%v", result, retireErr)
+	}
+}
+
 func TestValidateExistingWakeBlockerRequiresExactIdentity(t *testing.T) {
 	root := t.TempDir()
 	binding := WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"}
@@ -1153,7 +1261,7 @@ func TestParseManualRetireResultAcceptsExactProducerRefusalEnums(t *testing.T) {
 		"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
 		"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
 		"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
-		"manual_retirement_proof_mismatch", "manual_absent_refused",
+		"manual_retirement_proof_mismatch", "manual_absent_refused", "manual_legacy_lock_unbound",
 	} {
 		t.Run(reason, func(t *testing.T) {
 			body := fmt.Sprintf(`{"schema":1,"status":"refused","reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox","generation":"generation-1","target_digest":"sha256:target-1"}`, reason)

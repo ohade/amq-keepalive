@@ -1029,7 +1029,7 @@ func manualRefusalReason(reason string) bool {
 		"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
 		"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
 		"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
-		"manual_retirement_proof_mismatch", "manual_absent_refused":
+		"manual_retirement_proof_mismatch", "manual_absent_refused", "manual_legacy_lock_unbound":
 		return true
 	default:
 		return false
