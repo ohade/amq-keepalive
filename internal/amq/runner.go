@@ -22,7 +22,6 @@ var ErrWakeReadinessUncertain = errors.New("amq wake readiness is uncertain; chi
 
 const defaultWakeReadyTimeout = 10 * time.Second
 const defaultCommandTimeout = 5 * time.Second
-const staleWakeReadyMarkerAge = 24 * time.Hour
 const maxWakeBaselineBytes = 64 * 1024
 const maxLifecycleResultBytes = 64 * 1024
 const maxCLIOutputBytes = 64 * 1024
@@ -200,14 +199,29 @@ type RetireWakeRequest struct {
 }
 
 type CLI struct {
-	Path string
+	Path                 string
+	wakeReadyWarningSink func(error)
+	wakeReadyCleanup     func(string, time.Time) error
+	wakeReadyCleanupNow  func() time.Time
 }
 
 func NewCLI(path string) CLI {
 	if path == "" {
 		path = "amq"
 	}
-	return CLI{Path: path}
+	return CLI{
+		Path: path,
+		wakeReadyWarningSink: func(err error) {
+			_, _ = fmt.Fprintf(os.Stderr, "amq-keepalive warning: %v\n", err)
+		},
+	}
+}
+
+// WithWarningSink returns a copy that reports non-fatal maintenance warnings
+// to sink. A nil sink explicitly suppresses warnings.
+func (c CLI) WithWarningSink(sink func(error)) CLI {
+	c.wakeReadyWarningSink = sink
+	return c
 }
 
 func (c CLI) Env(ctx context.Context) (Env, error) {
@@ -298,11 +312,7 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) (WakeBinding, 
 	}
 
 	args := []string{"wake"}
-	_, readyFile, err := newWakeReadyPath()
-	if err != nil {
-		return WakeBinding{}, err
-	}
-	_, resultFile, err := newWakeReadyPath()
+	readyFile, resultFile, err := c.newWakeReadyPaths()
 	if err != nil {
 		return WakeBinding{}, err
 	}
@@ -510,62 +520,6 @@ func BaselineDigest(path string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
-}
-
-func newWakeReadyPath() (string, string, error) {
-	cacheDir := strings.TrimSpace(os.Getenv("AMQ_KEEPALIVE_CACHE_DIR"))
-	if cacheDir == "" {
-		var err error
-		cacheDir, err = os.UserCacheDir()
-		if err != nil {
-			return "", "", fmt.Errorf("resolve user cache directory for wake readiness: %w", err)
-		}
-	}
-	dir := filepath.Join(cacheDir, "amq-keepalive", "readiness")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", "", fmt.Errorf("create wake readiness directory: %w", err)
-	}
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return "", "", fmt.Errorf("inspect wake readiness directory: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return "", "", fmt.Errorf("wake readiness path %q must be a real directory", dir)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", "", fmt.Errorf("secure wake readiness directory: %w", err)
-	}
-	scavengeStaleWakeReadyMarkers(dir, time.Now())
-	placeholder, err := os.CreateTemp(dir, "wake-*")
-	if err != nil {
-		return "", "", fmt.Errorf("reserve wake readiness path: %w", err)
-	}
-	path := placeholder.Name()
-	if err := placeholder.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", "", fmt.Errorf("close wake readiness placeholder: %w", err)
-	}
-	if err := os.Remove(path); err != nil {
-		return "", "", fmt.Errorf("prepare wake readiness destination: %w", err)
-	}
-	return dir, path, nil
-}
-
-func scavengeStaleWakeReadyMarkers(dir string, now time.Time) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "wake-") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || now.Sub(info.ModTime()) < staleWakeReadyMarkerAge {
-			continue
-		}
-		_ = os.Remove(filepath.Join(dir, entry.Name()))
-	}
 }
 
 type wakeProcessResult struct {
