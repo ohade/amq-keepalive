@@ -8,7 +8,20 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
+
+func TestNormalizeOptionsUsesSharedSupervisorPolicyBounds(t *testing.T) {
+	opts, err := NormalizeOptions(Options{BinaryPath: "/bin/echo", AMQPath: "/bin/echo", RegistryPath: "/tmp/registry.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Interval != DefaultSupervisorInterval || opts.OwnerGrace != supervisor.MinOwnerGoneGrace ||
+		opts.Retention != supervisor.MinRetiredRetention || opts.GCTimeout != supervisor.MaxLifecycleTimeout {
+		t.Fatalf("normalized policy=%#v", opts)
+	}
+}
 
 func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 	opts := Options{

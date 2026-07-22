@@ -198,13 +198,13 @@ registry-only escape that prints `unresolved_amq_state: true`; it does not claim
 that any wake was retired. A fresh explicit attach/reattach replaces the live
 row and clears its quarantine.
 
-The supervisor currently keeps the cross-process registration lease while a
-root batch runs. That preserves frozen membership and excludes a racing
-reattach, but means an eight-listener batch can delay unrelated registrations
-for up to sixteen lifecycle calls at the five-second command ceiling (about 80
-seconds, plus local persistence). Releasing and safely reacquiring that global
-lease requires a separate coordinator protocol and is intentionally not
-claimed by this change.
+The supervisor keeps the cross-process registration lease while one root batch
+runs. That preserves frozen membership and excludes a racing reattach. The pass
+ends immediately after the batch's bounded maximum of sixteen lifecycle calls
+for eight listeners; it never performs unrelated wake starts under the same
+lease. A five-second follow-up pass handles unrelated rows. At the five-second
+command ceiling, the worst batch lease is therefore about 80 seconds plus local
+persistence, rather than that batch time plus an unbounded reconciliation tail.
 
 Before enabling automatic GC against an existing user registry:
 
@@ -224,11 +224,15 @@ history. They are purged only after retention by an exact compare-and-swap.
 AMQ and keepalive also have an executable producer/consumer contract check:
 
 ```sh
-AMQ_BIN=/path/to/amq sh ./verify-amq-contract.sh
+AMQ_SOURCE=/path/to/agent-message-queue sh ./verify-amq-contract.sh
 ```
 
-It strict-decodes real `amq env --json` and `amq wake retire --json` output and
-fails on missing, unknown, or version-mismatched fields.
+The script requires an explicit AMQ source checkout, builds that exact source,
+and runs the real producer/consumer contract. Release and cross-repository CI
+jobs should invoke this command directly; a missing or unbuildable source is a
+hard failure, never a silent skip. The consumer accepts additive unknown JSON
+fields for forward compatibility while still rejecting missing required
+fields, unknown enum values, trailing JSON, and unsupported schemas.
 
 Supported hook install:
 
@@ -341,6 +345,14 @@ Spawned wake processes run in a separate Unix session with null stdio, so they d
 not retain a terminal surface or the LaunchAgent's unrotated log and do not receive
 the supervisor's terminal-generated signals. Registration-lease waits are
 context-cancelable, and default signal handling is restored after the first signal.
+Any failed supervisor pass retries after five seconds, including failures before
+a durable GC coordinator can be discovered. Transition diagnostics are part of
+the observable contract: a failed stderr write is returned instead of silently
+discarding the diagnostic.
+
+`doctor` is registry-read-only: it uses the preview loader and creates no lock,
+backup, or migrated registry. Its JSON includes `active_gc_batch_id` and
+`active_gc_batch_phase` when a durable coordinator is present.
 
 ## Boundaries
 
