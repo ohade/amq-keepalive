@@ -95,8 +95,9 @@ replaces prior entries for the same AMQ root and agent across all adapters and
 makes a crash or late readiness recoverable by the next supervisor pass. Startup
 then uses AMQ's internal
 `--accept-existing-wake` readiness contract: a live wake is accepted only when
-its `--inject-via` executable and fixed arguments exactly match. A differing
-target fails closed. A definite pre-readiness exit restores the prior rows; a
+its `--inject-via` executable, ordered fixed arguments, owner, persisted floor,
+and generation-bound catch-up acknowledgement match. A differing target fails
+closed. A definite pre-readiness exit restores the prior rows; a
 timeout or cancellation after spawn leaves the reservation in place because the
 unsignaled AMQ child may still publish readiness. On success the same reservation
 is marked active, so there is no post-readiness commit window that can orphan a
@@ -104,19 +105,24 @@ live wake. Use
 `--wake-ready-timeout` on `attach`, `reattach`, or `supervise` to adjust the
 readiness wait; the default is 10 seconds. This requires an AMQ build that
 supports `--accept-existing-wake` target verification and
-`--baseline-existing`. The baseline keeps messages already waiting in
-`inbox/new` unread, emits no receipts for them, and allows only later arrivals
-to trigger terminal injection for the newly attached wake.
+exact baseline manifests. Legacy starts without a registered floor use
+`--baseline-existing` once; AMQ materializes that snapshot into the saved target
+and reuses it across wake downtime. SessionStart reattach instead receives
+`AMQ_WAKE_BASELINE_FILE` from `amq coop exec --defer-wake` and passes the exact
+file to AMQ. If a live same-transport/same-owner wake has an older exact floor,
+AMQ performs its generation- and identity-safe baseline rotation; different
+injectors, arguments, owners, or unverified wakes are never signaled. Wake keeps
+floor messages unread, emits no receipts, and notifies arrivals after the floor.
 
 For a launcher recreating a terminal, add `--retire-detached`. This opt-in path
 looks up the prior registration for the same AMQ root and agent. If its adapter
 target is independently proven gone, it first asks AMQ's target-aware wake start
 to converge on the new exact target. An already-absent lock starts directly. If
 a live old wake blocks the exact-target start, this release stops: destructive
-retirement is hard-gated until AMQ exposes a positively verifiable
-identity-safe-retire capability from issue #235. No `amq wake retire` subprocess
-is invoked, no active wake is retargeted, and the prior registry rows are restored
-after the definite start failure.
+retirement remains disabled in keepalive even though AMQ now has a low-level,
+identity-safe `wake retire` command. No `amq wake retire` subprocess is invoked,
+no active wake is retargeted to another terminal, and the prior registry rows
+are restored after the definite start failure.
 
 Safe detached-session retirement:
 
@@ -129,10 +135,9 @@ Safe detached-session retirement:
 
 `retire-session` currently performs only its fail-closed preflight. It requires
 exactly one registry entry per requested agent and independently proves every
-registered cmux surface is missing, then returns the #235 capability error without
+registered cmux surface is missing, then returns the keepalive policy gate without
 signaling AMQ or changing the registry. It preserves the wakes and rows so callers
-can fall back to a new room until the upstream identity-safe retirement capability
-lands.
+can review low-level retirement separately or fall back to a new room.
 
 Detached registry cleanup is preview-first:
 
@@ -143,7 +148,7 @@ Detached registry cleanup is preview-first:
 `gc` defaults to a read-only JSON dry run and requires 24 hours of continuously
 proven detachment. Target collisions, live cmux TTY aliases, transient probe
 failures, and recent or legacy entries without a `detached_since` timestamp are
-excluded. `gc --apply` is deliberately hard-gated by the same #235 capability
+excluded. `gc --apply` is deliberately hard-gated by the same keepalive policy
 boundary and invokes neither AMQ nor registry mutation. Use the JSON candidates
 for review only; do not treat them as proof that a wake process is safe to signal.
 
@@ -163,14 +168,19 @@ print the exact snippets without writing files.
 
 The wrapper auto-selects `cmux` when `CMUX_SURFACE_ID` is present and otherwise
 falls back to `ghostty`; `AMQ_KEEPALIVE_ADAPTER` remains an explicit override.
-It bounds the actual `reattach` work with `AMQ_KEEPALIVE_TIMEOUT_SECONDS`
-(default: 10). The hook passes a shorter inner AMQ readiness timeout (8 seconds
-by default) so the process has bounded time to report failure before the outer
-watchdog fires. If adapter discovery, probing, or AMQ wake startup hangs, the hook
-logs the adapter and exact target with the timeout and still returns `{}` so
-agent startup continues. Invalid or non-positive timeout overrides are normalized
-back to the default. The hook also bounds the initial stdin read so a host that
-leaves stdin open cannot stall startup before the reattach watchdog begins.
+It gives stdin parsing plus inner reattach/readiness work one deterministic
+`AMQ_KEEPALIVE_TIMEOUT_SECONDS` budget (default: 10), then allows the combined
+process wrapper a fixed one-second scheduler/startup grace. This remains below
+the installed host hook's additional five-second hard-timeout margin. The hook
+reserves time for verification to observe the exact `notifier_live`
+acknowledgement. Invalid timeout overrides are normalized, open
+stdin cannot stall startup, and timeout cleanup never signals AMQ's detached wake
+grandchild. Ordinary non-AMQ launches stay quiet. An intended deferred-wake launch
+that lacks a valid baseline or exact acknowledgement emits a visible
+`AMQ wake unavailable; messages remain queued` SessionStart warning. While the
+shared deadline still has budget, cmux also gets a best-effort exact-surface
+notification; agent startup continues even if that optional notification cannot
+be delivered.
 
 Manual Claude Code SessionStart hook snippet:
 
@@ -211,8 +221,10 @@ Set `AMQ_KEEPALIVE_BIN=/absolute/path/to/amq-keepalive` if the binary is not on
 `AMQ_KEEPALIVE_WAKE_TIMEOUT_MILLISECONDS`, and
 `AMQ_KEEPALIVE_NO_START=1` for test/dry-run wiring. Leave
 `AMQ_KEEPALIVE_SELF` unset unless you need to force a specific absolute injector
-path. The hook always prints `{}` so agent startup continues even if reattach
-fails; failures are logged to `~/.amq-keepalive/session-start.log`.
+path. `AMQ_WAKE_BASELINE_FILE` and the sanitized `AMQ_WAKE_BASELINE_ERROR` are
+normally supplied by `amq coop exec --defer-wake`. Success prints `{}`; intended
+AMQ launches print the warning JSON on failure. Details are logged to
+`~/.amq-keepalive/session-start.log`.
 
 LaunchAgent install:
 
@@ -248,9 +260,9 @@ context-cancelable, and default signal handling is restored after the first sign
 
 - The tool does not parse AMQ mailbox, lock, presence, or target files.
 - The tool does not launch or resurrect terminal sessions.
-- All destructive wake-retirement paths are disabled until AMQ #235 exposes a
-  positive identity-safe-retire capability. Production code contains no
-  `wake retire` execution path in this release.
+- Keepalive still disables destructive wake retirement by policy. AMQ exposes
+  an identity-safe low-level retire capability, but production keepalive code
+  contains no `wake retire` execution path in this release.
 - Adapter targets should use an explicit scheme shape:
   `<adapter>:<scheme>:<value>`. The supported terminal schemes are
   `ghostty:terminal:<id>` and `cmux:surface:<uuid>`.
@@ -260,13 +272,14 @@ context-cancelable, and default signal handling is restored after the first sign
 - Reboot survival comes from reattaching on session start, not from assuming a
   terminal id survives process or machine restart. The recreated session
   registers its current target.
-- `reattach` never retargets a live wake implicitly. A matching live target is
-  verified, while a differing live target fails closed and logs the mismatch
-  without signaling it. With explicit `--retire-detached`, a saved target proven
-  gone may attempt exact-target convergence; a blocking old wake hits the #235
-  hard gate with no retirement or retry. Stale/dead wake locks are otherwise
-  replaced by AMQ's target-aware start using the registry target; keepalive does
-  not resurrect an older saved adapter through `amq wake repair` first.
+- `reattach` never retargets a live wake to another terminal implicitly. A
+  matching live target is verified; the narrow SessionStart path may rotate only
+  its baseline generation when transport and owner are exact. A differing live
+  target fails closed without signaling it. With explicit `--retire-detached`, a
+  saved target proven gone may attempt exact-target convergence; a blocking old
+  wake hits the keepalive policy gate with no retirement or retry. Stale/dead wake
+  locks otherwise restart from the persisted exact baseline, so downtime arrivals
+  stay eligible; keepalive does not invoke `amq wake repair` first.
 - A normalized `(adapter, target)` can have only one registry owner. Legacy
   collisions fail closed for every claimant; the supervisor never picks a winner.
   For cmux, the stronger rule is exactly one live surface UUID per canonical TTY.

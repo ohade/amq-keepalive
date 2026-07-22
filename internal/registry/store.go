@@ -34,6 +34,8 @@ type Entry struct {
 	Agent                  string    `json:"agent"`
 	Adapter                string    `json:"adapter"`
 	Target                 string    `json:"target"`
+	BaselineFile           string    `json:"baseline_file,omitempty"`
+	BaselineDigest         string    `json:"baseline_digest,omitempty"`
 	State                  State     `json:"state"`
 	LastAttach             time.Time `json:"last_attach,omitempty"`
 	LastSeenBySupervisor   time.Time `json:"last_seen_by_supervisor,omitempty"`

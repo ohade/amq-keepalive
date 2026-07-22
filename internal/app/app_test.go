@@ -90,6 +90,37 @@ func TestReattachReplacesCurrentSessionAdapterEntry(t *testing.T) {
 	}
 }
 
+func TestAttachPersistsValidatedBaselineBinding(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	baseline := filepath.Join(dir, "wake-baseline.json")
+	if err := os.WriteFile(baseline, []byte("manifest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runApp(t, "attach",
+		"--registry", registryPath,
+		"--adapter", "file",
+		"--target", filepath.Join(dir, "inbox.txt"),
+		"--root", filepath.Join(dir, "mail", "collab"),
+		"--base-root", filepath.Join(dir, "mail"),
+		"--session", "collab",
+		"--me", "codex",
+		"--baseline-file", baseline,
+		"--no-start",
+	)
+	loaded, err := registry.New(registryPath).Load()
+	if err != nil || len(loaded.Entries) != 1 {
+		t.Fatalf("registry entries=%#v err=%v", loaded.Entries, err)
+	}
+	digest, err := amq.BaselineDigest(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Entries[0].BaselineFile != baseline || loaded.Entries[0].BaselineDigest != digest {
+		t.Fatalf("persisted baseline binding = %+v", loaded.Entries[0])
+	}
+}
+
 func TestAttachIsIdempotentForSamePhysicalCmuxOwner(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("cmux adapter requires macOS")

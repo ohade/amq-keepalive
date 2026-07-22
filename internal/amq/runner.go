@@ -3,9 +3,12 @@ package amq
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +21,7 @@ var ErrWakeReadinessUncertain = errors.New("amq wake readiness is uncertain; chi
 
 const defaultWakeReadyTimeout = 10 * time.Second
 const staleWakeReadyMarkerAge = 24 * time.Hour
+const maxWakeBaselineBytes = 64 * 1024
 
 type Env struct {
 	SchemaVersion int               `json:"schema_version"`
@@ -45,12 +49,14 @@ func (r WakeRepairResult) Text() string {
 }
 
 type StartWakeRequest struct {
-	Root      string
-	Me        string
-	InjectVia string
-	Adapter   string
-	Target    string
-	Timeout   time.Duration
+	Root           string
+	Me             string
+	InjectVia      string
+	Adapter        string
+	Target         string
+	BaselineFile   string
+	BaselineDigest string
+	Timeout        time.Duration
 }
 
 type CLI struct {
@@ -111,6 +117,19 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	if req.Target == "" {
 		return errors.New("target is required")
 	}
+	baselineFile := strings.TrimSpace(req.BaselineFile)
+	if (baselineFile == "") != (strings.TrimSpace(req.BaselineDigest) == "") {
+		return errors.New("baseline file and digest must be set together")
+	}
+	if baselineFile != "" {
+		digest, err := BaselineDigest(baselineFile)
+		if err != nil {
+			return fmt.Errorf("validate wake baseline: %w", err)
+		}
+		if digest != req.BaselineDigest {
+			return errors.New("wake baseline digest changed since registration")
+		}
+	}
 
 	args := []string{"wake"}
 	_, readyFile, err := newWakeReadyPath()
@@ -124,8 +143,12 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	if req.Me != "" {
 		args = append(args, "-me", req.Me)
 	}
+	if baselineFile != "" {
+		args = append(args, "--baseline-file", baselineFile, "--replace-existing-baseline")
+	} else {
+		args = append(args, "--baseline-existing")
+	}
 	args = append(args,
-		"--baseline-existing",
 		"-inject-via", req.InjectVia,
 		"-inject-arg", "inject",
 		"-inject-arg", req.Adapter,
@@ -190,6 +213,47 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	// fsync, but the marker itself is no longer needed after acknowledgement.
 	_ = os.Remove(readyFile)
 	return nil
+}
+
+// BaselineDigest validates the stable file properties needed by keepalive and
+// returns the digest persisted in the registry. AMQ performs the authoritative
+// root, agent, owner, and manifest validation when wake starts.
+func BaselineDigest(path string) (string, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "." || !filepath.IsAbs(path) {
+		return "", errors.New("wake baseline path must be absolute")
+	}
+	before, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return "", errors.New("wake baseline must be a regular file, not a symlink")
+	}
+	if before.Mode().Perm() != 0o600 {
+		return "", fmt.Errorf("wake baseline mode is %o, want 0600", before.Mode().Perm())
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	after, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !os.SameFile(before, after) {
+		return "", errors.New("wake baseline changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxWakeBaselineBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxWakeBaselineBytes {
+		return "", fmt.Errorf("wake baseline exceeds %d bytes", maxWakeBaselineBytes)
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 func newWakeReadyPath() (string, string, error) {

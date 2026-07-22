@@ -115,12 +115,14 @@ func (r Reconciler) checkLocalReadiness(ctx context.Context, entry registry.Entr
 
 func (r Reconciler) ensureWake(ctx context.Context, entry registry.Entry, now time.Time) (registry.Entry, Result) {
 	err := r.Wake.StartWake(ctx, amq.StartWakeRequest{
-		Root:      entry.Root,
-		Me:        entry.Agent,
-		InjectVia: r.InjectVia,
-		Adapter:   entry.Adapter,
-		Target:    entry.Target,
-		Timeout:   r.WakeTimeout,
+		Root:           entry.Root,
+		Me:             entry.Agent,
+		InjectVia:      r.InjectVia,
+		Adapter:        entry.Adapter,
+		Target:         entry.Target,
+		BaselineFile:   entry.BaselineFile,
+		BaselineDigest: entry.BaselineDigest,
+		Timeout:        r.WakeTimeout,
 	})
 	if err == nil {
 		return r.markActive(entry, now, ActionEnsured), Result{Action: ActionEnsured, AMQTouched: true}
