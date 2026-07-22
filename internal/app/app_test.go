@@ -1253,7 +1253,7 @@ func TestNormalizeAMQPathsUsesAbsoluteBaseSessionRoot(t *testing.T) {
 	}
 }
 
-func TestRetireSessionHardGatePreservesAllEntriesAndInvokesNoAMQ(t *testing.T) {
+func TestRetireSessionPreviewPreservesAllEntriesAndInvokesNoAMQ(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("cmux adapter requires macOS")
 	}
@@ -1311,7 +1311,7 @@ printf '{"status":"retired","agent":"%s","pid":4242}\n' "$agent"
 		"--amq", fakeAMQ,
 		"--self", fakeKeepalive,
 	})
-	if code != 1 || !strings.Contains(stderr.String(), "wake_gc_v1") {
+	if code != 0 || !strings.Contains(stdout.String(), `"plan_id"`) || stderr.Len() != 0 {
 		t.Fatalf("retire-session code=%d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 	}
 	loaded, err := store.Load()
@@ -1358,7 +1358,7 @@ func TestRetireSessionRefusesWhenTargetStillExists(t *testing.T) {
 	}
 	var stderr bytes.Buffer
 	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
-		"retire-session", "--registry", registryPath, "--root", root, "--amq", fakeAMQ,
+		"retire-session", "--registry", registryPath, "--root", root, "--agents", "codex,claude", "--amq", fakeAMQ,
 	})
 	if code != 1 || !strings.Contains(stderr.String(), "still exists") {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
@@ -1369,7 +1369,7 @@ func TestRetireSessionRefusesWhenTargetStillExists(t *testing.T) {
 	}
 }
 
-func TestRetireSessionGatePreventsPartialRetirement(t *testing.T) {
+func TestRetireSessionApplyWithoutConfirmationSignalsNothing(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("cmux adapter requires macOS")
 	}
@@ -1419,9 +1419,9 @@ printf '%s\n' '{"status":"retired","agent":"codex","pid":4242}'
 	var stderr bytes.Buffer
 	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
 		"retire-session", "--registry", registryPath, "--root", root,
-		"--amq", fakeAMQ, "--self", fakeKeepalive,
+		"--agents", "codex,claude", "--amq", fakeAMQ, "--self", fakeKeepalive, "--apply",
 	})
-	if code != 1 || !strings.Contains(stderr.String(), "identity-safe-retire") {
+	if code != 1 || !strings.Contains(stderr.String(), "--confirm-plan") {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
 	loaded, err := store.Load()

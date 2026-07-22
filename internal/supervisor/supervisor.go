@@ -83,6 +83,9 @@ func (r Reconciler) checkLocalReadiness(ctx context.Context, entry registry.Entr
 	if err := ctx.Err(); err != nil {
 		return entry, Result{Action: ActionDeferred, Error: err}, true
 	}
+	if entry.ManualRetirementIntent.Active() {
+		return entry, Result{Action: ActionDeferred}, true
+	}
 	if !entry.NextHealthCheck.IsZero() && now.Before(entry.NextHealthCheck) {
 		return entry, Result{Action: ActionDeferred}, true
 	}

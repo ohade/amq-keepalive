@@ -1424,6 +1424,184 @@ func TestStoreRecordGCRootAttemptValidatesUpdatesAndWindow(t *testing.T) {
 	}
 }
 
+func TestPendingManualRetirementBlocksOrdinaryRegistryMutationPaths(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Store, Entry) error
+	}{
+		{name: "Save", run: func(store *Store, entry Entry) error {
+			changed := entry
+			changed.LastError = "ordinary writer"
+			return store.Save(File{Entries: []Entry{changed}})
+		}},
+		{name: "UpdateEntry", run: func(store *Store, entry Entry) error {
+			entry.ManualRetirementIntent = ManualRetirementIntent{}
+			return store.UpdateEntry(entry)
+		}},
+		{name: "Forget", run: func(store *Store, entry Entry) error {
+			_, err := store.Forget(entry.ID)
+			return err
+		}},
+		{name: "ForgetIfUnchanged", run: func(store *Store, entry Entry) error {
+			_, err := store.ForgetIfUnchanged(entry)
+			return err
+		}},
+		{name: "ForgetMany", run: func(store *Store, entry Entry) error {
+			_, err := store.ForgetMany([]string{entry.ID})
+			return err
+		}},
+		{name: "Upsert", run: func(store *Store, entry Entry) error {
+			_, err := store.Upsert(Entry{Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target})
+			return err
+		}},
+		{name: "ReplaceSessionAdapter", run: func(store *Store, entry Entry) error {
+			_, _, err := store.ReplaceSessionAdapter(Entry{Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target + "-next"})
+			return err
+		}},
+		{name: "RestoreSessionAdapterIfUnchanged", run: func(store *Store, entry Entry) error {
+			_, err := store.RestoreSessionAdapterIfUnchanged(entry, nil)
+			return err
+		}},
+		{name: "RecordGCRootAttempt", run: func(store *Store, entry Entry) error {
+			_, err := store.RecordGCRootAttempt(entry.Root, time.Now().UTC(), nil)
+			return err
+		}},
+		{name: "StartGCRootBatch", run: func(store *Store, entry Entry) error {
+			now := time.Now().UTC()
+			batch := GCRootBatch{
+				ID: "batch", CanonicalRoot: entry.Root, StartedAt: now, Phase: GCRootBatchPreflight,
+				Members: []GCRootBatchMember{{
+					EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+					WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+				}},
+			}
+			_, err := store.StartGCRootBatch(batch, []Entry{entry})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entry := pendingManualRetirementTestEntry(t)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{entry}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.run(store, entry); err == nil {
+				t.Fatalf("%s unexpectedly mutated pending manual retirement", test.name)
+			}
+			loaded, err := store.Load()
+			if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != entry || len(loaded.GCRootBatches) != 0 || len(loaded.GCRootAttempts) != 0 {
+				t.Fatalf("%s changed pending row: file=%#v err=%v", test.name, loaded, err)
+			}
+		})
+	}
+}
+
+func TestUpdateEntriesAllowsOnlyExactPendingManualRetirementCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Entry)
+	}{
+		{name: "intent stripped", mutate: func(entry *Entry) {
+			entry.ManualRetirementIntent = ManualRetirementIntent{}
+		}},
+		{name: "receipt binding mismatch", mutate: func(entry *Entry) {
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+			entry.ManualRetirementReceipt.Generation = "other-generation"
+		}},
+		{name: "receipt semantics mismatch", mutate: func(entry *Entry) {
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+			entry.ManualRetirementReceipt.ReasonCode = "tombstone_match"
+		}},
+		{name: "unrelated field drift", mutate: func(entry *Entry) {
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+			entry.Target += "-changed"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := pendingManualRetirementTestEntry(t)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+				t.Fatal(err)
+			}
+			after := before
+			test.mutate(&after)
+			if result, err := store.UpdateEntries([]EntryUpdate{{Before: before, After: after}}); err == nil || result.Updated != 0 {
+				t.Fatalf("mismatched completion result=%#v err=%v", result, err)
+			}
+			loaded, err := store.Load()
+			if err != nil || loaded.Entries[0] != before {
+				t.Fatalf("mismatched completion changed row=%#v err=%v", loaded.Entries, err)
+			}
+		})
+	}
+
+	for _, completion := range []struct{ outcome, reason string }{{"retired", "manual_retired"}, {"already_retired", "tombstone_match"}} {
+		t.Run(completion.reason, func(t *testing.T) {
+			before := pendingManualRetirementTestEntry(t)
+			after := completedManualRetirementTestEntry(before, completion.outcome, completion.reason)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+				t.Fatal(err)
+			}
+			result, err := store.UpdateEntries([]EntryUpdate{{Before: before, After: after}})
+			if err != nil || result.Updated != 1 || result.Skipped != 0 {
+				t.Fatalf("exact completion result=%#v err=%v", result, err)
+			}
+			loaded, err := store.Load()
+			if err != nil || loaded.Entries[0] != after {
+				t.Fatalf("exact completion row=%#v err=%v", loaded.Entries, err)
+			}
+		})
+	}
+}
+
+func pendingManualRetirementTestEntry(t *testing.T) Entry {
+	t.Helper()
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	entry := Entry{
+		Root: root, Agent: "worker", Adapter: "file", Target: filepath.Join(root, "target"),
+		State: StateDetached, LegacyUnbound: true,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 7, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "sha256:digest"},
+	}
+	entry.ID = EntryID(entry.Root, entry.Agent, entry.Adapter, entry.Target)
+	entry.ManualRetirementIntent = ManualRetirementIntent{
+		PlanID: strings.Repeat("a", 64), RowDigest: strings.Repeat("b", 64),
+		Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		AMQExecutable: "/bin/sh", InjectVia: "/bin/sh", TimeoutNanos: int64(time.Second),
+		Generation: "generation", TargetDigest: "sha256:digest", StartedAt: now,
+	}
+	return entry
+}
+
+func completedManualRetirementTestEntry(before Entry, outcome, reason string) Entry {
+	after := before
+	completedAt := before.ManualRetirementIntent.StartedAt.Add(time.Second)
+	after.State = StateRetired
+	after.RetiredAt = completedAt
+	after.RetirementOutcome = outcome
+	after.RetirementReason = reason
+	after.OwnerGoneSince = time.Time{}
+	after.GCFailureCount = 0
+	after.GCBackoffUntil = time.Time{}
+	after.GCQuarantinedAt = time.Time{}
+	after.GCQuarantineReason = ""
+	after.LastGCDecision = "retired"
+	after.LastGCReason = reason
+	after.LastError = ""
+	after.ManualRetirementReceipt = ManualRetirementReceipt{
+		PlanID: before.ManualRetirementIntent.PlanID, RowDigest: before.ManualRetirementIntent.RowDigest,
+		Generation: before.ManualRetirementIntent.Generation, TargetDigest: before.ManualRetirementIntent.TargetDigest,
+		CompletedAt: completedAt, ReasonCode: reason,
+	}
+	after.ManualRetirementIntent = ManualRetirementIntent{}
+	return after
+}
+
 func findTestEntry(entries []Entry, id string) (Entry, bool) {
 	for _, entry := range entries {
 		if entry.ID == id {

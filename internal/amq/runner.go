@@ -195,6 +195,7 @@ type RetireWakeRequest struct {
 	TargetDigest     string
 	RequireOwnerGone bool
 	Check            bool
+	Manual           bool
 	Timeout          time.Duration
 }
 
@@ -397,17 +398,36 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) (WakeBinding, 
 }
 
 func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeResult, error) {
-	if req.Root == "" || req.Me == "" || req.InjectVia == "" || req.Adapter == "" || req.Target == "" ||
-		req.Generation == "" || req.TargetDigest == "" {
-		return RetireWakeResult{}, errors.New("exact root, agent, injector, adapter, target, generation, and target digest are required")
+	if req.Root == "" || req.Me == "" || req.InjectVia == "" || req.Adapter == "" || req.Target == "" {
+		return RetireWakeResult{}, errors.New("exact root, agent, injector, adapter, and target are required")
+	}
+	if req.Manual {
+		if req.RequireOwnerGone {
+			return RetireWakeResult{}, errors.New("manual retirement cannot require automated owner-gone proof")
+		}
+		if (req.Generation == "") != (req.TargetDigest == "") {
+			return RetireWakeResult{}, errors.New("manual retirement generation and target digest must be supplied together")
+		}
+		if !req.Check && (req.Generation == "" || req.TargetDigest == "") {
+			return RetireWakeResult{}, errors.New("manual retirement requires the exact preflight generation and target digest")
+		}
+	} else if req.Generation == "" || req.TargetDigest == "" {
+		return RetireWakeResult{}, errors.New("automated retirement requires the exact generation and target digest")
 	}
 	args := []string{"wake", "retire", "--json", "--root", req.Root, "--me", req.Me,
 		"--inject-via", req.InjectVia,
 		"--inject-arg", "inject", "--inject-arg", req.Adapter, "--inject-arg", req.Target,
-		"--if-generation", req.Generation, "--if-target-digest", req.TargetDigest,
 	}
-	if req.RequireOwnerGone {
-		args = append(args, "--require-owner-gone")
+	if req.Manual {
+		args = append(args, "--manual")
+		if req.Generation != "" {
+			args = append(args, "--if-generation", req.Generation, "--if-target-digest", req.TargetDigest)
+		}
+	} else {
+		args = append(args, "--if-generation", req.Generation, "--if-target-digest", req.TargetDigest)
+		if req.RequireOwnerGone {
+			args = append(args, "--require-owner-gone")
+		}
 	}
 	if req.Check {
 		args = append(args, "--check")
@@ -419,7 +439,13 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeR
 	commandCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	stdout, stderr, runErr := c.run(commandCtx, args...)
-	result, parseErr := parseRetireResult(stdout)
+	var result RetireWakeResult
+	var parseErr error
+	if req.Manual {
+		result, parseErr = parseManualRetireResult(stdout)
+	} else {
+		result, parseErr = parseRetireResult(stdout)
+	}
 	if parseErr != nil {
 		if runErr != nil {
 			return RetireWakeResult{}, errors.Join(
@@ -775,6 +801,14 @@ func readSecureJSONFileWithPolicy(path string, destination any, allowUnknown boo
 }
 
 func parseRetireResult(data []byte) (RetireWakeResult, error) {
+	return parseRetireResultWithPolicy(data, true)
+}
+
+func parseManualRetireResult(data []byte) (RetireWakeResult, error) {
+	return parseRetireResultWithPolicy(data, false)
+}
+
+func parseRetireResultWithPolicy(data []byte, requireBinding bool) (RetireWakeResult, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return RetireWakeResult{}, errors.New("empty amq wake retire output")
 	}
@@ -782,7 +816,11 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 	if err := decodeExtensibleJSON(data, &result); err != nil {
 		return RetireWakeResult{}, fmt.Errorf("parse amq wake retire JSON: %w", err)
 	}
-	if err := requireJSONFields(data, "schema", "status", "reason_code", "agent", "root", "lock", "target", "generation", "target_digest"); err != nil {
+	required := []string{"schema", "status", "reason_code", "agent", "root", "lock", "target"}
+	if requireBinding {
+		required = append(required, "generation", "target_digest")
+	}
+	if err := requireJSONFields(data, required...); err != nil {
 		return RetireWakeResult{}, fmt.Errorf("parse amq wake retire JSON: %w", err)
 	}
 	result.Status = strings.TrimSpace(result.Status)
@@ -795,12 +833,12 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 	}
 	switch result.Status {
 	case "eligible":
-		if result.ReasonCode != "owner_gone" {
-			return RetireWakeResult{}, errors.New("eligible retirement response must use reason_code owner_gone")
+		if result.ReasonCode != "owner_gone" && result.ReasonCode != "manual_eligible" {
+			return RetireWakeResult{}, errors.New("eligible retirement response has an unsupported reason_code")
 		}
 	case "retired":
-		if result.ReasonCode != "retired_exact" {
-			return RetireWakeResult{}, errors.New("retired response must use reason_code retired_exact")
+		if result.ReasonCode != "retired_exact" && result.ReasonCode != "manual_retired" {
+			return RetireWakeResult{}, errors.New("retired response has an unsupported reason_code")
 		}
 	case "already_retired":
 		if result.ReasonCode != "tombstone_match" {
@@ -818,7 +856,10 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 		switch result.ReasonCode {
 		case "invalid_automation_binding", "no_retirement_proof", "retirement_proof_mismatch", "unverified_replacement",
 			"wake_creating", "wake_unverified", "wake_state_unsupported", "raw_wake", "target_missing",
-			"target_mismatch", "owner_missing", "owner_live", "owner_uninspectable", "generation_changed":
+			"target_mismatch", "owner_missing", "owner_live", "owner_uninspectable", "generation_changed",
+			"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
+			"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
+			"manual_target_missing", "manual_target_mismatch", "manual_wake_changed":
 		default:
 			return RetireWakeResult{}, fmt.Errorf("refused response has unknown reason_code %q", result.ReasonCode)
 		}
@@ -899,6 +940,26 @@ func validateRetireEcho(req RetireWakeRequest, result RetireWakeResult) error {
 	gotRoot, err := canonicalPath(result.Root)
 	if err != nil || gotRoot != wantRoot || result.Agent != req.Me {
 		return errors.New("amq wake retire response root/agent identity mismatch")
+	}
+	if req.Manual {
+		if req.Check {
+			if result.Status != "eligible" && result.Status != "refused" && result.Status != "error" {
+				return fmt.Errorf("manual retirement check returned unexpected status %q", result.Status)
+			}
+			if result.Status == "eligible" && (result.ReasonCode != "manual_eligible" || result.Generation == "" || result.TargetDigest == "") {
+				return errors.New("manual retirement eligibility lacks exact generation/digest proof")
+			}
+			return nil
+		}
+		validCompletion := (result.Status == "retired" && result.ReasonCode == "manual_retired") ||
+			(result.Status == "already_retired" && result.ReasonCode == "tombstone_match")
+		if !validCompletion {
+			return fmt.Errorf("manual retirement mutation returned unexpected status/reason %q/%q", result.Status, result.ReasonCode)
+		}
+		if result.Generation != req.Generation || result.TargetDigest != req.TargetDigest {
+			return errors.New("manual retirement result does not echo the exact preflight generation/digest")
+		}
+		return nil
 	}
 	if result.Generation != req.Generation || result.TargetDigest != req.TargetDigest {
 		return errors.New("amq wake retire response generation/digest mismatch")

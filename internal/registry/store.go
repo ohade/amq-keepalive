@@ -64,6 +64,41 @@ func (b WakeBinding) Complete() bool {
 	return strings.TrimSpace(b.Generation) != "" && strings.TrimSpace(b.TargetDigest) != ""
 }
 
+// ManualRetirementIntent is the durable, exact pre-signal authorization for
+// one legacy wake. A crash after AMQ acts leaves this token in place so a retry
+// can ask AMQ for the matching idempotent receipt instead of guessing whether
+// another signal is safe.
+type ManualRetirementIntent struct {
+	PlanID        string    `json:"plan_id"`
+	RowDigest     string    `json:"row_digest"`
+	Root          string    `json:"root"`
+	Agent         string    `json:"agent"`
+	Adapter       string    `json:"adapter"`
+	Target        string    `json:"target"`
+	AMQExecutable string    `json:"amq_executable"`
+	InjectVia     string    `json:"inject_via"`
+	TimeoutNanos  int64     `json:"timeout_nanos"`
+	Generation    string    `json:"generation"`
+	TargetDigest  string    `json:"target_digest"`
+	StartedAt     time.Time `json:"started_at"`
+}
+
+func (i ManualRetirementIntent) Active() bool { return i.PlanID != "" }
+
+// ManualRetirementReceipt retains the completed plan identity after pending
+// intent is cleared. It lets partial-plan replay skip already persisted
+// members without signaling AMQ again.
+type ManualRetirementReceipt struct {
+	PlanID       string    `json:"plan_id"`
+	RowDigest    string    `json:"row_digest"`
+	Generation   string    `json:"generation"`
+	TargetDigest string    `json:"target_digest"`
+	CompletedAt  time.Time `json:"completed_at"`
+	ReasonCode   string    `json:"reason_code"`
+}
+
+func (r ManualRetirementReceipt) Active() bool { return r.PlanID != "" }
+
 type GCRootBatchPhase string
 
 const (
@@ -126,40 +161,42 @@ type ReattachTransition struct {
 func (t ReattachTransition) Active() bool { return t.Phase != TransitionNone }
 
 type Entry struct {
-	ID                     string             `json:"id"`
-	Root                   string             `json:"root"`
-	BaseRoot               string             `json:"base_root,omitempty"`
-	SessionName            string             `json:"session_name,omitempty"`
-	Agent                  string             `json:"agent"`
-	Adapter                string             `json:"adapter"`
-	Target                 string             `json:"target"`
-	BaselineFile           string             `json:"baseline_file,omitempty"`
-	BaselineDigest         string             `json:"baseline_digest,omitempty"`
-	State                  State              `json:"state"`
-	LastAttach             time.Time          `json:"last_attach,omitempty"`
-	LastSeenBySupervisor   time.Time          `json:"last_seen_by_supervisor,omitempty"`
-	FailureCount           int                `json:"failure_count,omitempty"`
-	BackoffUntil           time.Time          `json:"backoff_until,omitempty"`
-	NextHealthCheck        time.Time          `json:"next_health_check,omitempty"`
-	DetachedSince          time.Time          `json:"detached_since,omitempty"`
-	LastError              string             `json:"last_error,omitempty"`
-	LastSupervisorDecision string             `json:"last_supervisor_decision,omitempty"`
-	LegacyUnbound          bool               `json:"legacy_unbound,omitempty"`
-	WakeOwnerPresent       bool               `json:"wake_owner_present,omitempty"`
-	WakeOwner              WakeOwner          `json:"wake_owner,omitempty"`
-	WakeBinding            WakeBinding        `json:"wake_binding,omitempty"`
-	OwnerGoneSince         time.Time          `json:"owner_gone_since,omitempty"`
-	RetiredAt              time.Time          `json:"retired_at,omitempty"`
-	RetirementOutcome      string             `json:"retirement_outcome,omitempty"`
-	RetirementReason       string             `json:"retirement_reason,omitempty"`
-	GCFailureCount         int                `json:"gc_failure_count,omitempty"`
-	GCBackoffUntil         time.Time          `json:"gc_backoff_until,omitempty"`
-	GCQuarantinedAt        time.Time          `json:"gc_quarantined_at,omitempty"`
-	GCQuarantineReason     string             `json:"gc_quarantine_reason,omitempty"`
-	LastGCRootBatchAt      time.Time          `json:"last_gc_root_batch_at,omitempty"`
-	LastGCDecision         string             `json:"last_gc_decision,omitempty"`
-	LastGCReason           string             `json:"last_gc_reason,omitempty"`
-	Transition             ReattachTransition `json:"reattach_transition,omitempty"`
+	ID                      string                  `json:"id"`
+	Root                    string                  `json:"root"`
+	BaseRoot                string                  `json:"base_root,omitempty"`
+	SessionName             string                  `json:"session_name,omitempty"`
+	Agent                   string                  `json:"agent"`
+	Adapter                 string                  `json:"adapter"`
+	Target                  string                  `json:"target"`
+	BaselineFile            string                  `json:"baseline_file,omitempty"`
+	BaselineDigest          string                  `json:"baseline_digest,omitempty"`
+	State                   State                   `json:"state"`
+	LastAttach              time.Time               `json:"last_attach,omitempty"`
+	LastSeenBySupervisor    time.Time               `json:"last_seen_by_supervisor,omitempty"`
+	FailureCount            int                     `json:"failure_count,omitempty"`
+	BackoffUntil            time.Time               `json:"backoff_until,omitempty"`
+	NextHealthCheck         time.Time               `json:"next_health_check,omitempty"`
+	DetachedSince           time.Time               `json:"detached_since,omitempty"`
+	LastError               string                  `json:"last_error,omitempty"`
+	LastSupervisorDecision  string                  `json:"last_supervisor_decision,omitempty"`
+	LegacyUnbound           bool                    `json:"legacy_unbound,omitempty"`
+	WakeOwnerPresent        bool                    `json:"wake_owner_present,omitempty"`
+	WakeOwner               WakeOwner               `json:"wake_owner,omitempty"`
+	WakeBinding             WakeBinding             `json:"wake_binding,omitempty"`
+	OwnerGoneSince          time.Time               `json:"owner_gone_since,omitempty"`
+	RetiredAt               time.Time               `json:"retired_at,omitempty"`
+	RetirementOutcome       string                  `json:"retirement_outcome,omitempty"`
+	RetirementReason        string                  `json:"retirement_reason,omitempty"`
+	GCFailureCount          int                     `json:"gc_failure_count,omitempty"`
+	GCBackoffUntil          time.Time               `json:"gc_backoff_until,omitempty"`
+	GCQuarantinedAt         time.Time               `json:"gc_quarantined_at,omitempty"`
+	GCQuarantineReason      string                  `json:"gc_quarantine_reason,omitempty"`
+	LastGCRootBatchAt       time.Time               `json:"last_gc_root_batch_at,omitempty"`
+	LastGCDecision          string                  `json:"last_gc_decision,omitempty"`
+	LastGCReason            string                  `json:"last_gc_reason,omitempty"`
+	Transition              ReattachTransition      `json:"reattach_transition,omitempty"`
+	ManualRetirementIntent  ManualRetirementIntent  `json:"manual_retirement_intent,omitempty"`
+	ManualRetirementReceipt ManualRetirementReceipt `json:"manual_retirement_receipt,omitempty"`
 }
 
 type File struct {
@@ -517,6 +554,22 @@ func (s *Store) Save(file File) error {
 		return errors.New("registry path is required")
 	}
 	return s.withLock(func() error {
+		current, _, _, err := s.readRegistryUnlocked()
+		if err != nil {
+			return err
+		}
+		nextByID := make(map[string]Entry, len(file.Entries))
+		for _, entry := range file.Entries {
+			nextByID[entry.ID] = entry
+		}
+		for _, entry := range current.Entries {
+			if !entry.ManualRetirementIntent.Active() {
+				continue
+			}
+			if next, ok := nextByID[entry.ID]; !ok || next != entry {
+				return fmt.Errorf("registry entry %q has a pending exact manual retirement and must remain byte-equivalent through Save", entry.ID)
+			}
+		}
 		return s.saveUnlocked(file)
 	})
 }
@@ -582,6 +635,9 @@ func (s *Store) Upsert(entry Entry) (Entry, error) {
 			if file.Entries[i].ID != prepared.ID {
 				continue
 			}
+			if file.Entries[i].ManualRetirementIntent.Active() {
+				return fmt.Errorf("registry entry %q has a pending exact manual retirement; registration is blocked until receipt reconciliation", prepared.ID)
+			}
 			if file.Entries[i].State == StateRetired && prepared.State != StateRetired {
 				file.Entries[i].ID = nextRetiredArchiveID(file.Entries[i], occupied)
 				continue
@@ -625,6 +681,9 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 			// AMQ permits one wake process per root and agent. Reattach therefore
 			// replaces the old registration even when the terminal adapter changed.
 			if existing.Root == prepared.Root && existing.Agent == prepared.Agent && existing.State != StateRetired {
+				if existing.ManualRetirementIntent.Active() {
+					return fmt.Errorf("registry entry %q has a pending exact manual retirement; reattach is blocked until receipt reconciliation", existing.ID)
+				}
 				removed = append(removed, existing)
 				livePrevious = append(livePrevious, existing)
 				if existing.Transition.Revision > revision {
@@ -668,6 +727,9 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 func (s *Store) RestoreSessionAdapterIfUnchanged(expected Entry, previous []Entry) (bool, error) {
 	if expected.ID == "" {
 		return false, errors.New("expected reservation id is required")
+	}
+	if expected.ManualRetirementIntent.Active() {
+		return false, errors.New("pending exact manual retirement cannot be restored as a reattach reservation")
 	}
 	restored := false
 	err := s.withLock(func() error {
@@ -762,6 +824,9 @@ func (s *Store) UpdateEntry(entry Entry) error {
 		}
 		for i := range file.Entries {
 			if file.Entries[i].ID == entry.ID {
+				if file.Entries[i].ManualRetirementIntent.Active() && file.Entries[i] != entry {
+					return fmt.Errorf("registry entry %q has a pending exact manual retirement and cannot be changed through UpdateEntry", entry.ID)
+				}
 				file.Entries[i] = entry
 				return s.saveUnlocked(file)
 			}
@@ -801,6 +866,15 @@ func (s *Store) UpdateEntries(updates []EntryUpdate) (UpdateResult, error) {
 		byID := make(map[string]int, len(file.Entries))
 		for i := range file.Entries {
 			byID[file.Entries[i].ID] = i
+		}
+		for _, update := range updates {
+			i, ok := byID[update.Before.ID]
+			if !ok || file.Entries[i] != update.Before || update.Before == update.After || !update.Before.ManualRetirementIntent.Active() {
+				continue
+			}
+			if err := validateManualRetirementCompletion(update.Before, update.After); err != nil {
+				return fmt.Errorf("registry entry %q pending manual retirement update: %w", update.Before.ID, err)
+			}
 		}
 		for _, update := range updates {
 			i, ok := byID[update.Before.ID]
@@ -849,6 +923,9 @@ func (s *Store) StartGCRootBatch(batch GCRootBatch, expected []Entry) (File, err
 		if !ok || !member.Matches(entry) {
 			return File{}, fmt.Errorf("GC root batch member %q does not match its expected entry", member.EntryID)
 		}
+		if entry.ManualRetirementIntent.Active() {
+			return File{}, fmt.Errorf("GC root batch member %q has a pending exact manual retirement", member.EntryID)
+		}
 	}
 
 	var updated File
@@ -894,6 +971,11 @@ func (s *Store) RecordGCRootAttempt(canonicalRoot string, startedAt time.Time, u
 	if strings.TrimSpace(canonicalRoot) == "" || startedAt.IsZero() {
 		return File{}, errors.New("GC root attempt canonical root and start time are required")
 	}
+	resolvedRoot, err := canonicalRegistryRoot(canonicalRoot)
+	if err != nil {
+		return File{}, err
+	}
+	canonicalRoot = resolvedRoot
 	seen := make(map[string]struct{}, len(updates))
 	for _, update := range updates {
 		if update.Before.ID == "" || update.Before.ID != update.After.ID {
@@ -905,10 +987,22 @@ func (s *Store) RecordGCRootAttempt(canonicalRoot string, startedAt time.Time, u
 		seen[update.Before.ID] = struct{}{}
 	}
 	var updated File
-	err := s.withLock(func() error {
+	err = s.withLock(func() error {
 		file, err := s.loadUnlocked()
 		if err != nil {
 			return err
+		}
+		for _, entry := range file.Entries {
+			if !entry.ManualRetirementIntent.Active() || entry.State == StateRetired {
+				continue
+			}
+			root, rootErr := canonicalRegistryRoot(entry.Root)
+			if rootErr != nil {
+				return rootErr
+			}
+			if root == canonicalRoot {
+				return fmt.Errorf("GC root attempt for %q is blocked by pending manual retirement entry %q", canonicalRoot, entry.ID)
+			}
 		}
 		byID := make(map[string]int, len(file.Entries))
 		for i := range file.Entries {
@@ -918,6 +1012,9 @@ func (s *Store) RecordGCRootAttempt(canonicalRoot string, startedAt time.Time, u
 			i, ok := byID[update.Before.ID]
 			if !ok || file.Entries[i] != update.Before {
 				return fmt.Errorf("GC root attempt entry %q changed before its marker could be recorded", update.Before.ID)
+			}
+			if update.Before.ManualRetirementIntent.Active() && update.Before != update.After {
+				return fmt.Errorf("GC root attempt cannot mutate pending manual retirement entry %q", update.Before.ID)
 			}
 			file.Entries[i] = update.After
 		}
@@ -1042,6 +1139,28 @@ func validateRegistryFile(file File) error {
 		if entry.State == StateRetired && !entry.GCQuarantinedAt.IsZero() {
 			return fmt.Errorf("registry entry %q is both retired and GC-quarantined", entry.ID)
 		}
+		if entry.ManualRetirementIntent.Active() && entry.ManualRetirementReceipt.Active() {
+			return fmt.Errorf("registry entry %q has both pending and completed manual retirement metadata", entry.ID)
+		}
+		if intent := entry.ManualRetirementIntent; intent.Active() {
+			entryRoot, rootErr := canonicalRegistryRoot(entry.Root)
+			if entry.State == StateRetired || !validSHA256Hex(intent.PlanID) || !validSHA256Hex(intent.RowDigest) ||
+				rootErr != nil || intent.Root != entryRoot || intent.Agent != entry.Agent || intent.Adapter != entry.Adapter ||
+				intent.Target != entry.Target || intent.AMQExecutable == "" || intent.InjectVia == "" || intent.TimeoutNanos <= 0 ||
+				intent.Generation == "" || intent.TargetDigest == "" || intent.StartedAt.IsZero() {
+				return fmt.Errorf("registry entry %q has an invalid pending manual retirement intent", entry.ID)
+			}
+		}
+		if receipt := entry.ManualRetirementReceipt; receipt.Active() {
+			validReason := receipt.ReasonCode == "manual_retired" || receipt.ReasonCode == "tombstone_match"
+			validOutcome := (receipt.ReasonCode == "manual_retired" && entry.RetirementOutcome == "retired") ||
+				(receipt.ReasonCode == "tombstone_match" && entry.RetirementOutcome == "already_retired")
+			if entry.State != StateRetired || !validSHA256Hex(receipt.PlanID) || !validSHA256Hex(receipt.RowDigest) ||
+				receipt.Generation == "" || receipt.TargetDigest == "" || receipt.CompletedAt.IsZero() || !validReason || !validOutcome ||
+				entry.RetirementReason != receipt.ReasonCode || !entry.RetiredAt.Equal(receipt.CompletedAt) {
+				return fmt.Errorf("registry entry %q has an invalid completed manual retirement receipt", entry.ID)
+			}
+		}
 		byID[entry.ID] = entry
 	}
 
@@ -1059,7 +1178,7 @@ func validateRegistryFile(file File) error {
 			if !ok || !member.Matches(entry) {
 				return fmt.Errorf("GC root batch %q member %q does not match the current registry row", batch.ID, member.EntryID)
 			}
-			if entry.State != StateRetired && (!entry.GCQuarantinedAt.IsZero() || entry.LegacyUnbound || entry.Transition.Active() || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete()) {
+			if entry.State != StateRetired && (entry.ManualRetirementIntent.Active() || !entry.GCQuarantinedAt.IsZero() || entry.LegacyUnbound || entry.Transition.Active() || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete()) {
 				return fmt.Errorf("GC root batch %q current member %q is not transition-free and strongly owner-bound", batch.ID, member.EntryID)
 			}
 			members[member.EntryID] = member
@@ -1078,6 +1197,54 @@ func validateRegistryFile(file File) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func validateManualRetirementCompletion(before, after Entry) error {
+	intent := before.ManualRetirementIntent
+	receipt := after.ManualRetirementReceipt
+	if !intent.Active() {
+		return nil
+	}
+	if after.ManualRetirementIntent.Active() || after.State != StateRetired || !receipt.Active() {
+		return errors.New("pending intent may only transition to a retired row with an exact receipt")
+	}
+	if receipt.PlanID != intent.PlanID || receipt.RowDigest != intent.RowDigest ||
+		receipt.Generation != intent.Generation || receipt.TargetDigest != intent.TargetDigest {
+		return errors.New("completion receipt does not match the pending plan, row, generation, and target digest")
+	}
+	validCompletion := (receipt.ReasonCode == "manual_retired" && after.RetirementOutcome == "retired") ||
+		(receipt.ReasonCode == "tombstone_match" && after.RetirementOutcome == "already_retired")
+	if !validCompletion || after.RetirementReason != receipt.ReasonCode || after.RetiredAt.IsZero() ||
+		!after.RetiredAt.Equal(receipt.CompletedAt) || after.LastGCDecision != "retired" || after.LastGCReason != receipt.ReasonCode {
+		return errors.New("completion receipt lacks exact manual retirement semantics")
+	}
+	expected := before
+	expected.State = after.State
+	expected.RetiredAt = after.RetiredAt
+	expected.RetirementOutcome = after.RetirementOutcome
+	expected.RetirementReason = after.RetirementReason
+	expected.OwnerGoneSince = after.OwnerGoneSince
+	expected.GCFailureCount = after.GCFailureCount
+	expected.GCBackoffUntil = after.GCBackoffUntil
+	expected.GCQuarantinedAt = after.GCQuarantinedAt
+	expected.GCQuarantineReason = after.GCQuarantineReason
+	expected.LastGCDecision = after.LastGCDecision
+	expected.LastGCReason = after.LastGCReason
+	expected.LastError = after.LastError
+	expected.ManualRetirementIntent = after.ManualRetirementIntent
+	expected.ManualRetirementReceipt = after.ManualRetirementReceipt
+	if expected != after {
+		return errors.New("completion changed fields outside the exact retirement disposition")
 	}
 	return nil
 }
@@ -1263,6 +1430,9 @@ func (s *Store) ForgetIfUnchanged(expected Entry) (bool, error) {
 			if entry != expected {
 				return nil
 			}
+			if entry.ManualRetirementIntent.Active() {
+				return fmt.Errorf("registry entry %q has a pending exact manual retirement and cannot be forgotten", entry.ID)
+			}
 			file.Entries = append(file.Entries[:i], file.Entries[i+1:]...)
 			removed = true
 			return s.saveUnlocked(file)
@@ -1288,6 +1458,9 @@ func (s *Store) ForgetMany(ids []string) (int, error) {
 		found := 0
 		for _, entry := range file.Entries {
 			if _, ok := wanted[entry.ID]; ok {
+				if entry.ManualRetirementIntent.Active() {
+					return fmt.Errorf("registry entry %q has a pending exact manual retirement and cannot be forgotten", entry.ID)
+				}
 				found++
 			}
 		}

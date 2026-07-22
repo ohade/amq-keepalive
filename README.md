@@ -135,14 +135,35 @@ Safe detached-session retirement:
 ./amq-keepalive retire-session \
   --root "$HOME/.agent-mail/dashboard" \
   --adapter cmux \
-  --agents codex,claude
+  --agents codex,claude > /tmp/amq-retire-preview.json
+
+plan_id="$(jq -r .plan_id /tmp/amq-retire-preview.json)"
+./amq-keepalive retire-session \
+  --root "$HOME/.agent-mail/dashboard" \
+  --adapter cmux \
+  --agents codex,claude \
+  --apply \
+  --confirm-plan "$plan_id"
 ```
 
-`retire-session` currently performs only its fail-closed preflight. It requires
-exactly one registry entry per requested agent and independently proves every
-registered cmux surface is missing, then returns the keepalive policy gate without
-signaling AMQ or changing the registry. It preserves the wakes and rows so callers
-can review low-level retirement separately or fall back to a new room.
+The first invocation is genuinely read-only: it does not create a lock or
+backup, change the registry, or call AMQ. The deterministic `plan_id` binds the
+canonical registry and collaboration root, explicit sorted agents, exact legacy
+row digests and normalized missing targets, canonical AMQ and keepalive
+executables, and lifecycle timeout. Use exactly the same options for apply; any
+row, target, path, executable, or timeout drift invalidates the token before a
+signal.
+
+Apply repeats target-absence proof under the registration lock, preflights every
+agent through AMQ's explicit manual-retirement contract, and durably saves every
+generation/digest-bound intent before sending the first signal. A static
+refusal therefore sends no retirement signals. Each successful result is saved
+immediately as a retained retired row without deleting mailbox, target, or
+baseline data. If keepalive crashes after AMQ records its tombstone but before
+the registry save, the pending intent blocks reattach and automatic GC for that
+root; repeating the exact confirmed command accepts only AMQ's matching
+idempotent receipt and cannot signal that wake twice. Missing, raw, unverified,
+changed, or mismatched wakes remain unresolved and are reported loudly.
 
 Detached registry cleanup is preview-first:
 
