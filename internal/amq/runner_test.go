@@ -218,10 +218,12 @@ func TestStartWakeCancelAfterReadyDoesNotKillEstablishedWake(t *testing.T) {
 	check := filepath.Join(dir, "check")
 	alive := filepath.Join(dir, "alive")
 	release := filepath.Join(dir, "release")
+	exited := filepath.Join(dir, "exited")
 	t.Setenv("AMQ_KEEPALIVE_READY_PATH_LOG", readyPathLog)
 	t.Setenv("AMQ_KEEPALIVE_CHECK", check)
 	t.Setenv("AMQ_KEEPALIVE_ALIVE", alive)
 	t.Setenv("AMQ_KEEPALIVE_RELEASE", release)
+	t.Setenv("AMQ_KEEPALIVE_EXITED", exited)
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
 ready=""
 previous=""
@@ -236,6 +238,7 @@ while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do
   if [ -f "$AMQ_KEEPALIVE_CHECK" ]; then : > "$AMQ_KEEPALIVE_ALIVE"; fi
   sleep 0.01
 done
+: > "$AMQ_KEEPALIVE_EXITED"
 `)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -254,6 +257,7 @@ done
 	if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
 		t.Fatalf("release wake: %v", err)
 	}
+	waitForFile(t, exited, 2*time.Second)
 	data, err := os.ReadFile(readyPathLog)
 	if err != nil {
 		t.Fatalf("read ready path log: %v", err)
@@ -267,10 +271,12 @@ func TestStartWakeCancelBeforeReadyLeavesChildUnsignaled(t *testing.T) {
 	allowReady := filepath.Join(dir, "allow-ready")
 	lateReady := filepath.Join(dir, "late-ready")
 	release := filepath.Join(dir, "release")
+	exited := filepath.Join(dir, "exited")
 	t.Setenv("AMQ_KEEPALIVE_STARTED", started)
 	t.Setenv("AMQ_KEEPALIVE_ALLOW_READY", allowReady)
 	t.Setenv("AMQ_KEEPALIVE_LATE_READY", lateReady)
 	t.Setenv("AMQ_KEEPALIVE_RELEASE", release)
+	t.Setenv("AMQ_KEEPALIVE_EXITED", exited)
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
 ready=""
 previous=""
@@ -284,6 +290,7 @@ while [ ! -f "$AMQ_KEEPALIVE_ALLOW_READY" ]; do sleep 0.01; done
 printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$ready"
 : > "$AMQ_KEEPALIVE_LATE_READY"
 while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
+: > "$AMQ_KEEPALIVE_EXITED"
 `)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -307,6 +314,7 @@ while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 	if err := os.WriteFile(release, nil, 0o600); err != nil {
 		t.Fatalf("release child: %v", err)
 	}
+	waitForFile(t, exited, 2*time.Second)
 }
 
 func TestStartWakeTimesOutWhenReadyFileNeverAppears(t *testing.T) {
@@ -467,11 +475,14 @@ func TestReadWakeBindingRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
-func TestLifecycleJSONRejectsUnknownFieldsWrongSchemaAndTrailingData(t *testing.T) {
+func TestLifecycleJSONAllowsAdditiveFieldsButRejectsWrongSchemaAndTrailingData(t *testing.T) {
+	additive := `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","target":"/tmp/target","generation":"g","target_digest":"d","extra":true}`
+	if result, err := parseRetireResult([]byte(additive)); err != nil || result.Status != "retired" {
+		t.Fatalf("additive retire field was not tolerated: result=%#v err=%v", result, err)
+	}
 	for name, body := range map[string]string{
-		"unknown":  `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","generation":"g","target_digest":"d","extra":true}`,
-		"schema":   `{"schema":2,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","generation":"g","target_digest":"d"}`,
-		"trailing": `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","generation":"g","target_digest":"d"} {}`,
+		"schema":   `{"schema":2,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","target":"/tmp/target","generation":"g","target_digest":"d"}`,
+		"trailing": `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","target":"/tmp/target","generation":"g","target_digest":"d"} {}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseRetireResult([]byte(body)); err == nil {
@@ -488,11 +499,16 @@ func TestLifecycleJSONRejectsUnknownFieldsWrongSchemaAndTrailingData(t *testing.
 	}
 }
 
-func TestEnvRequiresSchemaOneAndStrictJSON(t *testing.T) {
+func TestEnvAllowsAdditiveFieldsButRequiresSchemaFieldsAndEnums(t *testing.T) {
+	valid := `{"schema_version":1,"amq_version":"test","root":"/tmp/root","base_root":"/tmp","session_name":"root","in_session":true,"me":"worker","project":"test","root_source":"flag","peers":{},"capabilities":["wake_gc_v1"],"extra":true}`
+	if environment, err := parseEnv([]byte(valid)); err != nil || environment.Root != "/tmp/root" {
+		t.Fatalf("additive env field was not tolerated: environment=%#v err=%v", environment, err)
+	}
 	for name, payload := range map[string]string{
-		"wrong-schema": `{"schema_version":2,"capabilities":["wake_gc_v1"]}`,
-		"unknown":      `{"schema_version":1,"capabilities":["wake_gc_v1"],"extra":true}`,
-		"trailing":     `{"schema_version":1,"capabilities":["wake_gc_v1"]} {}`,
+		"wrong-schema":        strings.Replace(valid, `"schema_version":1`, `"schema_version":2`, 1),
+		"missing-capability":  strings.Replace(valid, `,"capabilities":["wake_gc_v1"]`, ``, 1),
+		"unknown-root-source": strings.Replace(valid, `"root_source":"flag"`, `"root_source":"surprise"`, 1),
+		"trailing":            valid + ` {}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -511,8 +527,9 @@ func TestAMQProducerGoldenFixtures(t *testing.T) {
 		t.Fatal(err)
 	}
 	var environment Env
-	if err := decodeStrictJSON(envData, &environment); err != nil {
-		t.Fatalf("strict-decode env producer fixture: %v", err)
+	environment, err = parseEnv(envData)
+	if err != nil {
+		t.Fatalf("decode env producer fixture: %v", err)
 	}
 	if environment.SchemaVersion != 1 || environment.RootID == "" || environment.BaseRootID == "" ||
 		!environment.Wake || !environment.HasCapability(CapabilityWakeGCV1) {
@@ -567,8 +584,8 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AMQ env producer failed: %v", err)
 	}
-	var environment Env
-	if err := decodeStrictJSON(envData, &environment); err != nil {
+	environment, err := parseEnv(envData)
+	if err != nil {
 		t.Fatalf("AMQ env producer drifted from keepalive consumer: %v\n%s", err, envData)
 	}
 	if environment.SchemaVersion != 1 {
@@ -661,8 +678,11 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AMQ wake start failure producer drifted from keepalive consumer: %v; command=%v output=%s", err, secondErr, secondOutput)
 	}
-	if err := ValidateExistingWakeBlocker(root, "worker", binding, startFailure); err != nil {
-		t.Fatalf("AMQ wake start blocker omitted exact retirement proof: %v; result=%#v", err, startFailure)
+	if startFailure.CurrentWakeMode != "inject-via" {
+		t.Fatalf("AMQ ownerless blocker mode=%q want inject-via; result=%#v", startFailure.CurrentWakeMode, startFailure)
+	}
+	if err := ValidateExistingWakeBlocker(root, "worker", binding, startFailure); err == nil {
+		t.Fatalf("AMQ ownerless blocker was accepted as owner-bound retirement proof: result=%#v", startFailure)
 	}
 }
 
@@ -704,7 +724,7 @@ func TestParseRetireResultStatusContract(t *testing.T) {
 	}
 	for status, reason := range valid {
 		t.Run("valid "+status, func(t *testing.T) {
-			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox"}`, status, reason)
+			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox","generation":"generation-1","target_digest":"sha256:target-1"}`, status, reason)
 			result, err := parseRetireResult([]byte(body))
 			if err != nil || result.Status != status || result.ReasonCode != reason {
 				t.Fatalf("result=%#v err=%v", result, err)
@@ -746,6 +766,9 @@ func TestReadWakeCommandResultContract(t *testing.T) {
 		t.Run("valid "+reason, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "result.json")
 			body := fmt.Sprintf(`{"schema":1,"status":"failed","reason_code":%q}`, reason)
+			if reason == "existing_wake_blocking" {
+				body = `{"schema":1,"status":"failed","reason_code":"existing_wake_blocking","root":"/tmp/root","agent":"worker","current_generation":"generation-1","current_target_digest":"sha256:target-1","current_wake_mode":"owner_bound"}`
+			}
 			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -755,11 +778,24 @@ func TestReadWakeCommandResultContract(t *testing.T) {
 			}
 		})
 	}
+	for _, mode := range []string{"owner_bound", "inject-via", "raw", "paste", "none", "unverified"} {
+		t.Run("valid blocker mode "+mode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "result.json")
+			body := fmt.Sprintf(`{"schema":1,"status":"failed","reason_code":"existing_wake_blocking","root":"/tmp/root","agent":"worker","current_generation":"generation-1","current_target_digest":"sha256:target-1","current_wake_mode":%q}`, mode)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readWakeCommandResult(path); err != nil {
+				t.Fatalf("known blocker mode %q rejected: %v", mode, err)
+			}
+		})
+	}
 	for name, body := range map[string]string{
 		"wrong schema": `{"schema":2,"status":"failed","reason_code":"invalid_owner"}`,
 		"wrong status": `{"schema":1,"status":"ok","reason_code":"invalid_owner"}`,
 		"missing code": `{"schema":1,"status":"failed"}`,
 		"unknown code": `{"schema":1,"status":"failed","reason_code":"surprise"}`,
+		"unknown mode": `{"schema":1,"status":"failed","reason_code":"existing_wake_blocking","root":"/tmp/root","agent":"worker","current_generation":"generation-1","current_target_digest":"sha256:target-1","current_wake_mode":"future-mode"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "result.json")
@@ -771,6 +807,16 @@ func TestReadWakeCommandResultContract(t *testing.T) {
 			}
 		})
 	}
+	t.Run("additive field", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "result.json")
+		body := `{"schema":1,"status":"failed","reason_code":"invalid_owner","future_detail":{"safe":true}}`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readWakeCommandResult(path); err != nil {
+			t.Fatalf("additive start-result field was not tolerated: %v", err)
+		}
+	})
 }
 
 func TestSecureLifecycleFileGuards(t *testing.T) {
@@ -969,6 +1015,33 @@ func TestRetireWakeJoinsProcessParseAndSanitizedStderrErrors(t *testing.T) {
 	}
 	if strings.ContainsAny(text, "\x1b\a") {
 		t.Fatalf("stderr control characters were not sanitized: %q", text)
+	}
+}
+
+func TestStartWakeJoinsMalformedResultWithProcessReadinessFailure(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+result=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--result-file" ]; then result="$arg"; fi
+  previous="$arg"
+done
+[ -n "$result" ] || exit 11
+printf '{' > "$result"
+exit 7
+`)
+	_, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root: "/tmp/amq-root", Me: "worker", InjectVia: "/tmp/amq-keepalive", Adapter: "file", Target: filepath.Join(dir, "target"),
+		Timeout: 5 * time.Second, Owner: testWakeOwner(),
+	})
+	if err == nil {
+		t.Fatal("malformed wake start result unexpectedly succeeded")
+	}
+	for _, want := range []string{"amq wake exited before becoming ready", "parse amq wake start result"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("joined error %q lacks %q", err, want)
+		}
 	}
 }
 

@@ -13,9 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
 
-const DefaultLabel = "com.ohade.amq-keepalive"
+const (
+	DefaultLabel              = "com.ohade.amq-keepalive"
+	DefaultSupervisorInterval = time.Minute
+)
 
 type Options struct {
 	Label        string
@@ -110,16 +115,16 @@ func NormalizeOptions(opts Options) (Options, error) {
 		opts.RegistryPath = abs
 	}
 	if opts.Interval <= 0 {
-		opts.Interval = time.Minute
+		opts.Interval = DefaultSupervisorInterval
 	}
-	if opts.OwnerGrace < 5*time.Minute {
-		opts.OwnerGrace = 5 * time.Minute
+	if opts.OwnerGrace < supervisor.MinOwnerGoneGrace {
+		opts.OwnerGrace = supervisor.MinOwnerGoneGrace
 	}
-	if opts.Retention < 24*time.Hour {
-		opts.Retention = 24 * time.Hour
+	if opts.Retention < supervisor.MinRetiredRetention {
+		opts.Retention = supervisor.MinRetiredRetention
 	}
-	if opts.GCTimeout <= 0 || opts.GCTimeout > 5*time.Second {
-		opts.GCTimeout = 5 * time.Second
+	if opts.GCTimeout <= 0 || opts.GCTimeout > supervisor.MaxLifecycleTimeout {
+		opts.GCTimeout = supervisor.MaxLifecycleTimeout
 	}
 	if opts.PlistPath == "" {
 		path, err := DefaultPlistPath(opts.Label)

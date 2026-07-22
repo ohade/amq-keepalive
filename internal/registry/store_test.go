@@ -541,6 +541,30 @@ func TestStoreMigratesV1WithSecureBackupAndLegacyFailClosedState(t *testing.T) {
 	}
 }
 
+func TestStoreMigrationIgnoresCleanupFailureAfterDurableBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousRemove := removeMigrationTemp
+	removeMigrationTemp = func(string) error { return errors.New("injected temporary cleanup failure") }
+	t.Cleanup(func() { removeMigrationTemp = previousRemove })
+	loaded, err := New(path).Load()
+	if err != nil || loaded.SchemaVersion != SchemaVersion {
+		t.Fatalf("migration reported false failure: loaded=%#v err=%v", loaded, err)
+	}
+	backup, err := os.ReadFile(path + ".v1.bak")
+	if err != nil || !bytes.Equal(backup, v1) {
+		t.Fatalf("durable backup=%q err=%v", backup, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, ".registry-v1-backup-*.tmp"))
+	if err != nil || len(temps) != 1 {
+		t.Fatalf("best-effort cleanup test did not retain exactly one injected temp: temps=%v err=%v", temps, err)
+	}
+}
+
 func TestStoreLoadPreviewMigratesV1OnlyInMemoryWithoutFilesystemWrites(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "registry.json")
@@ -1239,6 +1263,47 @@ func TestAppendGCRootAttemptEnforcesRollingDistinctRootLimit(t *testing.T) {
 	}
 	if _, err := appendGCRootAttempt(full, "/tmp/overflow", now); err == nil || !strings.Contains(err.Error(), "hard maximum") {
 		t.Fatalf("overflow attempt error=%v", err)
+	}
+}
+
+func TestStoreNormalizesFutureAttemptLedgerAndRecoversAfterOneWindow(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	file := File{SchemaVersion: SchemaVersion}
+	for index := 0; index < MaxGCRootAttempts; index++ {
+		file.GCRootAttempts = append(file.GCRootAttempts, GCRootAttempt{
+			CanonicalRoot: fmt.Sprintf("/tmp/future-root-%d", index), StartedAt: now.Add(365 * 24 * time.Hour),
+		})
+	}
+	path := filepath.Join(t.TempDir(), "registry.json")
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := New(path)
+	store.Now = func() time.Time { return now }
+	loaded, err := store.Load()
+	if err != nil || len(loaded.GCRootAttempts) != MaxGCRootAttempts {
+		t.Fatalf("normalized load=%#v err=%v", loaded.GCRootAttempts, err)
+	}
+	for _, attempt := range loaded.GCRootAttempts {
+		if !attempt.StartedAt.Equal(now) {
+			t.Fatalf("future attempt was not clamped to bounded window: %#v", attempt)
+		}
+	}
+	if _, err := appendGCRootAttempt(loaded.GCRootAttempts, "/tmp/blocked-now", now); err == nil || !strings.Contains(err.Error(), "hard maximum") {
+		t.Fatalf("normalized future ledger did not fail closed in current window: %v", err)
+	}
+	later := now.Add(GCRootAttemptWindow + time.Second)
+	if next, err := appendGCRootAttempt(loaded.GCRootAttempts, "/tmp/recovered", later); err != nil || len(next) != 1 || next[0].CanonicalRoot != "/tmp/recovered" {
+		t.Fatalf("normalized future ledger remained wedged: next=%#v err=%v", next, err)
+	}
+	var onDisk File
+	persisted, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(persisted, &onDisk) != nil || !onDisk.GCRootAttempts[0].StartedAt.Equal(now) {
+		t.Fatalf("normalized ledger was not persisted: file=%#v err=%v", onDisk, err)
 	}
 }
 

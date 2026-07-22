@@ -619,11 +619,11 @@ func TestRootBatchHardFiveRootsWindowAndCatchUpAcrossRestart(t *testing.T) {
 		if len(wake.mutations) != before+1 || pass.AttemptedRoot == "" {
 			t.Fatalf("pass %d mutations=%d attempted=%q", passIndex, len(wake.mutations)-before, pass.AttemptedRoot)
 		}
-		if passIndex < supervisor.MaxRootsPerGCWindow-1 && (!pass.PendingGCRoots || nextSuperviseDelay(time.Minute, pass) != supervisor.GCCatchUpInterval) {
+		if !pass.BatchExecuted || nextSuperviseDelay(time.Minute, pass) != supervisor.GCCatchUpInterval {
 			t.Fatalf("pass %d did not request five-second catch-up: %#v", passIndex, pass)
 		}
-		if passIndex == supervisor.MaxRootsPerGCWindow-1 && pass.PendingGCRoots {
-			t.Fatalf("fifth root bypassed hard rolling-window stop: %#v", pass)
+		if pass.PendingGCRoots {
+			t.Fatalf("batch pass unexpectedly retained a coordinator: %#v", pass)
 		}
 	}
 	restartNow := now.Add(time.Duration(supervisor.MaxRootsPerGCWindow) * supervisor.GCCatchUpInterval)
@@ -690,6 +690,67 @@ func TestSuperviseOversizedRootTouchesNoLifecycle(t *testing.T) {
 		if entry.LastGCReason != "root_batch_oversized" || !entry.GCBackoffUntil.Equal(now.Add(15*time.Minute)) {
 			t.Fatalf("oversized entry=%#v", entry)
 		}
+	}
+}
+
+func TestRootBatchEndsLockedPassAtSixteenLifecycleCallsBeforeUnrelatedWakeStart(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "batch-root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]registry.Entry, 0, supervisor.MaxAgentsPerRootBatch+1)
+	for index := 0; index < supervisor.MaxAgentsPerRootBatch; index++ {
+		entry := gcRootBatchEntry(fmt.Sprintf("member-%d", index), root, now.Add(-20*time.Minute))
+		if err := os.WriteFile(entry.Target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, entry)
+	}
+	unrelatedTarget := filepath.Join(dir, "unrelated-target")
+	if err := os.WriteFile(unrelatedTarget, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries = append(entries, registry.Entry{
+		ID: "unrelated", Root: filepath.Join(dir, "unrelated-root"), Agent: "unrelated", Adapter: "file", Target: unrelatedTarget,
+		State: registry.StateAttached, WakeOwnerPresent: true,
+		WakeOwner:          registry.WakeOwner{PID: 42, ProcessStart: "start-1", BootID: "boot-1", SessionID: 42},
+		WakeBinding:        registry.WakeBinding{Generation: "generation-unrelated", TargetDigest: "sha256:unrelated"},
+		GCQuarantinedAt:    now,
+		GCQuarantineReason: "test excludes unrelated row from automatic retirement",
+	})
+	registryPath := filepath.Join(dir, "registry.json")
+	if err := registry.New(registryPath).Save(registry.File{Entries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	wake := &leaseBoundWake{}
+	policy := gcBatchPolicy()
+	policy.Timeout = time.Hour
+	pass, err := (App{Stdout: io.Discard, Stderr: io.Discard, Now: func() time.Time { return now }}).superviseOnceWithGCState(
+		context.Background(), registryPath, wake, "/bin/sh", time.Hour, policy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pass.BatchExecuted || nextSuperviseDelay(time.Minute, pass) != supervisor.GCCatchUpInterval {
+		t.Fatalf("batch pass did not request bounded follow-up: %#v", pass)
+	}
+	if len(wake.lifecycle) != 2*supervisor.MaxAgentsPerRootBatch || wake.starts != 0 {
+		t.Fatalf("lifecycle=%d starts=%d, want lifecycle=%d starts=0", len(wake.lifecycle), wake.starts, 2*supervisor.MaxAgentsPerRootBatch)
+	}
+	for index, request := range wake.lifecycle {
+		if request.Timeout != supervisor.MaxLifecycleTimeout {
+			t.Fatalf("lifecycle[%d] timeout=%s want=%s", index, request.Timeout, supervisor.MaxLifecycleTimeout)
+		}
+	}
+	if _, err := (App{Stdout: io.Discard, Stderr: io.Discard, Now: func() time.Time { return now.Add(supervisor.GCCatchUpInterval) }}).superviseOnceWithGCState(
+		context.Background(), registryPath, wake, "/bin/sh", time.Hour, policy,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if wake.starts != 1 {
+		t.Fatalf("follow-up starts=%d, want unrelated row reconciled once", wake.starts)
 	}
 }
 
@@ -1125,6 +1186,32 @@ type gcBatchScriptWake struct {
 	panicAfterTombstone bool
 	failFirstMutation   bool
 	supersedeFirst      bool
+}
+
+type leaseBoundWake struct {
+	lifecycle []amq.RetireWakeRequest
+	starts    int
+}
+
+func (*leaseBoundWake) Env(context.Context) (amq.Env, error) {
+	return amq.Env{Capabilities: []string{amq.CapabilityWakeGCV1}}, nil
+}
+
+func (w *leaseBoundWake) StartWake(context.Context, amq.StartWakeRequest) (amq.WakeBinding, error) {
+	w.starts++
+	return amq.WakeBinding{Generation: "generation-follow-up", TargetDigest: "sha256:follow-up"}, nil
+}
+
+func (w *leaseBoundWake) RetireWake(_ context.Context, request amq.RetireWakeRequest) (amq.RetireWakeResult, error) {
+	w.lifecycle = append(w.lifecycle, request)
+	status, reason := "retired", "retired_exact"
+	if request.Check {
+		status, reason = "eligible", "owner_gone"
+	}
+	return amq.RetireWakeResult{
+		Status: status, ReasonCode: reason, Root: request.Root, Agent: request.Me,
+		Generation: request.Generation, TargetDigest: request.TargetDigest,
+	}, nil
 }
 
 func (*gcBatchScriptWake) StartWake(context.Context, amq.StartWakeRequest) (amq.WakeBinding, error) {

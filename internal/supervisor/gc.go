@@ -156,7 +156,7 @@ func (g GarbageCollector) ProcessWithBudget(ctx context.Context, entry registry.
 		}
 		return markRetired(entry, now, checked), retiredResult(result, checked)
 	}
-	if checked.Status == "refused" && checked.ReasonCode == "owner_live" {
+	if ownerLiveRetirementResult(checkReq, checked) {
 		if persist {
 			entry.OwnerGoneSince = time.Time{}
 			entry = clearGCFailure(entry)
@@ -249,6 +249,13 @@ func SafeRetirementResult(req amq.RetireWakeRequest, result amq.RetireWakeResult
 // invariant here protects alternate WakeLifecycle implementations and tests.
 func EligibleRetirementResult(req amq.RetireWakeRequest, result amq.RetireWakeResult) bool {
 	return result.Status == "eligible" && result.ReasonCode == "owner_gone" && retirementResultMatches(req, result)
+}
+
+// ownerLiveRetirementResult is a non-retirement safety result only when AMQ
+// echoes the exact frozen identity. Alternate lifecycle implementations cannot
+// use an unrelated owner_live response to reset this row's GC state.
+func ownerLiveRetirementResult(req amq.RetireWakeRequest, result amq.RetireWakeResult) bool {
+	return result.Status == "refused" && result.ReasonCode == "owner_live" && retirementResultMatches(req, result)
 }
 
 func retirementResultMatches(req amq.RetireWakeRequest, result amq.RetireWakeResult) bool {

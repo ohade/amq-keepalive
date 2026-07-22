@@ -594,6 +594,7 @@ type supervisionPass struct {
 	Results        []supervisor.Result
 	AttemptedRoot  string
 	PendingGCRoots bool
+	BatchExecuted  bool
 }
 
 type supervisePassFunc func(bool) (supervisionPass, error)
@@ -947,12 +948,22 @@ func runSuperviseLoop(ctx context.Context, interval time.Duration, stderr io.Wri
 	for {
 		pass, err := runOnce(false)
 		if err != nil {
-			_, _ = fmt.Fprintln(stderr, err)
+			if _, writeErr := fmt.Fprintln(stderr, err); writeErr != nil {
+				return errors.Join(err, fmt.Errorf("write supervisor failure diagnostic: %w", writeErr))
+			}
 		}
 		// A durable batch must keep its five-second recovery cadence even when
 		// the pass failed. The returned pass is authoritative about pending
 		// coordinator state; the error is diagnostic, not scheduling policy.
-		if waitErr := wait(ctx, nextSuperviseDelay(interval, pass)); waitErr != nil {
+		delay := nextSuperviseDelay(interval, pass)
+		if err != nil {
+			// A failed pass may have stopped before it could discover or return a
+			// durable coordinator. Retrying at the bounded catch-up cadence is the
+			// only safe way to avoid silently stretching recovery to the ordinary
+			// supervisor interval.
+			delay = supervisor.GCCatchUpInterval
+		}
+		if waitErr := wait(ctx, delay); waitErr != nil {
 			if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
 				return nil
 			}
@@ -962,7 +973,7 @@ func runSuperviseLoop(ctx context.Context, interval time.Duration, stderr io.Wri
 }
 
 func nextSuperviseDelay(interval time.Duration, pass supervisionPass) time.Duration {
-	if pass.AttemptedRoot != "" && pass.PendingGCRoots {
+	if pass.BatchExecuted || (pass.AttemptedRoot != "" && pass.PendingGCRoots) {
 		return supervisor.GCCatchUpInterval
 	}
 	return interval
@@ -1066,6 +1077,15 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 				}
 			}
 		}
+		if batchResults != nil {
+			// A root batch can consume two lifecycle calls per member, each with
+			// its own deadline. End this registration-lock lease immediately after
+			// that bounded unit of work. A five-second follow-up pass reconciles
+			// unrelated rows without allowing slow GC I/O to extend this lease.
+			pass.BatchExecuted = true
+			pass.Results = orderedBatchResults(file.Entries, batchResults)
+			return nil
+		}
 		adapters := adapter.DefaultRegistry()
 		probes := passProbes(file.Entries, adapters)
 		conflicts := targetOwnershipConflicts(file, adapters)
@@ -1115,7 +1135,9 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 						if err := store.UpdateEntry(updated); err != nil {
 							return err
 						}
-						a.logReconcileTransition(entry, updated, startResult)
+						if err := a.logReconcileTransition(entry, updated, startResult); err != nil {
+							return err
+						}
 						pass.Results = append(pass.Results, startResult)
 						continue
 					}
@@ -1129,7 +1151,9 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 						return err
 					}
 					blockedResult := supervisor.Result{Action: supervisor.ActionBackoff, AMQTouched: startResult.AMQTouched, Error: errors.New(updated.LastError)}
-					a.logReconcileTransition(entry, updated, blockedResult)
+					if err := a.logReconcileTransition(entry, updated, blockedResult); err != nil {
+						return err
+					}
 					pass.Results = append(pass.Results, blockedResult)
 					continue
 				}
@@ -1141,7 +1165,9 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 						return err
 					}
 					recoveredResult := supervisor.Result{Action: supervisor.ActionEnsured, AMQTouched: true}
-					a.logReconcileTransition(entry, updated, recoveredResult)
+					if err := a.logReconcileTransition(entry, updated, recoveredResult); err != nil {
+						return err
+					}
 					pass.Results = append(pass.Results, recoveredResult)
 					continue
 				}
@@ -1152,7 +1178,9 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 						return err
 					}
 					failedResult := supervisor.Result{Action: supervisor.ActionStartFailed, AMQTouched: true, Error: recoverErr}
-					a.logReconcileTransition(entry, updated, failedResult)
+					if err := a.logReconcileTransition(entry, updated, failedResult); err != nil {
+						return err
+					}
 					pass.Results = append(pass.Results, failedResult)
 					continue
 				}
@@ -1170,7 +1198,9 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 					continue
 				}
 				entry = gcUpdated
-				a.logGCTransition(previous, entry, gcResult)
+				if err := a.logGCTransition(previous, entry, gcResult); err != nil {
+					return err
+				}
 				if gcResult.Status == supervisor.GCStatusRetired ||
 					gcResult.Status == supervisor.GCStatusOwnerGoneSeen ||
 					gcResult.Status == supervisor.GCStatusEligible ||
@@ -1186,7 +1216,9 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 			if previous != updated {
 				updates = append(updates, registry.EntryUpdate{Before: previous, After: updated})
 			}
-			a.logReconcileTransition(previous, updated, result)
+			if err := a.logReconcileTransition(previous, updated, result); err != nil {
+				return err
+			}
 			pass.Results = append(pass.Results, result)
 		}
 		if _, err = store.UpdateEntries(updates); err != nil {
@@ -1217,6 +1249,16 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 		return nil
 	})
 	return pass, err
+}
+
+func orderedBatchResults(entries []registry.Entry, selected map[string]supervisor.Result) []supervisor.Result {
+	results := make([]supervisor.Result, 0, len(selected))
+	for _, entry := range entries {
+		if result, ok := selected[entry.ID]; ok {
+			results = append(results, result)
+		}
+	}
+	return results
 }
 
 func oversizedGCRootBatchResults(plan gcRootBatchPlan) map[string]supervisor.Result {
@@ -1556,18 +1598,18 @@ func transitionPreviousEntry(transition registry.ReattachTransition) registry.En
 	}
 }
 
-func (a App) logReconcileTransition(previous, updated registry.Entry, result supervisor.Result) {
+func (a App) logReconcileTransition(previous, updated registry.Entry, result supervisor.Result) error {
 	if previous.State == updated.State &&
 		previous.LastError == updated.LastError &&
 		previous.LastSupervisorDecision == updated.LastSupervisorDecision {
-		return
+		return nil
 	}
 	w := a.Stderr
 	if w == nil {
 		w = os.Stderr
 	}
 	if result.Error != nil {
-		fmt.Fprintf(w,
+		if _, err := fmt.Fprintf(w,
 			"amq-keepalive reconcile warning: action=%s root=%q agent=%q adapter=%q target=%q failure_count=%d error=%q\n",
 			result.Action,
 			updated.Root,
@@ -1576,30 +1618,35 @@ func (a App) logReconcileTransition(previous, updated registry.Entry, result sup
 			updated.Target,
 			updated.FailureCount,
 			result.Error.Error(),
-		)
-		return
+		); err != nil {
+			return fmt.Errorf("write reconcile transition diagnostic: %w", err)
+		}
+		return nil
 	}
 	if updated.State == registry.StateActive {
-		fmt.Fprintf(w,
+		if _, err := fmt.Fprintf(w,
 			"amq-keepalive reconcile recovered: action=%s root=%q agent=%q adapter=%q target=%q\n",
 			result.Action,
 			updated.Root,
 			updated.Agent,
 			updated.Adapter,
 			updated.Target,
-		)
+		); err != nil {
+			return fmt.Errorf("write reconcile transition diagnostic: %w", err)
+		}
 	}
+	return nil
 }
 
-func (a App) logGCTransition(previous, updated registry.Entry, result supervisor.GCResult) {
+func (a App) logGCTransition(previous, updated registry.Entry, result supervisor.GCResult) error {
 	if previous.LastGCDecision == updated.LastGCDecision && previous.LastGCReason == updated.LastGCReason {
-		return
+		return nil
 	}
 	w := a.Stderr
 	if w == nil {
 		w = os.Stderr
 	}
-	_, _ = fmt.Fprintf(w,
+	if _, err := fmt.Fprintf(w,
 		"amq-keepalive gc: status=%s reason_code=%q root=%q agent=%q generation=%q reason=%q\n",
 		result.Status,
 		result.ReasonCode,
@@ -1607,7 +1654,10 @@ func (a App) logGCTransition(previous, updated registry.Entry, result supervisor
 		updated.Agent,
 		updated.WakeBinding.Generation,
 		result.Reason,
-	)
+	); err != nil {
+		return fmt.Errorf("write GC transition diagnostic: %w", err)
+	}
+	return nil
 }
 
 type fixedProbeError struct {
@@ -1818,10 +1868,12 @@ type doctorEntry struct {
 }
 
 type doctorResult struct {
-	SchemaVersion    int           `json:"schema_version"`
-	WakeGCCapability bool          `json:"wake_gc_capability"`
-	CapabilityError  string        `json:"capability_error,omitempty"`
-	Entries          []doctorEntry `json:"entries"`
+	SchemaVersion      int           `json:"schema_version"`
+	WakeGCCapability   bool          `json:"wake_gc_capability"`
+	CapabilityError    string        `json:"capability_error,omitempty"`
+	ActiveGCBatchID    string        `json:"active_gc_batch_id,omitempty"`
+	ActiveGCBatchPhase string        `json:"active_gc_batch_phase,omitempty"`
+	Entries            []doctorEntry `json:"entries"`
 }
 
 func (a App) doctor(ctx context.Context, args []string) error {
@@ -1833,11 +1885,17 @@ func (a App) doctor(ctx context.Context, args []string) error {
 		return err
 	}
 	store := registry.New(*registryPath)
-	file, err := store.Load()
+	file, err := store.LoadPreview()
 	if err != nil {
 		return err
 	}
 	result := doctorResult{SchemaVersion: file.SchemaVersion}
+	if batch, active, batchErr := activeGCRootBatch(file); batchErr != nil {
+		return batchErr
+	} else if active {
+		result.ActiveGCBatchID = batch.ID
+		result.ActiveGCBatchPhase = string(batch.Phase)
+	}
 	if environment, envErr := amq.NewCLI(*amqPath).Env(ctx); envErr != nil {
 		result.CapabilityError = envErr.Error()
 	} else {
@@ -2000,6 +2058,14 @@ func (a App) gc(ctx context.Context, args []string) error {
 					}
 				}
 			}
+		}
+		if *apply && result.AttemptedRoot != "" {
+			for _, entry := range file.Entries {
+				if selectedResult, ok := selected[entry.ID]; ok && selectedResult.GC != nil {
+					result.Entries = append(result.Entries, *selectedResult.GC)
+				}
+			}
+			return nil
 		}
 		for _, entry := range file.Entries {
 			if selectedResult, ok := selected[entry.ID]; ok {

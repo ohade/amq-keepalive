@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,56 @@ func TestGCAbandonRequiresExactDoubleConfirmation(t *testing.T) {
 	})
 	if code != 1 || !strings.Contains(stderr.String(), "same exact non-empty batch id") {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestDoctorReportsActiveBatchWithoutMutatingRegistry(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := canonicalGCRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := registry.Entry{
+		ID: "entry", Root: root, Agent: "worker", Adapter: "file", Target: filepath.Join(root, "target"), State: registry.StateActive,
+		WakeOwnerPresent: true, WakeOwner: registry.WakeOwner{PID: 42, ProcessStart: "start", BootID: "boot", SessionID: 42},
+		WakeBinding: registry.WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"},
+	}
+	member := registry.GCRootBatchMember{
+		EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	file := registry.File{SchemaVersion: registry.SchemaVersion, Entries: []registry.Entry{entry},
+		GCRootBatches:  []registry.GCRootBatch{{ID: "batch-1", CanonicalRoot: root, StartedAt: now, Phase: registry.GCRootBatchRetiring, Members: []registry.GCRootBatchMember{member}}},
+		GCRootAttempts: []registry.GCRootAttempt{{CanonicalRoot: root, StartedAt: now}},
+	}
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryPath := filepath.Join(dir, "registry.json")
+	if err := os.WriteFile(registryPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeAMQ := filepath.Join(dir, "amq")
+	env := `{"schema_version":1,"amq_version":"test","root":"/tmp/root","base_root":"/tmp","session_name":"root","in_session":true,"me":"worker","project":"test","root_source":"flag","peers":{},"capabilities":["wake_gc_v1"]}`
+	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nprintf '%s\\n' '"+env+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := (App{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"doctor", "--registry", registryPath, "--amq", fakeAMQ})
+	if code != 0 || !strings.Contains(stdout.String(), `"active_gc_batch_id": "batch-1"`) || !strings.Contains(stdout.String(), `"active_gc_batch_phase": "retiring"`) {
+		t.Fatalf("doctor code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, forbidden := range []string{registryPath + ".lock", registryPath + ".registration.lock", registryPath + ".v1.bak"} {
+		if _, err := os.Lstat(forbidden); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("doctor created %q: %v", forbidden, err)
+		}
 	}
 }
 
@@ -152,7 +203,7 @@ func TestAttachWithoutStrongOwnerPersistsInactiveReservationAndWarns(t *testing.
 	called := filepath.Join(dir, "amq-called")
 	t.Setenv("AMQ_KEEPALIVE_CALLED", called)
 	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nif [ \"$1\" = env ]; then printf '%s\\n' '{\"schema_version\":1,\"capabilities\":[\"wake_gc_v1\"]}'; exit 0; fi\n: > \"$AMQ_KEEPALIVE_CALLED\"\nexit 99\n"), 0o700); err != nil {
+	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nif [ \"$1\" = env ]; then printf '%s\\n' '{\"schema_version\":1,\"amq_version\":\"test\",\"root\":\"/tmp/root\",\"base_root\":\"/tmp\",\"session_name\":\"root\",\"in_session\":true,\"me\":\"worker\",\"project\":\"test\",\"root_source\":\"flag\",\"peers\":{},\"capabilities\":[\"wake_gc_v1\"]}'; exit 0; fi\n: > \"$AMQ_KEEPALIVE_CALLED\"\nexit 99\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
@@ -194,7 +245,7 @@ func TestManagedAttachCapabilityGatePrecedesRegistryMutation(t *testing.T) {
 			touched := filepath.Join(dir, "wake-touched")
 			t.Setenv("AMQ_KEEPALIVE_WAKE_TOUCHED", touched)
 			fakeAMQ := filepath.Join(dir, "amq")
-			script := "#!/bin/sh\nif [ \"$1\" = env ]; then printf '%s\\n' '{\"schema_version\":1,\"capabilities\":[]}'; exit 0; fi\n: > \"$AMQ_KEEPALIVE_WAKE_TOUCHED\"\n"
+			script := "#!/bin/sh\nif [ \"$1\" = env ]; then printf '%s\\n' '{\"schema_version\":1,\"amq_version\":\"test\",\"root\":\"/tmp/root\",\"base_root\":\"/tmp\",\"session_name\":\"root\",\"in_session\":true,\"me\":\"worker\",\"project\":\"test\",\"root_source\":\"flag\",\"peers\":{},\"capabilities\":[]}'; exit 0; fi\n: > \"$AMQ_KEEPALIVE_WAKE_TOUCHED\"\n"
 			if err := os.WriteFile(fakeAMQ, []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -809,10 +860,12 @@ func TestReattachCancellationPreservesReservationForLateReadyWake(t *testing.T) 
 	allowReady := filepath.Join(dir, "allow-ready")
 	lateReady := filepath.Join(dir, "late-ready")
 	release := filepath.Join(dir, "release")
+	exited := filepath.Join(dir, "exited")
 	t.Setenv("AMQ_KEEPALIVE_STARTED", started)
 	t.Setenv("AMQ_KEEPALIVE_ALLOW_READY", allowReady)
 	t.Setenv("AMQ_KEEPALIVE_LATE_READY", lateReady)
 	t.Setenv("AMQ_KEEPALIVE_RELEASE", release)
+	t.Setenv("AMQ_KEEPALIVE_EXITED", exited)
 	fakeAMQ := filepath.Join(dir, "amq")
 	if err := os.WriteFile(fakeAMQ, appManagedAMQScript(`#!/bin/sh
 ready=""
@@ -828,6 +881,7 @@ umask 077
 printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$ready"
 : > "$AMQ_KEEPALIVE_LATE_READY"
 while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
+: > "$AMQ_KEEPALIVE_EXITED"
 `), 0o700); err != nil {
 		t.Fatalf("write fake amq: %v", err)
 	}
@@ -857,6 +911,7 @@ while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 	if err := os.WriteFile(release, nil, 0o600); err != nil {
 		t.Fatalf("release late wake: %v", err)
 	}
+	waitForPath(t, exited, 2*time.Second)
 
 	wake := &appCountingWake{}
 	if _, err := (App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}).superviseOnce(
@@ -897,6 +952,7 @@ func TestReattachRefusesLegacyUnboundOldWakeAndRestoresOldRow(t *testing.T) {
 	firstStart := filepath.Join(dir, "first-start")
 	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
 	t.Setenv("AMQ_KEEPALIVE_FIRST_START", firstStart)
+	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", root)
 	fakeAMQ := filepath.Join(dir, "amq")
 	if err := os.WriteFile(fakeAMQ, appManagedAMQScript(`#!/bin/sh
 printf 'CALL %s\n' "$*" >> "$AMQ_KEEPALIVE_ARGS_LOG"
@@ -914,7 +970,7 @@ if [ ! -f "$AMQ_KEEPALIVE_FIRST_START" ]; then
   done
   [ -n "$result" ] || exit 12
   umask 077
-  printf '%s\n' '{"schema":1,"status":"failed","reason_code":"existing_wake_blocking"}' > "$result"
+  printf '{"schema":1,"status":"failed","reason_code":"existing_wake_blocking","root":"%s","agent":"codex","current_generation":"generation-1","current_target_digest":"sha256:target-1","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT" > "$result"
   echo 'existing wake target differs' >&2
   exit 7
 fi
@@ -1068,6 +1124,7 @@ func TestReattachDoesNotRetryThroughLegacyUnboundRetirement(t *testing.T) {
 	firstStart := filepath.Join(dir, "first-start")
 	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
 	t.Setenv("AMQ_KEEPALIVE_FIRST_START", firstStart)
+	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", root)
 	fakeAMQ := filepath.Join(dir, "amq")
 	if err := os.WriteFile(fakeAMQ, appManagedAMQScript(`#!/bin/sh
 printf 'CALL %s\n' "$*" >> "$AMQ_KEEPALIVE_ARGS_LOG"
@@ -1085,7 +1142,7 @@ if [ ! -f "$AMQ_KEEPALIVE_FIRST_START" ]; then
   done
   [ -n "$result" ] || exit 12
   umask 077
-  printf '%s\n' '{"schema":1,"status":"failed","reason_code":"existing_wake_blocking"}' > "$result"
+  printf '{"schema":1,"status":"failed","reason_code":"existing_wake_blocking","root":"%s","agent":"codex","current_generation":"generation-1","current_target_digest":"sha256:target-1","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT" > "$result"
   echo 'existing wake target differs' >&2
   exit 7
 fi
@@ -1571,6 +1628,66 @@ func TestSuperviseLoopKeepsCatchUpDelayAfterPendingBatchError(t *testing.T) {
 	}
 }
 
+func TestSuperviseLoopUsesCatchUpDelayForEarlyFailureWithoutBatchState(t *testing.T) {
+	wantErr := errors.New("registry could not be loaded")
+	var waits []time.Duration
+	err := runSuperviseLoop(context.Background(), time.Hour, io.Discard,
+		func(bool) (supervisionPass, error) { return supervisionPass{}, wantErr },
+		func(_ context.Context, delay time.Duration) error {
+			waits = append(waits, delay)
+			return context.Canceled
+		},
+	)
+	if err != nil || len(waits) != 1 || waits[0] != supervisor.GCCatchUpInterval {
+		t.Fatalf("waits=%v err=%v", waits, err)
+	}
+}
+
+type failingDiagnosticWriter struct{ err error }
+
+func (w failingDiagnosticWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestSuperviseLoopReturnsDiagnosticWriteFailure(t *testing.T) {
+	passErr := errors.New("supervise failed")
+	writeErr := errors.New("diagnostic sink failed")
+	waited := false
+	err := runSuperviseLoop(context.Background(), time.Hour, failingDiagnosticWriter{err: writeErr},
+		func(bool) (supervisionPass, error) { return supervisionPass{}, passErr },
+		func(context.Context, time.Duration) error { waited = true; return context.Canceled },
+	)
+	if !errors.Is(err, passErr) || !errors.Is(err, writeErr) || waited {
+		t.Fatalf("err=%v waited=%v", err, waited)
+	}
+}
+
+func TestGCTransitionDiagnosticWriteFailureIsReturnedWithoutPersistingObservation(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry := registry.Entry{
+		ID: "entry", Root: filepath.Join(dir, "root"), Agent: "worker", Adapter: "file", Target: target, State: registry.StateActive,
+		WakeOwnerPresent: true, WakeOwner: appTestWakeOwner(), WakeBinding: appTestWakeBinding(),
+	}
+	if err := registry.New(registryPath).Save(registry.File{Entries: []registry.Entry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := errors.New("diagnostic sink failed")
+	_, err := (App{Stdout: io.Discard, Stderr: failingDiagnosticWriter{err: writeErr}}).superviseOnceWithGCState(
+		context.Background(), registryPath, &appGCWake{}, "/bin/sh", time.Second,
+		supervisor.GCPolicy{AutoGC: true, OwnerGrace: supervisor.MinOwnerGoneGrace, RetiredRetention: supervisor.MinRetiredRetention, Timeout: time.Second},
+	)
+	if !errors.Is(err, writeErr) || !strings.Contains(err.Error(), "GC transition diagnostic") {
+		t.Fatalf("err=%v", err)
+	}
+	loaded, loadErr := registry.New(registryPath).Load()
+	if loadErr != nil || !loaded.Entries[0].OwnerGoneSince.IsZero() {
+		t.Fatalf("diagnostic failure persisted observation: entry=%#v err=%v", loaded.Entries[0], loadErr)
+	}
+}
+
 func TestSuperviseCancellationStopsLaterStartsAndLeavesRegistryUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
@@ -1788,7 +1905,7 @@ func TestGCDryRunLeavesLegacyUnboundRegistryUntouched(t *testing.T) {
 	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
 printf '%s\n' "$*" >> "$AMQ_KEEPALIVE_AMQ_CALLS"
 if [ "$1" = "env" ]; then
-  printf '%s\n' '{"schema_version":1,"capabilities":["wake_gc_v1"]}'
+  printf '%s\n' '{"schema_version":1,"amq_version":"test","root":"/tmp/root","base_root":"/tmp","session_name":"root","in_session":true,"me":"worker","project":"test","root_source":"flag","peers":{},"capabilities":["wake_gc_v1"]}'
   exit 0
 fi
 printf '%s\n' '{"status":"retired","agent":"codex","pid":4242}'
@@ -1893,7 +2010,7 @@ func TestGCDryRunPreviewsV1WithoutAnyFilesystemMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"capabilities\":[\"wake_gc_v1\"]}'\n"), 0o700); err != nil {
+	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"amq_version\":\"test\",\"root\":\"/tmp/root\",\"base_root\":\"/tmp\",\"session_name\":\"root\",\"in_session\":true,\"me\":\"worker\",\"project\":\"test\",\"root_source\":\"flag\",\"peers\":{},\"capabilities\":[\"wake_gc_v1\"]}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	beforeEntries, err := os.ReadDir(dir)
@@ -2016,7 +2133,7 @@ func TestGCApplyRetiresOwnerGoneWakeEvenWhenTerminalTargetExists(t *testing.T) {
 	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
 printf '%s\n' "$*" >> "$AMQ_KEEPALIVE_AMQ_CALLS"
 if [ "$1" = "env" ]; then
-  printf '%s\n' '{"schema_version":1,"capabilities":["wake_gc_v1"]}'
+  printf '%s\n' '{"schema_version":1,"amq_version":"test","root":"/tmp/root","base_root":"/tmp","session_name":"root","in_session":true,"me":"worker","project":"test","root_source":"flag","peers":{},"capabilities":["wake_gc_v1"]}'
   exit 0
 fi
 status=retired
@@ -2128,7 +2245,7 @@ func (w *appGCWake) RetireWake(_ context.Context, request amq.RetireWakeRequest)
 	}, nil
 }
 
-func TestSupervisorRetirementCapDefersEligibleOwnerGoneWakeWithoutRestart(t *testing.T) {
+func TestSupervisorBatchPassDefersOtherRootObservationToFollowUp(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
 	now := time.Now().UTC()
@@ -2154,12 +2271,21 @@ func TestSupervisorRetirementCapDefersEligibleOwnerGoneWakeWithoutRestart(t *tes
 		t.Fatal(err)
 	}
 	wake := &appGCWake{}
-	results, err := (App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}).superviseOnceWithGC(
+	policy := supervisor.GCPolicy{AutoGC: true, OwnerGrace: 5 * time.Minute, RetiredRetention: 24 * time.Hour, Timeout: time.Second}
+	pass, err := (App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Now: func() time.Time { return now }}).superviseOnceWithGCState(
 		context.Background(), registryPath, wake, "/bin/sh", time.Second,
-		supervisor.GCPolicy{AutoGC: true, OwnerGrace: 5 * time.Minute, RetiredRetention: 24 * time.Hour, Timeout: time.Second}, 99,
+		policy,
 	)
-	if err != nil || len(results) != 2 || wake.starts != 0 || len(wake.retires) != 3 {
-		t.Fatalf("results=%#v starts=%d retires=%#v err=%v", results, wake.starts, wake.retires, err)
+	if err != nil || len(pass.Results) != 1 || !pass.BatchExecuted || wake.starts != 0 || len(wake.retires) != 2 {
+		t.Fatalf("pass=%#v starts=%d retires=%#v err=%v", pass, wake.starts, wake.retires, err)
+	}
+	if _, err := (App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}, Now: func() time.Time { return now.Add(supervisor.GCCatchUpInterval) }}).superviseOnceWithGCState(
+		context.Background(), registryPath, wake, "/bin/sh", time.Second, policy,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if wake.starts != 0 || len(wake.retires) != 3 {
+		t.Fatalf("follow-up starts=%d retires=%#v", wake.starts, wake.retires)
 	}
 	loaded, err := registry.New(registryPath).Load()
 	if err != nil {
@@ -2219,7 +2345,7 @@ func appExactBlockingWake(old registry.Entry) *amq.WakeStartError {
 func appManagedAMQScript(body string) []byte {
 	const shebang = "#!/bin/sh\n"
 	const capability = `if [ "$1" = "env" ]; then
-  printf '%s\n' '{"schema_version":1,"capabilities":["wake_gc_v1"]}'
+  printf '%s\n' '{"schema_version":1,"amq_version":"test","root":"/tmp/root","base_root":"/tmp","session_name":"root","in_session":true,"me":"worker","project":"test","root_source":"flag","peers":{},"capabilities":["wake_gc_v1"]}'
   exit 0
 fi
 `

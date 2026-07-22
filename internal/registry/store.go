@@ -209,6 +209,8 @@ var saveAbandonedGCRootBatch = func(store *Store, file File) error {
 	return store.saveUnlocked(file)
 }
 
+var removeMigrationTemp = os.Remove
+
 type registrationSemaphore struct {
 	token chan struct{}
 }
@@ -258,6 +260,9 @@ func (s *Store) LoadPreview() (File, error) {
 		return File{}, errors.New("registry path is required")
 	}
 	file, _, _, err := s.readRegistryUnlocked()
+	if err == nil {
+		_, err = normalizeFutureGCRootAttempts(&file, s.now())
+	}
 	return file, err
 }
 
@@ -335,6 +340,13 @@ func (s *Store) loadUnlockedValidated(validate func(File) error) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
+	repairedAttempts, err := normalizeFutureGCRootAttempts(&file, s.now())
+	if err != nil {
+		return File{}, err
+	}
+	if err := validateRegistryFile(file); err != nil {
+		return File{}, fmt.Errorf("%w %q after GC attempt normalization: %w", ErrCorrupt, s.Path, err)
+	}
 	if validate != nil {
 		if err := validate(file); err != nil {
 			return File{}, err
@@ -344,11 +356,51 @@ func (s *Store) loadUnlockedValidated(validate func(File) error) (File, error) {
 		if err := s.backupV1Registry(data); err != nil {
 			return File{}, fmt.Errorf("back up registry schema v1: %w", err)
 		}
+	}
+	if migrateV1 || repairedAttempts {
 		if err := s.saveUnlocked(file); err != nil {
-			return File{}, fmt.Errorf("migrate registry schema v1: %w", err)
+			return File{}, fmt.Errorf("persist registry normalization: %w", err)
 		}
 	}
 	return file, nil
+}
+
+// normalizeFutureGCRootAttempts converts an impossible future rolling-window
+// ledger into a bounded fail-closed window starting now. Persisting this repair
+// lets the rate limit self-recover after one minute instead of remaining wedged
+// until an arbitrary future timestamp. A future timestamp which authorizes an
+// active frozen batch is never rewritten; that coordinator is quarantined for
+// explicit recovery because its immutable start identity includes the time.
+func normalizeFutureGCRootAttempts(file *File, now time.Time) (bool, error) {
+	activeAttempts := make(map[string]struct{}, len(file.GCRootBatches))
+	for _, batch := range file.GCRootBatches {
+		key := batch.CanonicalRoot + "\x00" + batch.StartedAt.UTC().Format(time.RFC3339Nano)
+		activeAttempts[key] = struct{}{}
+	}
+	changed := false
+	seenClampedRoots := make(map[string]struct{})
+	next := make([]GCRootAttempt, 0, len(file.GCRootAttempts))
+	for _, attempt := range file.GCRootAttempts {
+		if !attempt.StartedAt.After(now) {
+			next = append(next, attempt)
+			continue
+		}
+		key := attempt.CanonicalRoot + "\x00" + attempt.StartedAt.UTC().Format(time.RFC3339Nano)
+		if _, active := activeAttempts[key]; active {
+			return false, fmt.Errorf("future-dated active GC root batch attempt for %q at %s is quarantined", attempt.CanonicalRoot, attempt.StartedAt.UTC().Format(time.RFC3339Nano))
+		}
+		changed = true
+		if _, duplicate := seenClampedRoots[attempt.CanonicalRoot]; duplicate {
+			continue
+		}
+		seenClampedRoots[attempt.CanonicalRoot] = struct{}{}
+		attempt.StartedAt = now
+		next = append(next, attempt)
+	}
+	if changed {
+		file.GCRootAttempts = next
+	}
+	return changed, nil
 }
 
 func (s *Store) readRegistryUnlocked() (File, []byte, bool, error) {
@@ -430,11 +482,16 @@ func (s *Store) backupV1Registry(data []byte) error {
 			return err
 		}
 	}
-	if err := os.Remove(tmpName); err != nil {
+	// The linked backup is the durable migration prerequisite. Sync its
+	// directory before treating publication as complete; removal of the
+	// now-unreferenced temporary name is only housekeeping and must not turn a
+	// successfully published backup into a false migration failure.
+	if err := syncDir(dir); err != nil {
 		return err
 	}
 	ok = true
-	return syncDir(dir)
+	_ = removeMigrationTemp(tmpName)
+	return nil
 }
 
 func validateExistingV1Backup(path string, data []byte) error {
@@ -885,6 +942,9 @@ func appendGCRootAttempt(existing []GCRootAttempt, canonicalRoot string, started
 	for _, attempt := range existing {
 		if attempt.StartedAt.Before(windowStart) {
 			continue
+		}
+		if attempt.StartedAt.After(startedAt) {
+			attempt.StartedAt = startedAt
 		}
 		if _, duplicate := recentRoots[attempt.CanonicalRoot]; duplicate {
 			continue

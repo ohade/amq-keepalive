@@ -76,6 +76,29 @@ func TestGarbageCollectorLiveOrUnknownOwnerFailsClosedAndClearsObservation(t *te
 	}
 }
 
+func TestGarbageCollectorPinsOwnerLiveResetToExactEcho(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	entry := gcTestEntry()
+	entry.OwnerGoneSince = now.Add(-time.Hour)
+	entry.GCFailureCount = 2
+	entry.GCBackoffUntil = now.Add(-time.Minute)
+	collectorFor := func(wake *fakeLifecycle) GarbageCollector {
+		return GarbageCollector{Wake: wake, InjectVia: "/bin/sh", CapabilityAvailable: true, Now: func() time.Time { return now }}
+	}
+	exactWake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("refused", "owner_live"), err: errors.New("owner remains live")}}}
+	exact, exactResult := collectorFor(exactWake).Process(context.Background(), entry, true)
+	if !exact.OwnerGoneSince.IsZero() || exact.GCFailureCount != 0 || !exact.GCBackoffUntil.IsZero() || exactResult.ReasonCode != "owner_live" {
+		t.Fatalf("exact owner_live did not clear stale GC state: updated=%#v result=%#v", exact, exactResult)
+	}
+	mismatch := gcResultFor("refused", "owner_live")
+	mismatch.Root = "/tmp/unrelated-root"
+	mismatchWake := &fakeLifecycle{replies: []gcReply{{result: mismatch, err: errors.New("unrelated owner remains live")}}}
+	failed, failedResult := collectorFor(mismatchWake).Process(context.Background(), entry, true)
+	if failed.GCFailureCount != 3 || failed.GCBackoffUntil.IsZero() || failedResult.Reason != "unrelated owner remains live" {
+		t.Fatalf("mismatched owner_live was treated as exact: updated=%#v result=%#v", failed, failedResult)
+	}
+}
+
 func TestGarbageCollectorSafeSupersededMarksOnlyOldRowRetired(t *testing.T) {
 	wake := &fakeLifecycle{replies: []gcReply{{result: amq.RetireWakeResult{
 		Status: "superseded", ReasonCode: "generation_superseded",
