@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 type App struct {
 	Stdout io.Writer
 	Stderr io.Writer
+	Now    func() time.Time
 }
 
 type wakeLifecycle interface {
@@ -162,7 +164,7 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 	wakeOwner, wakeOwnerErr := amq.WakeOwnerFromEnvironment()
 	var amqEnvironment amq.Env
 	var amqEnvironmentErr error
-	if opts.Root == "" || opts.Me == "" || opts.BaseRoot == "" || opts.SessionName == "" {
+	if !opts.NoStart || opts.Root == "" || opts.Me == "" || opts.BaseRoot == "" || opts.SessionName == "" {
 		amqEnvironment, amqEnvironmentErr = envCLI.Env(ctx)
 		if amqEnvironmentErr != nil && (opts.Root == "" || opts.Me == "") {
 			return amqEnvironmentErr
@@ -216,6 +218,11 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 		}
 		opts.Target = normalized
 	}
+	if !opts.NoStart {
+		if capabilityErr := managedWakeCapabilityError(amqEnvironmentErr, amqEnvironment); capabilityErr != nil {
+			return capabilityErr
+		}
+	}
 	store := registry.New(opts.RegistryPath)
 	next := registry.Entry{
 		ID:               registry.EntryID(opts.Root, opts.Me, opts.AdapterName, opts.Target),
@@ -254,6 +261,9 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 		}
 		file, err := store.Load()
 		if err != nil {
+			return err
+		}
+		if err := registrationGCBatchError(file, next.Root); err != nil {
 			return err
 		}
 		if inventory != nil {
@@ -344,14 +354,21 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 	return printJSON(a.Stdout, entry)
 }
 
-func managedWakeReadinessError(ownerErr, environmentErr error, _ amq.Env) error {
-	if ownerErr != nil {
-		return fmt.Errorf("AMQ wake unavailable; messages remain queued: %w", ownerErr)
-	}
+func managedWakeCapabilityError(environmentErr error, environment amq.Env) error {
 	if environmentErr != nil {
 		return fmt.Errorf("AMQ wake unavailable; messages remain queued: capability check failed: %w", environmentErr)
 	}
+	if !environment.HasCapability(amq.CapabilityWakeGCV1) {
+		return fmt.Errorf("AMQ wake unavailable; messages remain queued: %w", errIdentitySafeWakeRetireUnavailable)
+	}
 	return nil
+}
+
+func managedWakeReadinessError(ownerErr, environmentErr error, environment amq.Env) error {
+	if ownerErr != nil {
+		return fmt.Errorf("AMQ wake unavailable; messages remain queued: %w", ownerErr)
+	}
+	return managedWakeCapabilityError(environmentErr, environment)
 }
 
 func resolveRegistrationReadinessFailure(
@@ -428,7 +445,7 @@ func checkPhysicalTargetAvailable(
 		return fmt.Errorf("resolve requested physical target ownership: %w", err)
 	}
 	for _, existing := range file.Entries {
-		if existing.Adapter != candidate.Adapter || existing.ID == candidate.ID {
+		if existing.State == registry.StateRetired || existing.Adapter != candidate.Adapter || existing.ID == candidate.ID {
 			continue
 		}
 		if ignoreSameRootAgent && existing.Root == candidate.Root && existing.Agent == candidate.Agent {
@@ -484,10 +501,6 @@ func recoverDetachedRegistration(
 		return next, false, fmt.Errorf("refusing detached wake recovery for %s at %s: expected one registry entry, found %d", next.Agent, next.Root, len(matches))
 	}
 	previous := matches[0]
-	if previous.Adapter == next.Adapter && previous.Target == next.Target {
-		return next, false, nil
-	}
-
 	updated, initialStart := reconciler.StartFresh(ctx, next)
 	if initialStart.Error == nil && initialStart.Action == supervisor.ActionEnsured {
 		return updated, true, nil
@@ -502,11 +515,16 @@ func recoverDetachedRegistration(
 		return updated, false, fmt.Errorf("old wake is already retired; new inactive reservation retained for supervisor retry: %w", initialStart.Error)
 	}
 	var structuredStart *amq.WakeStartError
-	if !errors.As(initialStart.Error, &structuredStart) || structuredStart.Result.ReasonCode != "existing_wake_blocking" {
+	if !errors.As(initialStart.Error, &structuredStart) {
 		return updated, false, fmt.Errorf("recover detached %s wake: exact-target start did not prove an old-wake conflict; refusing retirement: %w", previous.Agent, initialStart.Error)
 	}
 	if !previous.WakeOwnerPresent || !previous.WakeOwner.Strong() || !previous.WakeBinding.Complete() {
 		return updated, false, fmt.Errorf("recover detached %s wake: exact-target start failed: %v; old wake lacks owner-bound generation metadata", previous.Agent, initialStart.Error)
+	}
+	if blockerErr := amq.ValidateExistingWakeBlocker(previous.Root, previous.Agent, amq.WakeBinding{
+		Generation: previous.WakeBinding.Generation, TargetDigest: previous.WakeBinding.TargetDigest,
+	}, structuredStart.Result); blockerErr != nil {
+		return updated, false, fmt.Errorf("recover detached %s wake: start failure did not prove the persisted old wake is the blocker: %w", previous.Agent, blockerErr)
 	}
 	environment, environmentErr := lifecycle.Env(ctx)
 	if environmentErr != nil {
@@ -566,6 +584,288 @@ func recoverDetachedRegistration(
 	return updated, true, nil
 }
 
+type gcRootBatchPlan struct {
+	Canonical string
+	Members   []registry.Entry
+	Oversized bool
+}
+
+type supervisionPass struct {
+	Results        []supervisor.Result
+	AttemptedRoot  string
+	PendingGCRoots bool
+}
+
+func (a App) now() time.Time {
+	if a.Now != nil {
+		return a.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func canonicalGCRoot(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", errors.New("GC root is empty")
+	}
+	abs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real, nil
+	}
+	return abs, nil
+}
+
+func gcEntryLocallyEligible(entry registry.Entry, now time.Time, policy supervisor.GCPolicy) bool {
+	if entry.State == registry.StateRetired || entry.Transition.Active() || entry.LegacyUnbound ||
+		!entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete() {
+		return false
+	}
+	if !entry.GCBackoffUntil.IsZero() && now.Before(entry.GCBackoffUntil) {
+		return false
+	}
+	if entry.LastGCDecision == supervisor.GCStatusEligible {
+		return true
+	}
+	grace := policy.OwnerGrace
+	if grace < supervisor.MinOwnerGoneGrace {
+		grace = supervisor.MinOwnerGoneGrace
+	}
+	return !entry.OwnerGoneSince.IsZero() && now.Sub(entry.OwnerGoneSince) >= grace
+}
+
+func planGCRootBatch(entries []registry.Entry, now time.Time, policy supervisor.GCPolicy) (gcRootBatchPlan, error) {
+	return planGCRootBatchWithAttempts(entries, nil, now, policy)
+}
+
+func planGCRootBatchForFile(file registry.File, now time.Time, policy supervisor.GCPolicy) (gcRootBatchPlan, error) {
+	return planGCRootBatchWithAttempts(file.Entries, file.GCRootAttempts, now, policy)
+}
+
+func planGCRootBatchWithAttempts(entries []registry.Entry, attempts []registry.GCRootAttempt, now time.Time, policy supervisor.GCPolicy) (gcRootBatchPlan, error) {
+	recentRoots := make(map[string]struct{})
+	windowStart := now.Add(-supervisor.GCRootWindow)
+	for _, attempt := range attempts {
+		if attempt.StartedAt.IsZero() || attempt.StartedAt.Before(windowStart) {
+			continue
+		}
+		root, err := canonicalGCRoot(attempt.CanonicalRoot)
+		if err != nil {
+			return gcRootBatchPlan{}, err
+		}
+		recentRoots[root] = struct{}{}
+	}
+	for _, entry := range entries {
+		if entry.LastGCRootBatchAt.IsZero() || entry.LastGCRootBatchAt.Before(windowStart) {
+			continue
+		}
+		root, err := canonicalGCRoot(entry.Root)
+		if err != nil {
+			return gcRootBatchPlan{}, err
+		}
+		recentRoots[root] = struct{}{}
+	}
+	candidateSince := make(map[string]time.Time)
+	for _, entry := range entries {
+		if !gcEntryLocallyEligible(entry, now, policy) {
+			continue
+		}
+		root, err := canonicalGCRoot(entry.Root)
+		if err != nil {
+			return gcRootBatchPlan{}, err
+		}
+		if _, recent := recentRoots[root]; recent {
+			continue
+		}
+		since := entry.OwnerGoneSince
+		previous, exists := candidateSince[root]
+		if !exists || since.Before(previous) {
+			candidateSince[root] = since
+		}
+	}
+	selected := ""
+	var selectedSince time.Time
+	for root, since := range candidateSince {
+		if selected == "" || since.Before(selectedSince) || (since.Equal(selectedSince) && root < selected) {
+			selected = root
+			selectedSince = since
+		}
+	}
+	if selected == "" {
+		return gcRootBatchPlan{}, nil
+	}
+	if len(recentRoots) >= supervisor.MaxRootsPerGCWindow {
+		return gcRootBatchPlan{}, nil
+	}
+	members := make([]registry.Entry, 0)
+	for _, entry := range entries {
+		root, err := canonicalGCRoot(entry.Root)
+		if err != nil {
+			return gcRootBatchPlan{}, err
+		}
+		if root == selected && entry.State != registry.StateRetired {
+			members = append(members, entry)
+		}
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
+	return gcRootBatchPlan{Canonical: selected, Members: members, Oversized: len(members) > supervisor.MaxAgentsPerRootBatch}, nil
+}
+
+func persistGCRootBatchMarker(store *registry.Store, file *registry.File, plan gcRootBatchPlan, now time.Time) error {
+	if plan.Canonical == "" {
+		return nil
+	}
+	memberIDs := make(map[string]struct{}, len(plan.Members))
+	for _, member := range plan.Members {
+		memberIDs[member.ID] = struct{}{}
+	}
+	updates := make([]registry.EntryUpdate, 0)
+	for index, entry := range file.Entries {
+		if _, selected := memberIDs[entry.ID]; !selected || entry.State == registry.StateRetired {
+			continue
+		}
+		updated := entry
+		updated.LastGCRootBatchAt = now
+		if plan.Oversized {
+			updated.GCBackoffUntil = now.Add(supervisor.GCRootTerminalBackoff)
+			updated.LastGCDecision = supervisor.GCStatusSkipped
+			updated.LastGCReason = "root_batch_oversized"
+		}
+		updates = append(updates, registry.EntryUpdate{Before: entry, After: updated})
+		file.Entries[index] = updated
+	}
+	updatedFile, err := store.RecordGCRootAttempt(plan.Canonical, now, updates)
+	if err != nil {
+		return err
+	}
+	*file = updatedFile
+	return nil
+}
+
+func gcRootMemberLocalBlock(entry registry.Entry) string {
+	switch {
+	case entry.Transition.Active():
+		return "transition_active"
+	case entry.LegacyUnbound || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong():
+		return "owner_unbound"
+	case !entry.WakeBinding.Complete():
+		return "binding_unavailable"
+	case entry.ID == "" || entry.Root == "" || entry.Agent == "" || entry.Adapter == "" || entry.Target == "":
+		return "identity_incomplete"
+	default:
+		return ""
+	}
+}
+
+func locallyBlockedGCRootResults(plan gcRootBatchPlan) map[string]supervisor.Result {
+	results := make(map[string]supervisor.Result, len(plan.Members))
+	for _, entry := range plan.Members {
+		reason := gcRootMemberLocalBlock(entry)
+		if reason == "" {
+			reason = "root_batch_blocked_by_sibling"
+		}
+		item := supervisor.GCResult{
+			EntryID: entry.ID, Status: supervisor.GCStatusSkipped, ReasonCode: reason,
+			Reason:          "a non-retired listener in the canonical root lacks safe frozen-batch metadata",
+			OwnerBound:      entry.WakeOwnerPresent && entry.WakeOwner.Strong() && !entry.LegacyUnbound,
+			BindingComplete: entry.WakeBinding.Complete(),
+		}
+		results[entry.ID] = gcSupervisorResult(item)
+	}
+	return results
+}
+
+func persistLocallyBlockedGCRoot(store *registry.Store, file *registry.File, plan gcRootBatchPlan, now time.Time) error {
+	updates := make([]registry.EntryUpdate, 0, len(plan.Members))
+	for _, entry := range plan.Members {
+		updated := entry
+		updated.LastGCRootBatchAt = now
+		updated.GCBackoffUntil = now.Add(supervisor.GCRootTerminalBackoff)
+		updated.LastGCDecision = supervisor.GCStatusSkipped
+		updated.LastGCReason = gcRootMemberLocalBlock(entry)
+		if updated.LastGCReason == "" {
+			updated.LastGCReason = "root_batch_blocked_by_sibling"
+		}
+		updates = append(updates, registry.EntryUpdate{Before: entry, After: updated})
+	}
+	updatedFile, err := store.RecordGCRootAttempt(plan.Canonical, now, updates)
+	if err != nil {
+		return err
+	}
+	*file = updatedFile
+	return nil
+}
+
+func gcRootPlanHasLocalBlock(plan gcRootBatchPlan) bool {
+	for _, entry := range plan.Members {
+		if gcRootMemberLocalBlock(entry) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func frozenGCRootBatch(plan gcRootBatchPlan, now time.Time) registry.GCRootBatch {
+	members := make([]registry.GCRootBatchMember, 0, len(plan.Members))
+	ids := make([]string, 0, len(plan.Members))
+	for _, entry := range plan.Members {
+		members = append(members, registry.GCRootBatchMember{
+			EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+			WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+		})
+		ids = append(ids, entry.ID)
+	}
+	return registry.GCRootBatch{
+		ID:            registry.EntryID(plan.Canonical, "gc-root-batch", now.Format(time.RFC3339Nano), strings.Join(ids, "\x00")),
+		CanonicalRoot: plan.Canonical, StartedAt: now, Phase: registry.GCRootBatchPreflight, Members: members,
+	}
+}
+
+func activeGCRootBatch(file registry.File) (registry.GCRootBatch, bool, error) {
+	if len(file.GCRootBatches) > 1 {
+		return registry.GCRootBatch{}, false, fmt.Errorf("registry contains %d active GC root batches", len(file.GCRootBatches))
+	}
+	if len(file.GCRootBatches) == 0 {
+		return registry.GCRootBatch{}, false, nil
+	}
+	return file.GCRootBatches[0], true, nil
+
+}
+
+func registrationGCBatchError(file registry.File, root string) error {
+	canonical, err := canonicalGCRoot(root)
+	if err != nil {
+		return err
+	}
+	for _, batch := range file.GCRootBatches {
+		if batch.CanonicalRoot == canonical {
+			return fmt.Errorf("GC root batch %s is active for %s; registration is deferred until its frozen membership converges", batch.ID, canonical)
+		}
+	}
+	return nil
+}
+
+func validateNoAmbiguousLiveSessions(entries []registry.Entry) error {
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		if entry.State == registry.StateRetired {
+			continue
+		}
+		root, err := canonicalGCRoot(entry.Root)
+		if err != nil {
+			return err
+		}
+		key := root + "\x00" + entry.Agent
+		counts[key]++
+		if counts[key] > 1 {
+			return fmt.Errorf("%w: root=%q agent=%q count=%d", registry.ErrAmbiguousSession, root, entry.Agent, counts[key])
+		}
+	}
+	return nil
+}
+
 func (a App) supervise(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("supervise", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
@@ -578,37 +878,46 @@ func (a App) supervise(ctx context.Context, args []string) error {
 	autoGC := fs.Bool("auto-gc", false, "retire owner-bound wakes after two positive owner-gone observations")
 	ownerGrace := fs.Duration("owner-gone-grace", 5*time.Minute, "minimum interval between positive owner-gone observations")
 	retiredRetention := fs.Duration("retired-retention", 24*time.Hour, "diagnostic retention for retired registry rows")
-	gcMax := fs.Int("gc-max-per-pass", 1, "maximum wake retirements per supervisor pass")
 	gcTimeout := fs.Duration("gc-timeout", 5*time.Second, "deadline for each AMQ lifecycle command")
+	legacyGCMax := fs.Int("gc-max-per-pass", 1, "deprecated compatibility option; ignored in favor of hard root-batch limits")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *interval <= 0 {
 		return errors.New("--interval must be greater than zero")
 	}
-	if *ownerGrace < 0 || *retiredRetention < 0 || *gcMax < 1 || *gcTimeout <= 0 || *gcTimeout > 5*time.Second {
-		return errors.New("GC policy requires non-negative grace/retention, max >= 1, and timeout in (0,5s]")
+	if *legacyGCMax <= 0 {
+		return errors.New("deprecated --gc-max-per-pass must be greater than zero")
+	}
+	if err := validateGCPolicy(*ownerGrace, *retiredRetention, *gcTimeout); err != nil {
+		return err
 	}
 	gcPolicy := supervisor.GCPolicy{AutoGC: *autoGC, OwnerGrace: *ownerGrace, RetiredRetention: *retiredRetention, Timeout: *gcTimeout}
 
-	runOnce := func(emitJSON bool) error {
-		results, err := a.superviseOnceWithGC(ctx, *registryPath, amq.NewCLI(*amqPath), *self, *wakeTimeout, gcPolicy, *gcMax)
+	runOnce := func(emitJSON bool) (supervisionPass, error) {
+		pass, err := a.superviseOnceWithGCState(ctx, *registryPath, amq.NewCLI(*amqPath), *self, *wakeTimeout, gcPolicy)
 		if err != nil {
-			return err
+			return pass, err
 		}
 		if emitJSON {
-			return printJSON(a.Stdout, results)
+			return pass, printJSON(a.Stdout, pass.Results)
 		}
-		return nil
+		return pass, nil
 	}
 	if *once {
-		return runOnce(true)
+		_, err := runOnce(true)
+		return err
 	}
 	for {
-		if err := runOnce(false); err != nil {
+		pass, err := runOnce(false)
+		if err != nil {
 			fmt.Fprintln(a.Stderr, err)
 		}
-		timer := time.NewTimer(*interval)
+		delay := *interval
+		if err == nil {
+			delay = nextSuperviseDelay(*interval, pass)
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -618,43 +927,123 @@ func (a App) supervise(ctx context.Context, args []string) error {
 	}
 }
 
-func (a App) superviseOnce(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration) ([]supervisor.Result, error) {
-	return a.superviseOnceWithGC(ctx, registryPath, wake, self, wakeTimeout, supervisor.GCPolicy{}, 1)
+func nextSuperviseDelay(interval time.Duration, pass supervisionPass) time.Duration {
+	if pass.AttemptedRoot != "" && pass.PendingGCRoots {
+		return supervisor.GCCatchUpInterval
+	}
+	return interval
 }
 
-func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration, gcPolicy supervisor.GCPolicy, gcMax int) ([]supervisor.Result, error) {
+func (a App) superviseOnce(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration) ([]supervisor.Result, error) {
+	return a.superviseOnceWithGC(ctx, registryPath, wake, self, wakeTimeout, supervisor.GCPolicy{}, 0)
+}
+
+// The final integer is retained for source compatibility with the pre-batch
+// internal helper. It is deliberately ignored: GC throughput has only the
+// hard root-batch limits and cannot be weakened by callers.
+func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration, gcPolicy supervisor.GCPolicy, _ int) ([]supervisor.Result, error) {
+	pass, err := a.superviseOnceWithGCState(ctx, registryPath, wake, self, wakeTimeout, gcPolicy)
+	return pass.Results, err
+}
+
+func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration, gcPolicy supervisor.GCPolicy) (supervisionPass, error) {
 	store := registry.New(registryPath)
-	var results []supervisor.Result
+	var pass supervisionPass
 	var capability bool
 	var capabilityErr error
 	lifecycle, lifecycleOK := wake.(wakeLifecycle)
 	if gcPolicy.AutoGC {
-		if !lifecycleOK {
-			capabilityErr = errors.New("wake runner does not implement owner-bound lifecycle operations")
-		} else if environment, err := lifecycle.Env(ctx); err != nil {
-			capabilityErr = err
-		} else {
-			capability = environment.HasCapability(amq.CapabilityWakeGCV1)
-		}
+		capability, capabilityErr = probeWakeGCCapability(ctx, lifecycle, lifecycleOK)
 	}
 	err := store.WithRegistrationLockContext(ctx, func() error {
 		file, err := store.Load()
 		if err != nil {
 			return err
 		}
+		if err := validateNoAmbiguousLiveSessions(file.Entries); err != nil {
+			return err
+		}
+		now := a.now()
+		batch, hasBatch, err := activeGCRootBatch(file)
+		if err != nil {
+			return err
+		}
+		var batchResults map[string]supervisor.Result
+		if hasBatch {
+			pass.AttemptedRoot = batch.CanonicalRoot
+			if !gcPolicy.AutoGC {
+				if batch.Phase == registry.GCRootBatchRetiring {
+					capability, capabilityErr = probeWakeGCCapability(ctx, lifecycle, lifecycleOK)
+					if capabilityErr != nil || !capability {
+						if capabilityErr == nil {
+							capabilityErr = errIdentitySafeWakeRetireUnavailable
+						}
+						return fmt.Errorf("persisted retiring GC root batch %s is retained because kill-switch check-only recovery is unavailable: %w", batch.ID, capabilityErr)
+					}
+				}
+				batchResults, err = a.abortGCRootBatchForDisabledPolicy(ctx, store, &file, batch, lifecycle, capability, capabilityErr, self, gcPolicy)
+				if err != nil {
+					return err
+				}
+				pass.PendingGCRoots = false
+			} else {
+				if capabilityErr != nil {
+					return fmt.Errorf("persisted GC root batch %s cannot resume capability check: %w", batch.ID, capabilityErr)
+				}
+				if !capability {
+					return fmt.Errorf("persisted GC root batch %s cannot resume: %w", batch.ID, errIdentitySafeWakeRetireUnavailable)
+				}
+				batchResults, pass.PendingGCRoots, err = a.executeGCRootBatch(ctx, store, &file, batch, lifecycle, capability, capabilityErr, self, gcPolicy)
+				if err != nil {
+					return err
+				}
+			}
+		} else if gcPolicy.AutoGC && lifecycleOK && capability && capabilityErr == nil {
+			plan, planErr := planGCRootBatchForFile(file, now, gcPolicy)
+			if planErr != nil {
+				return planErr
+			}
+			if plan.Canonical != "" {
+				pass.AttemptedRoot = plan.Canonical
+				if plan.Oversized {
+					if err := persistGCRootBatchMarker(store, &file, plan, now); err != nil {
+						return err
+					}
+					batchResults = oversizedGCRootBatchResults(plan)
+				} else if gcRootPlanHasLocalBlock(plan) {
+					if err := persistLocallyBlockedGCRoot(store, &file, plan, now); err != nil {
+						return err
+					}
+					batchResults = locallyBlockedGCRootResults(plan)
+				} else {
+					batch = frozenGCRootBatch(plan, now)
+					file, err = store.StartGCRootBatch(batch, plan.Members)
+					if err != nil {
+						return err
+					}
+					batchResults, pass.PendingGCRoots, err = a.executeGCRootBatch(ctx, store, &file, batch, lifecycle, capability, capabilityErr, self, gcPolicy)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
 		adapters := adapter.DefaultRegistry()
 		probes := passProbes(file.Entries, adapters)
 		conflicts := targetOwnershipConflicts(file, adapters)
-		if anyEntryDue(file.Entries, time.Now().UTC()) {
+		if anyEntryDue(file.Entries, now) {
 			mergeOwnershipConflicts(conflicts, physicalOwnershipConflicts(ctx, file, probes))
 		}
-		results = make([]supervisor.Result, 0, len(file.Entries))
+		pass.Results = make([]supervisor.Result, 0, len(file.Entries))
 		updates := make([]registry.EntryUpdate, 0, len(file.Entries))
 		purges := make([]registry.Entry, 0)
-		retiredThisPass := 0
 		for _, entry := range file.Entries {
+			if result, selected := batchResults[entry.ID]; selected {
+				pass.Results = append(pass.Results, result)
+				continue
+			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				results = append(results, supervisor.Result{Action: supervisor.ActionDeferred, Error: ctxErr})
+				pass.Results = append(pass.Results, supervisor.Result{Action: supervisor.ActionDeferred, Error: ctxErr})
 				continue
 			}
 			previous := entry
@@ -677,7 +1066,7 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 							return err
 						}
 						a.logReconcileTransition(entry, updated, startResult)
-						results = append(results, startResult)
+						pass.Results = append(pass.Results, startResult)
 						continue
 					}
 					startErr := startResult.Error
@@ -691,7 +1080,7 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 					}
 					blockedResult := supervisor.Result{Action: supervisor.ActionBackoff, AMQTouched: startResult.AMQTouched, Error: errors.New(updated.LastError)}
 					a.logReconcileTransition(entry, updated, blockedResult)
-					results = append(results, blockedResult)
+					pass.Results = append(pass.Results, blockedResult)
 					continue
 				}
 				old := transitionPreviousEntry(entry.Transition)
@@ -703,7 +1092,7 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 					}
 					recoveredResult := supervisor.Result{Action: supervisor.ActionEnsured, AMQTouched: true}
 					a.logReconcileTransition(entry, updated, recoveredResult)
-					results = append(results, recoveredResult)
+					pass.Results = append(pass.Results, recoveredResult)
 					continue
 				}
 				if recoverErr != nil {
@@ -714,7 +1103,7 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 					}
 					failedResult := supervisor.Result{Action: supervisor.ActionStartFailed, AMQTouched: true, Error: recoverErr}
 					a.logReconcileTransition(entry, updated, failedResult)
-					results = append(results, failedResult)
+					pass.Results = append(pass.Results, failedResult)
 					continue
 				}
 			}
@@ -723,18 +1112,15 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 					Wake: lifecycle, InjectVia: self, CapabilityAvailable: capability,
 					CapabilityError: capabilityErr, Policy: gcPolicy,
 				}
-				apply := retiredThisPass < gcMax
-				gcUpdated, gcResult := collector.Process(ctx, entry, apply)
+				collector.Now = a.Now
+				gcUpdated, gcResult := collector.ProcessWithBudget(ctx, entry, true, false)
 				if gcResult.Purge {
 					purges = append(purges, previous)
-					results = append(results, supervisor.Result{Action: supervisor.GCStatusPurgeCandidate, GC: &gcResult})
+					pass.Results = append(pass.Results, supervisor.Result{Action: supervisor.GCStatusPurgeCandidate, GC: &gcResult})
 					continue
 				}
 				entry = gcUpdated
 				a.logGCTransition(previous, entry, gcResult)
-				if previous.State != registry.StateRetired && entry.State == registry.StateRetired {
-					retiredThisPass++
-				}
 				if gcResult.Status == supervisor.GCStatusRetired ||
 					gcResult.Status == supervisor.GCStatusOwnerGoneSeen ||
 					gcResult.Status == supervisor.GCStatusEligible ||
@@ -742,7 +1128,7 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 					if previous != entry {
 						updates = append(updates, registry.EntryUpdate{Before: previous, After: entry})
 					}
-					results = append(results, supervisor.Result{Action: gcResult.Status, AMQTouched: gcResult.AMQTouched, GC: &gcResult})
+					pass.Results = append(pass.Results, supervisor.Result{Action: gcResult.Status, AMQTouched: gcResult.AMQTouched, GC: &gcResult})
 					continue
 				}
 			}
@@ -751,7 +1137,7 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 				updates = append(updates, registry.EntryUpdate{Before: previous, After: updated})
 			}
 			a.logReconcileTransition(previous, updated, result)
-			results = append(results, result)
+			pass.Results = append(pass.Results, result)
 		}
 		if _, err = store.UpdateEntries(updates); err != nil {
 			return err
@@ -761,9 +1147,353 @@ func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake 
 				return err
 			}
 		}
+		if !pass.PendingGCRoots && gcPolicy.AutoGC && lifecycleOK && capability && capabilityErr == nil {
+			latest, loadErr := store.Load()
+			if loadErr != nil {
+				return loadErr
+			}
+			if _, active, activeErr := activeGCRootBatch(latest); activeErr != nil {
+				return activeErr
+			} else if active {
+				pass.PendingGCRoots = true
+			} else {
+				next, planErr := planGCRootBatchForFile(latest, now, gcPolicy)
+				if planErr != nil {
+					return planErr
+				}
+				pass.PendingGCRoots = next.Canonical != ""
+			}
+		}
 		return nil
 	})
-	return results, err
+	return pass, err
+}
+
+func oversizedGCRootBatchResults(plan gcRootBatchPlan) map[string]supervisor.Result {
+	results := make(map[string]supervisor.Result, len(plan.Members))
+	for _, entry := range plan.Members {
+		item := supervisor.GCResult{
+			EntryID: entry.ID, Status: supervisor.GCStatusSkipped, ReasonCode: "root_batch_oversized",
+			Reason:          fmt.Sprintf("canonical root has %d listener rows; hard maximum is %d", len(plan.Members), supervisor.MaxAgentsPerRootBatch),
+			OwnerBound:      entry.WakeOwnerPresent && entry.WakeOwner.Strong() && !entry.LegacyUnbound,
+			BindingComplete: entry.WakeBinding.Complete(), AMQTouched: false,
+		}
+		results[entry.ID] = supervisor.Result{Action: item.Status, GC: &item}
+	}
+	return results
+}
+
+func gcSupervisorResult(item supervisor.GCResult) supervisor.Result {
+	return supervisor.Result{Action: item.Status, AMQTouched: item.AMQTouched, GC: &item}
+}
+
+func frozenBatchEntries(file registry.File, batch registry.GCRootBatch) ([]registry.Entry, error) {
+	byID := make(map[string]registry.Entry, len(file.Entries))
+	for _, entry := range file.Entries {
+		byID[entry.ID] = entry
+	}
+	entries := make([]registry.Entry, 0, len(batch.Members))
+	for _, member := range batch.Members {
+		entry, ok := byID[member.EntryID]
+		if !ok {
+			return nil, fmt.Errorf("GC root batch %s frozen member %s is missing", batch.ID, member.EntryID)
+		}
+		if !member.Matches(entry) {
+			return nil, fmt.Errorf("GC root batch %s frozen member %s changed identity or binding", batch.ID, member.EntryID)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func replaceFileEntry(file *registry.File, updated registry.Entry) error {
+	for index := range file.Entries {
+		if file.Entries[index].ID == updated.ID {
+			file.Entries[index] = updated
+			return nil
+		}
+	}
+	return fmt.Errorf("registry entry %q disappeared from supervisor snapshot", updated.ID)
+}
+
+func preflightRequiresRetry(item supervisor.GCResult) bool {
+	switch item.ReasonCode {
+	case "capability_check_failed", "capability_unavailable", "lifecycle_unavailable", "lifecycle_error", "gc_backoff_active", "internal_error":
+		return true
+	default:
+		return item.RetirementStatus == "error"
+	}
+}
+
+func batchHaltedResult(entry registry.Entry, reason string) supervisor.Result {
+	item := supervisor.GCResult{
+		EntryID: entry.ID, Status: supervisor.GCStatusSkipped, ReasonCode: "root_batch_halted",
+		Reason: reason, OwnerBound: entry.WakeOwnerPresent && entry.WakeOwner.Strong() && !entry.LegacyUnbound,
+		BindingComplete: entry.WakeBinding.Complete(),
+	}
+	return gcSupervisorResult(item)
+}
+
+func probeWakeGCCapability(ctx context.Context, lifecycle wakeLifecycle, ok bool) (bool, error) {
+	if !ok {
+		return false, errors.New("wake runner does not implement owner-bound lifecycle operations")
+	}
+	environment, err := lifecycle.Env(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !environment.HasCapability(amq.CapabilityWakeGCV1) {
+		return false, errIdentitySafeWakeRetireUnavailable
+	}
+	return true, nil
+}
+
+// abortGCRootBatchForDisabledPolicy implements --auto-gc=false as a hard kill
+// switch. A preflight batch is canceled without lifecycle I/O. A retiring batch
+// performs check-only reconciliation so a crash-persisted tombstone or exact
+// superseding generation is reflected in the registry, but it issues no retire
+// mutation. The batch is then finished so registration cannot remain wedged.
+func (a App) abortGCRootBatchForDisabledPolicy(
+	ctx context.Context,
+	store *registry.Store,
+	file *registry.File,
+	batch registry.GCRootBatch,
+	lifecycle wakeLifecycle,
+	capability bool,
+	capabilityErr error,
+	self string,
+	policy supervisor.GCPolicy,
+) (map[string]supervisor.Result, error) {
+	entries, err := frozenBatchEntries(*file, batch)
+	if err != nil {
+		return nil, err
+	}
+	results := make(map[string]supervisor.Result, len(entries))
+	updates := make([]registry.EntryUpdate, 0, len(entries))
+	collector := supervisor.GarbageCollector{
+		Wake: lifecycle, InjectVia: self, CapabilityAvailable: capability,
+		CapabilityError: capabilityErr, Policy: policy, Now: a.Now,
+	}
+	checkOnly := batch.Phase == registry.GCRootBatchRetiring && capability && capabilityErr == nil
+	unresolved := false
+	for _, entry := range entries {
+		updated := entry
+		var item supervisor.GCResult
+		if entry.State == registry.StateRetired {
+			item = supervisor.GCResult{EntryID: entry.ID, Status: supervisor.GCStatusRetired, ReasonCode: "registry_already_retired", Reason: "frozen member retirement was already persisted"}
+		} else if checkOnly {
+			probeEntry := entry
+			probeEntry.GCBackoffUntil = time.Time{}
+			updated, item = collector.ProcessWithBudget(ctx, probeEntry, true, false)
+			resolved := item.Status == supervisor.GCStatusRetired ||
+				(item.RetirementStatus == "eligible" && item.ReasonCode == "owner_gone") ||
+				(item.RetirementStatus == "refused" && item.ReasonCode == "owner_live")
+			if !resolved {
+				unresolved = true
+			}
+		} else {
+			reasonCode := "auto_gc_disabled"
+			reason := "automatic GC is disabled; frozen batch was canceled without retirement"
+			if batch.Phase == registry.GCRootBatchRetiring && capabilityErr != nil {
+				reasonCode = "capability_check_failed"
+				reason = "automatic GC is disabled and check-only batch recovery capability failed: " + capabilityErr.Error()
+			}
+			item = supervisor.GCResult{
+				EntryID: entry.ID, Status: supervisor.GCStatusSkipped, ReasonCode: reasonCode, Reason: reason,
+				Capability: capability, OwnerBound: entry.WakeOwnerPresent && entry.WakeOwner.Strong() && !entry.LegacyUnbound,
+				BindingComplete: entry.WakeBinding.Complete(),
+			}
+			updated.LastGCDecision = item.Status
+			updated.LastGCReason = item.ReasonCode
+		}
+		if updated.State != registry.StateRetired {
+			updated.GCBackoffUntil = a.now().Add(supervisor.GCRootTerminalBackoff)
+		}
+		results[entry.ID] = gcSupervisorResult(item)
+		if updated != entry {
+			updates = append(updates, registry.EntryUpdate{Before: entry, After: updated})
+		}
+	}
+	updateResult, err := store.UpdateEntries(updates)
+	if err != nil {
+		return results, err
+	}
+	if updateResult.Skipped != 0 {
+		return results, fmt.Errorf("GC root batch %s kill-switch recovery lost %d optimistic updates", batch.ID, updateResult.Skipped)
+	}
+	for _, update := range updates {
+		if err := replaceFileEntry(file, update.After); err != nil {
+			return results, err
+		}
+	}
+	if unresolved {
+		return results, fmt.Errorf("GC root batch %s is retained because kill-switch check-only recovery had an unresolved lifecycle result", batch.ID)
+	}
+	if _, err := store.FinishGCRootBatch(batch.ID); err != nil {
+		return results, err
+	}
+	file.GCRootBatches = nil
+	return results, nil
+}
+
+// executeGCRootBatch is deliberately two-phase. The preflight phase observes
+// every frozen member and persists those non-destructive observations before
+// any retirement. Only an all-eligible root advances durably to the retiring
+// phase. Retirement results are then CAS-persisted one at a time, making a
+// crash after AMQ's tombstone but before the registry save replay-safe.
+func (a App) executeGCRootBatch(
+	ctx context.Context,
+	store *registry.Store,
+	file *registry.File,
+	batch registry.GCRootBatch,
+	lifecycle wakeLifecycle,
+	capability bool,
+	capabilityErr error,
+	self string,
+	policy supervisor.GCPolicy,
+) (map[string]supervisor.Result, bool, error) {
+	results := make(map[string]supervisor.Result, len(batch.Members))
+	collector := supervisor.GarbageCollector{
+		Wake: lifecycle, InjectVia: self, CapabilityAvailable: capability,
+		CapabilityError: capabilityErr, Policy: policy, Now: a.Now,
+	}
+	entries, err := frozenBatchEntries(*file, batch)
+	if err != nil {
+		return results, true, err
+	}
+
+	if batch.Phase == registry.GCRootBatchPreflight {
+		updates := make([]registry.EntryUpdate, 0, len(entries))
+		terminalBlock := false
+		retryBlock := false
+		for _, entry := range entries {
+			if entry.State == registry.StateRetired {
+				continue
+			}
+			updated, item := collector.ProcessWithBudget(ctx, entry, true, false)
+			acceptable := (item.Status == supervisor.GCStatusEligible && item.RetirementStatus == "eligible" && item.ReasonCode == "owner_gone") ||
+				(item.Status == supervisor.GCStatusRetired && (item.RetirementStatus == "already_retired" || item.RetirementStatus == "retired"))
+			if !acceptable {
+				if preflightRequiresRetry(item) {
+					retryBlock = true
+					updated.OwnerGoneSince = entry.OwnerGoneSince
+					updated.GCBackoffUntil = a.now().Add(supervisor.GCCatchUpInterval)
+				} else {
+					terminalBlock = true
+				}
+			}
+			results[entry.ID] = gcSupervisorResult(item)
+			if updated != entry {
+				updates = append(updates, registry.EntryUpdate{Before: entry, After: updated})
+			}
+		}
+		if terminalBlock {
+			quarantineUntil := a.now().Add(supervisor.GCRootTerminalBackoff)
+			updateIndex := make(map[string]int, len(updates))
+			for index := range updates {
+				updateIndex[updates[index].Before.ID] = index
+			}
+			for _, entry := range entries {
+				if entry.State == registry.StateRetired {
+					continue
+				}
+				if index, exists := updateIndex[entry.ID]; exists {
+					if updates[index].After.State != registry.StateRetired {
+						updates[index].After.GCBackoffUntil = quarantineUntil
+					}
+					continue
+				}
+				updated := entry
+				updated.GCBackoffUntil = quarantineUntil
+				updates = append(updates, registry.EntryUpdate{Before: entry, After: updated})
+			}
+		}
+		updateResult, updateErr := store.UpdateEntries(updates)
+		if updateErr != nil {
+			return results, true, updateErr
+		}
+		if updateResult.Skipped != 0 {
+			return results, true, fmt.Errorf("GC root batch %s preflight lost %d optimistic updates", batch.ID, updateResult.Skipped)
+		}
+		for _, update := range updates {
+			if err := replaceFileEntry(file, update.After); err != nil {
+				return results, true, err
+			}
+		}
+		if terminalBlock {
+			if _, err := store.FinishGCRootBatch(batch.ID); err != nil {
+				return results, true, err
+			}
+			file.GCRootBatches = nil
+			return results, false, nil
+		}
+		if retryBlock {
+			return results, true, nil
+		}
+		if _, err := store.AdvanceGCRootBatch(batch.ID, registry.GCRootBatchPreflight, registry.GCRootBatchRetiring); err != nil {
+			return results, true, err
+		}
+		batch.Phase = registry.GCRootBatchRetiring
+		file.GCRootBatches[0].Phase = registry.GCRootBatchRetiring
+	}
+
+	entries, err = frozenBatchEntries(*file, batch)
+	if err != nil {
+		return results, true, err
+	}
+	for index, entry := range entries {
+		if entry.State == registry.StateRetired {
+			if _, exists := results[entry.ID]; !exists {
+				item := supervisor.GCResult{EntryID: entry.ID, Status: supervisor.GCStatusRetired, ReasonCode: "registry_already_retired", Reason: "frozen member retirement was already persisted"}
+				results[entry.ID] = gcSupervisorResult(item)
+			}
+			continue
+		}
+		updated, item := collector.RetirePreflighted(ctx, entry)
+		updated.LastGCDecision = item.Status
+		updated.LastGCReason = item.ReasonCode
+		if item.Status != supervisor.GCStatusRetired && updated.State != registry.StateRetired {
+			// Frozen batches own their retry cadence. Preserve the already-proven
+			// owner-gone observation and make the first retry eligible at the hard
+			// five-second catch-up boundary instead of the ordinary one-minute GC
+			// observation backoff.
+			updated.OwnerGoneSince = entry.OwnerGoneSince
+			updated.GCBackoffUntil = a.now().Add(supervisor.GCCatchUpInterval)
+		}
+		results[entry.ID] = gcSupervisorResult(item)
+		if updated != entry {
+			updateResult, updateErr := store.UpdateEntries([]registry.EntryUpdate{{Before: entry, After: updated}})
+			if updateErr != nil {
+				return results, true, updateErr
+			}
+			if updateResult.Skipped != 0 {
+				return results, true, fmt.Errorf("GC root batch %s member %s changed before retirement result persistence", batch.ID, entry.ID)
+			}
+			if err := replaceFileEntry(file, updated); err != nil {
+				return results, true, err
+			}
+		}
+		if item.Status != supervisor.GCStatusRetired {
+			for _, remaining := range entries[index+1:] {
+				if _, exists := results[remaining.ID]; !exists {
+					results[remaining.ID] = batchHaltedResult(remaining, "an earlier frozen member retirement failed; later members were not mutated")
+				}
+			}
+			if item.RetirementStatus == "superseded" && updated.State == registry.StateRetired {
+				if _, err := store.FinishGCRootBatch(batch.ID); err != nil {
+					return results, true, err
+				}
+				file.GCRootBatches = nil
+				return results, false, nil
+			}
+			return results, true, nil
+		}
+	}
+	if _, err := store.FinishGCRootBatch(batch.ID); err != nil {
+		return results, true, err
+	}
+	file.GCRootBatches = nil
+	return results, false, nil
 }
 
 func transitionPreviousEntry(transition registry.ReattachTransition) registry.Entry {
@@ -819,7 +1549,7 @@ func (a App) logGCTransition(previous, updated registry.Entry, result supervisor
 	if w == nil {
 		w = os.Stderr
 	}
-	fmt.Fprintf(w,
+	_, _ = fmt.Fprintf(w,
 		"amq-keepalive gc: status=%s reason_code=%q root=%q agent=%q generation=%q reason=%q\n",
 		result.Status,
 		result.ReasonCode,
@@ -1089,11 +1819,25 @@ func (a App) doctor(ctx context.Context, args []string) error {
 
 type gcResult struct {
 	Applied          bool                  `json:"applied"`
+	AttemptedRoot    string                `json:"attempted_root,omitempty"`
 	WakeGCCapability bool                  `json:"wake_gc_capability"`
 	CapabilityError  string                `json:"capability_error,omitempty"`
 	OwnerGoneGrace   string                `json:"owner_gone_grace"`
 	RetiredRetention string                `json:"retired_retention"`
 	Entries          []supervisor.GCResult `json:"entries"`
+}
+
+func validateGCPolicy(ownerGrace, retiredRetention, timeout time.Duration) error {
+	if ownerGrace < supervisor.MinOwnerGoneGrace {
+		return fmt.Errorf("GC owner-gone grace must be at least %s", supervisor.MinOwnerGoneGrace)
+	}
+	if retiredRetention < supervisor.MinRetiredRetention {
+		return fmt.Errorf("GC retired retention must be at least %s", supervisor.MinRetiredRetention)
+	}
+	if timeout <= 0 || timeout > supervisor.MaxLifecycleTimeout {
+		return fmt.Errorf("GC timeout must be in (0,%s]", supervisor.MaxLifecycleTimeout)
+	}
+	return nil
 }
 
 func (a App) gc(ctx context.Context, args []string) error {
@@ -1105,7 +1849,6 @@ func (a App) gc(ctx context.Context, args []string) error {
 	ownerGrace := fs.Duration("owner-gone-grace", 5*time.Minute, "minimum interval between positive owner-gone observations")
 	legacyAge := fs.Duration("min-detached-age", -1, "deprecated alias for --owner-gone-grace")
 	retiredRetention := fs.Duration("retired-retention", 24*time.Hour, "diagnostic retention for retired registry rows")
-	maxRetirements := fs.Int("max-retirements", 1, "maximum wake retirements in this invocation")
 	timeout := fs.Duration("timeout", 5*time.Second, "deadline for each AMQ lifecycle command")
 	apply := fs.Bool("apply", false, "persist observations and retire eligible exact wakes")
 	if err := fs.Parse(args); err != nil {
@@ -1114,8 +1857,8 @@ func (a App) gc(ctx context.Context, args []string) error {
 	if *legacyAge >= 0 {
 		*ownerGrace = *legacyAge
 	}
-	if *ownerGrace < 0 || *retiredRetention < 0 || *maxRetirements < 1 || *timeout <= 0 || *timeout > 5*time.Second {
-		return errors.New("GC policy requires non-negative grace/retention, max >= 1, and timeout in (0,5s]")
+	if err := validateGCPolicy(*ownerGrace, *retiredRetention, *timeout); err != nil {
+		return err
 	}
 
 	store := registry.New(*registryPath)
@@ -1135,23 +1878,70 @@ func (a App) gc(ctx context.Context, args []string) error {
 		result.CapabilityError = capabilityErr.Error()
 	}
 	policy := supervisor.GCPolicy{AutoGC: *apply, OwnerGrace: *ownerGrace, RetiredRetention: *retiredRetention, Timeout: *timeout}
-	err := store.WithRegistrationLockContext(ctx, func() error {
-		file, err := store.Load()
-		if err != nil {
-			return err
+	processFile := func(file registry.File) error {
+		if *apply {
+			if err := validateNoAmbiguousLiveSessions(file.Entries); err != nil {
+				return err
+			}
 		}
 		updates := make([]registry.EntryUpdate, 0)
 		purges := make([]registry.Entry, 0)
-		retired := 0
+		selected := make(map[string]supervisor.Result)
+		if *apply {
+			batch, active, batchErr := activeGCRootBatch(file)
+			if batchErr != nil {
+				return batchErr
+			}
+			if active {
+				result.AttemptedRoot = batch.CanonicalRoot
+				var executeErr error
+				selected, _, executeErr = a.executeGCRootBatch(ctx, store, &file, batch, cli, capability, capabilityErr, *self, policy)
+				if executeErr != nil {
+					return executeErr
+				}
+			} else if capability && capabilityErr == nil {
+				plan, planErr := planGCRootBatchForFile(file, a.now(), policy)
+				if planErr != nil {
+					return planErr
+				}
+				if plan.Canonical != "" {
+					result.AttemptedRoot = plan.Canonical
+					if plan.Oversized {
+						if err := persistGCRootBatchMarker(store, &file, plan, a.now()); err != nil {
+							return err
+						}
+						selected = oversizedGCRootBatchResults(plan)
+					} else if gcRootPlanHasLocalBlock(plan) {
+						if err := persistLocallyBlockedGCRoot(store, &file, plan, a.now()); err != nil {
+							return err
+						}
+						selected = locallyBlockedGCRootResults(plan)
+					} else {
+						batch = frozenGCRootBatch(plan, a.now())
+						file, batchErr = store.StartGCRootBatch(batch, plan.Members)
+						if batchErr != nil {
+							return batchErr
+						}
+						selected, _, batchErr = a.executeGCRootBatch(ctx, store, &file, batch, cli, capability, capabilityErr, *self, policy)
+						if batchErr != nil {
+							return batchErr
+						}
+					}
+				}
+			}
+		}
 		for _, entry := range file.Entries {
+			if selectedResult, ok := selected[entry.ID]; ok {
+				if selectedResult.GC != nil {
+					result.Entries = append(result.Entries, *selectedResult.GC)
+				}
+				continue
+			}
 			collector := supervisor.GarbageCollector{
 				Wake: cli, InjectVia: *self, CapabilityAvailable: capability,
-				CapabilityError: capabilityErr, Policy: policy,
+				CapabilityError: capabilityErr, Policy: policy, Now: a.Now,
 			}
-			updated, item := collector.Process(ctx, entry, *apply && retired < *maxRetirements)
-			if entry.State != registry.StateRetired && updated.State == registry.StateRetired {
-				retired++
-			}
+			updated, item := collector.ProcessWithBudget(ctx, entry, *apply, false)
 			if item.Purge && *apply {
 				purges = append(purges, entry)
 			} else if updated != entry && *apply {
@@ -1159,16 +1949,34 @@ func (a App) gc(ctx context.Context, args []string) error {
 			}
 			result.Entries = append(result.Entries, item)
 		}
-		if _, err := store.UpdateEntries(updates); err != nil {
-			return err
-		}
-		for _, entry := range purges {
-			if _, err := store.ForgetIfUnchanged(entry); err != nil {
+		if *apply {
+			if _, err := store.UpdateEntries(updates); err != nil {
 				return err
+			}
+			for _, entry := range purges {
+				if _, err := store.ForgetIfUnchanged(entry); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
-	})
+	}
+	var err error
+	if *apply {
+		err = store.WithRegistrationLockContext(ctx, func() error {
+			file, loadErr := store.Load()
+			if loadErr != nil {
+				return loadErr
+			}
+			return processFile(file)
+		})
+	} else {
+		var file registry.File
+		file, err = store.LoadPreview()
+		if err == nil {
+			err = processFile(file)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -1339,14 +2147,20 @@ func (a App) installLaunchd(ctx context.Context, args []string) error {
 	autoGC := fs.Bool("auto-gc", false, "enable owner-bound automatic wake retirement")
 	ownerGrace := fs.Duration("owner-gone-grace", 5*time.Minute, "minimum interval between positive owner-gone observations")
 	retention := fs.Duration("retired-retention", 24*time.Hour, "diagnostic retention for retired registry rows")
-	gcMax := fs.Int("gc-max-per-pass", 1, "maximum wake retirements per supervisor pass")
 	gcTimeout := fs.Duration("gc-timeout", 5*time.Second, "deadline for each AMQ lifecycle command")
+	legacyGCMax := fs.Int("gc-max-per-pass", 1, "deprecated compatibility option; ignored in favor of hard root-batch limits")
 	noLoad := fs.Bool("no-load", false, "write plist without loading it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *interval <= 0 || *ownerGrace <= 0 || *retention <= 0 || *gcMax < 1 || *gcTimeout <= 0 || *gcTimeout > 5*time.Second {
-		return errors.New("launchd policy requires positive interval/grace/retention, max >= 1, and timeout in (0,5s]")
+	if *interval <= 0 {
+		return errors.New("launchd policy requires a positive interval")
+	}
+	if *legacyGCMax <= 0 {
+		return errors.New("deprecated --gc-max-per-pass must be greater than zero")
+	}
+	if err := validateGCPolicy(*ownerGrace, *retention, *gcTimeout); err != nil {
+		return err
 	}
 	opts := launchd.Options{
 		Label:        *label,
@@ -1358,7 +2172,6 @@ func (a App) installLaunchd(ctx context.Context, args []string) error {
 		AutoGC:       *autoGC,
 		OwnerGrace:   *ownerGrace,
 		Retention:    *retention,
-		GCMaxPerPass: *gcMax,
 		GCTimeout:    *gcTimeout,
 		Load:         !*noLoad,
 	}

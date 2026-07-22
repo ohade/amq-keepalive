@@ -18,6 +18,12 @@ import (
 
 const (
 	SchemaVersion = 2
+	// MaxGCRootBatchMembers is a persistence-layer safety bound as well as a
+	// coordinator policy. A malformed or direct caller cannot durably freeze an
+	// unbounded retirement batch.
+	MaxGCRootBatchMembers = 8
+	MaxGCRootAttempts     = 5
+	GCRootAttemptWindow   = time.Minute
 
 	StateAttached State = "attached"
 	StateActive   State = "active"
@@ -55,6 +61,48 @@ type WakeBinding struct {
 
 func (b WakeBinding) Complete() bool {
 	return strings.TrimSpace(b.Generation) != "" && strings.TrimSpace(b.TargetDigest) != ""
+}
+
+type GCRootBatchPhase string
+
+const (
+	GCRootBatchPreflight GCRootBatchPhase = "preflight"
+	GCRootBatchRetiring  GCRootBatchPhase = "retiring"
+)
+
+// GCRootBatchMember is an immutable snapshot of one listener selected for a
+// root-wide GC batch. Keeping this outside Entry means a crash followed by a
+// new registration cannot silently change the set or exact wake binding which
+// a resumed batch is authorized to retire.
+type GCRootBatchMember struct {
+	EntryID          string      `json:"entry_id"`
+	Root             string      `json:"root"`
+	Agent            string      `json:"agent"`
+	Adapter          string      `json:"adapter"`
+	Target           string      `json:"target"`
+	WakeOwnerPresent bool        `json:"wake_owner_present"`
+	WakeOwner        WakeOwner   `json:"wake_owner"`
+	WakeBinding      WakeBinding `json:"wake_binding"`
+}
+
+func (m GCRootBatchMember) Matches(entry Entry) bool {
+	return entry.ID == m.EntryID && entry.Root == m.Root && entry.Agent == m.Agent &&
+		entry.Adapter == m.Adapter && entry.Target == m.Target &&
+		entry.WakeOwnerPresent == m.WakeOwnerPresent && entry.WakeOwner == m.WakeOwner &&
+		entry.WakeBinding == m.WakeBinding
+}
+
+type GCRootBatch struct {
+	ID            string              `json:"id"`
+	CanonicalRoot string              `json:"canonical_root"`
+	StartedAt     time.Time           `json:"started_at"`
+	Phase         GCRootBatchPhase    `json:"phase"`
+	Members       []GCRootBatchMember `json:"members"`
+}
+
+type GCRootAttempt struct {
+	CanonicalRoot string    `json:"canonical_root"`
+	StartedAt     time.Time `json:"started_at"`
 }
 
 // ReattachTransition records the old exact wake which a new reservation may
@@ -105,14 +153,17 @@ type Entry struct {
 	RetirementReason       string             `json:"retirement_reason,omitempty"`
 	GCFailureCount         int                `json:"gc_failure_count,omitempty"`
 	GCBackoffUntil         time.Time          `json:"gc_backoff_until,omitempty"`
+	LastGCRootBatchAt      time.Time          `json:"last_gc_root_batch_at,omitempty"`
 	LastGCDecision         string             `json:"last_gc_decision,omitempty"`
 	LastGCReason           string             `json:"last_gc_reason,omitempty"`
 	Transition             ReattachTransition `json:"reattach_transition,omitempty"`
 }
 
 type File struct {
-	SchemaVersion int     `json:"schema_version"`
-	Entries       []Entry `json:"entries"`
+	SchemaVersion  int             `json:"schema_version"`
+	Entries        []Entry         `json:"entries"`
+	GCRootBatches  []GCRootBatch   `json:"gc_root_batches,omitempty"`
+	GCRootAttempts []GCRootAttempt `json:"gc_root_attempts,omitempty"`
 }
 
 type Store struct {
@@ -122,6 +173,7 @@ type Store struct {
 
 var ErrCorrupt = errors.New("registry file is corrupt")
 var ErrTargetOwned = errors.New("adapter target is already owned")
+var ErrAmbiguousSession = errors.New("multiple live registry entries exist for one root and agent")
 
 type EntryUpdate struct {
 	Before Entry
@@ -173,6 +225,18 @@ func (s *Store) Load() (File, error) {
 		file = loaded
 		return err
 	})
+	return file, err
+}
+
+// LoadPreview reads and validates the registry without creating lock files,
+// backups, directories, or a migrated registry. Schema v1 is upgraded only in
+// the returned in-memory value so callers such as GC dry-run remain genuinely
+// non-mutating.
+func (s *Store) LoadPreview() (File, error) {
+	if s.Path == "" {
+		return File{}, errors.New("registry path is required")
+	}
+	file, _, _, err := s.readRegistryUnlocked()
 	return file, err
 }
 
@@ -240,24 +304,49 @@ func (s *Store) WithRegistrationLockContext(ctx context.Context, fn func() error
 }
 
 func (s *Store) loadUnlocked() (File, error) {
-	data, err := os.ReadFile(s.Path)
-	if errors.Is(err, os.ErrNotExist) {
-		return File{SchemaVersion: SchemaVersion}, nil
-	}
+	return s.loadUnlockedValidated(nil)
+}
+
+// loadUnlockedValidated lets a write operation reject an unsafe registry
+// shape before even schema migration changes durable state.
+func (s *Store) loadUnlockedValidated(validate func(File) error) (File, error) {
+	file, data, migrateV1, err := s.readRegistryUnlocked()
 	if err != nil {
 		return File{}, err
 	}
+	if validate != nil {
+		if err := validate(file); err != nil {
+			return File{}, err
+		}
+	}
+	if migrateV1 {
+		if err := s.backupV1Registry(data); err != nil {
+			return File{}, fmt.Errorf("back up registry schema v1: %w", err)
+		}
+		if err := s.saveUnlocked(file); err != nil {
+			return File{}, fmt.Errorf("migrate registry schema v1: %w", err)
+		}
+	}
+	return file, nil
+}
+
+func (s *Store) readRegistryUnlocked() (File, []byte, bool, error) {
+	data, err := os.ReadFile(s.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return File{SchemaVersion: SchemaVersion}, nil, false, nil
+	}
+	if err != nil {
+		return File{}, nil, false, err
+	}
 	var file File
 	if err := json.Unmarshal(data, &file); err != nil {
-		return File{}, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
+		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
 	if file.SchemaVersion == 0 {
 		file.SchemaVersion = 1
 	}
+	migrateV1 := file.SchemaVersion == 1
 	if file.SchemaVersion == 1 {
-		if err := s.backupV1Registry(data); err != nil {
-			return File{}, fmt.Errorf("back up registry schema v1: %w", err)
-		}
 		for i := range file.Entries {
 			file.Entries[i].LegacyUnbound = true
 			file.Entries[i].WakeOwnerPresent = false
@@ -265,47 +354,41 @@ func (s *Store) loadUnlocked() (File, error) {
 			file.Entries[i].WakeBinding = WakeBinding{}
 		}
 		file.SchemaVersion = SchemaVersion
-		if err := s.saveUnlocked(file); err != nil {
-			return File{}, fmt.Errorf("migrate registry schema v1: %w", err)
-		}
 	}
 	if file.SchemaVersion != SchemaVersion {
-		return File{}, fmt.Errorf("unsupported registry schema version %d", file.SchemaVersion)
+		return File{}, nil, false, fmt.Errorf("unsupported registry schema version %d", file.SchemaVersion)
 	}
 	sortEntries(file.Entries)
-	return file, nil
+	if err := validateRegistryFile(file); err != nil {
+		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
+	}
+	return file, data, migrateV1, nil
 }
 
 func (s *Store) backupV1Registry(data []byte) error {
 	path := s.Path + ".v1.bak"
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		info, statErr := os.Lstat(path)
-		if statErr != nil {
-			return statErr
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-			return fmt.Errorf("existing migration backup %q is not a secure 0600 regular file", path)
-		}
-		existing, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		if !bytes.Equal(existing, data) {
-			return fmt.Errorf("existing migration backup %q does not match the schema v1 registry", path)
-		}
+	if err := validateExistingV1Backup(path, data); err == nil {
 		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
+
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, ".registry-v1-backup-*.tmp")
 	if err != nil {
 		return err
 	}
+	tmpName := file.Name()
 	ok := false
 	defer func() {
 		_ = file.Close()
 		if !ok {
-			_ = os.Remove(path)
+			_ = os.Remove(tmpName)
 		}
 	}()
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
 	if _, err := file.Write(data); err != nil {
 		return err
 	}
@@ -315,8 +398,40 @@ func (s *Store) backupV1Registry(data []byte) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
+	// Publishing a fully synced temporary file with link(2) is atomic and
+	// refuses to overwrite an existing backup. A racing publisher either wins
+	// with its complete file or verifies the already-published complete value.
+	if err := os.Link(tmpName, path); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if err := validateExistingV1Backup(path, data); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(tmpName); err != nil {
+		return err
+	}
 	ok = true
-	return syncDir(filepath.Dir(path))
+	return syncDir(dir)
+}
+
+func validateExistingV1Backup(path string, data []byte) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("existing migration backup %q is not a secure 0600 regular file", path)
+	}
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(existing, data) {
+		return fmt.Errorf("existing migration backup %q does not match the schema v1 registry", path)
+	}
+	return nil
 }
 
 func (s *Store) Save(file File) error {
@@ -330,6 +445,9 @@ func (s *Store) Save(file File) error {
 
 func (s *Store) saveUnlocked(file File) error {
 	file.SchemaVersion = SchemaVersion
+	if err := validateRegistryFile(file); err != nil {
+		return fmt.Errorf("refusing invalid registry state: %w", err)
+	}
 	sortEntries(file.Entries)
 
 	dir := filepath.Dir(s.Path)
@@ -380,13 +498,21 @@ func (s *Store) Upsert(entry Entry) (Entry, error) {
 		if owner, ok := conflictingTargetOwner(file.Entries, prepared, false); ok {
 			return targetOwnedError(prepared, owner)
 		}
+		occupied := entryIDs(file.Entries)
 		replaced := false
 		for i := range file.Entries {
-			if file.Entries[i].ID == prepared.ID {
-				file.Entries[i] = prepared
-				replaced = true
-				break
+			if file.Entries[i].ID != prepared.ID {
+				continue
 			}
+			if file.Entries[i].State == StateRetired && prepared.State != StateRetired {
+				file.Entries[i].ID = nextRetiredArchiveID(file.Entries[i], occupied)
+				continue
+			}
+			if replaced {
+				return fmt.Errorf("registry contains duplicate entry id %q", prepared.ID)
+			}
+			file.Entries[i] = prepared
+			replaced = true
 		}
 		if !replaced {
 			file.Entries = append(file.Entries, prepared)
@@ -404,7 +530,9 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 
 	var removed []Entry
 	err = s.withLock(func() error {
-		file, err := s.loadUnlocked()
+		file, err := s.loadUnlockedValidated(func(file File) error {
+			return validateSingleLiveSessionEntry(file.Entries, prepared.Root, prepared.Agent)
+		})
 		if err != nil {
 			return err
 		}
@@ -413,19 +541,21 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 		}
 		next := make([]Entry, 0, len(file.Entries)+1)
 		livePrevious := make([]Entry, 0, 1)
+		occupied := entryIDs(file.Entries)
 		var revision int64
 		for _, existing := range file.Entries {
 			// AMQ permits one wake process per root and agent. Reattach therefore
 			// replaces the old registration even when the terminal adapter changed.
-			if existing.Root == prepared.Root && existing.Agent == prepared.Agent {
+			if existing.Root == prepared.Root && existing.Agent == prepared.Agent && existing.State != StateRetired {
 				removed = append(removed, existing)
-				if existing.State != StateRetired {
-					livePrevious = append(livePrevious, existing)
-				}
+				livePrevious = append(livePrevious, existing)
 				if existing.Transition.Revision > revision {
 					revision = existing.Transition.Revision
 				}
 				continue
+			}
+			if existing.State == StateRetired && existing.ID == prepared.ID {
+				existing.ID = nextRetiredArchiveID(existing, occupied)
 			}
 			next = append(next, existing)
 		}
@@ -454,8 +584,9 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 
 // RestoreSessionAdapterIfUnchanged rolls back a pre-wake reattach reservation
 // only while that exact inactive row is still authoritative. It restores the
-// complete prior root/agent set atomically; a concurrent change wins and keeps
-// the recoverable reservation instead of being overwritten.
+// prior live root/agent row atomically while retained retirement history stays
+// in place. A concurrent change wins and keeps the recoverable reservation
+// instead of being overwritten.
 func (s *Store) RestoreSessionAdapterIfUnchanged(expected Entry, previous []Entry) (bool, error) {
 	if expected.ID == "" {
 		return false, errors.New("expected reservation id is required")
@@ -468,7 +599,7 @@ func (s *Store) RestoreSessionAdapterIfUnchanged(expected Entry, previous []Entr
 		}
 		index := -1
 		for i, entry := range file.Entries {
-			if entry.Root == expected.Root && entry.Agent == expected.Agent && entry.ID != expected.ID {
+			if entry.State != StateRetired && entry.Root == expected.Root && entry.Agent == expected.Agent && entry.ID != expected.ID {
 				return nil
 			}
 			if entry.ID == expected.ID {
@@ -484,7 +615,11 @@ func (s *Store) RestoreSessionAdapterIfUnchanged(expected Entry, previous []Entr
 		next := make([]Entry, 0, len(file.Entries)-1+len(previous))
 		next = append(next, file.Entries[:index]...)
 		next = append(next, file.Entries[index+1:]...)
-		next = append(next, previous...)
+		for _, entry := range previous {
+			if entry.State != StateRetired {
+				next = append(next, entry)
+			}
+		}
 		file.Entries = next
 		if err := s.saveUnlocked(file); err != nil {
 			return err
@@ -609,6 +744,327 @@ func (s *Store) UpdateEntries(updates []EntryUpdate) (UpdateResult, error) {
 	return result, err
 }
 
+// StartGCRootBatch atomically freezes the exact listener membership and marks
+// the selected root as having consumed a GC-window slot. expected must contain
+// every non-retired listener row in the canonical root selected by the caller.
+// The optimistic comparisons prevent a registration change from being folded
+// into the frozen batch.
+func (s *Store) StartGCRootBatch(batch GCRootBatch, expected []Entry) (File, error) {
+	if err := validateGCRootBatch(batch); err != nil {
+		return File{}, err
+	}
+	if len(expected) != len(batch.Members) {
+		return File{}, fmt.Errorf("GC root batch expected %d rows for %d members", len(expected), len(batch.Members))
+	}
+	expectedByID := make(map[string]Entry, len(expected))
+	for _, entry := range expected {
+		if entry.ID == "" {
+			return File{}, errors.New("GC root batch expected entry id is required")
+		}
+		if _, exists := expectedByID[entry.ID]; exists {
+			return File{}, fmt.Errorf("GC root batch contains duplicate expected entry %q", entry.ID)
+		}
+		expectedByID[entry.ID] = entry
+	}
+	for _, member := range batch.Members {
+		entry, ok := expectedByID[member.EntryID]
+		if !ok || !member.Matches(entry) {
+			return File{}, fmt.Errorf("GC root batch member %q does not match its expected entry", member.EntryID)
+		}
+	}
+
+	var updated File
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if len(file.GCRootBatches) != 0 {
+			return errors.New("a GC root batch is already active")
+		}
+		byID := make(map[string]int, len(file.Entries))
+		for i := range file.Entries {
+			byID[file.Entries[i].ID] = i
+		}
+		for _, expectedEntry := range expected {
+			i, ok := byID[expectedEntry.ID]
+			if !ok || file.Entries[i] != expectedEntry {
+				return fmt.Errorf("GC root batch entry %q changed before membership could be frozen", expectedEntry.ID)
+			}
+			file.Entries[i].LastGCRootBatchAt = batch.StartedAt
+		}
+		attempts, err := appendGCRootAttempt(file.GCRootAttempts, batch.CanonicalRoot, batch.StartedAt)
+		if err != nil {
+			return err
+		}
+		file.GCRootAttempts = attempts
+		file.GCRootBatches = append(file.GCRootBatches, batch)
+		if err := s.saveUnlocked(file); err != nil {
+			return err
+		}
+		updated = file
+		return nil
+	})
+	return updated, err
+}
+
+// RecordGCRootAttempt atomically persists a non-starting root attempt such as
+// an oversized-root refusal together with its per-entry diagnostics. The
+// top-level rolling ledger survives a subsequent reattach which replaces the
+// live row carrying LastGCRootBatchAt.
+func (s *Store) RecordGCRootAttempt(canonicalRoot string, startedAt time.Time, updates []EntryUpdate) (File, error) {
+	if strings.TrimSpace(canonicalRoot) == "" || startedAt.IsZero() {
+		return File{}, errors.New("GC root attempt canonical root and start time are required")
+	}
+	seen := make(map[string]struct{}, len(updates))
+	for _, update := range updates {
+		if update.Before.ID == "" || update.Before.ID != update.After.ID {
+			return File{}, errors.New("GC root attempt update requires one unchanged entry id")
+		}
+		if _, exists := seen[update.Before.ID]; exists {
+			return File{}, fmt.Errorf("GC root attempt contains duplicate update %q", update.Before.ID)
+		}
+		seen[update.Before.ID] = struct{}{}
+	}
+	var updated File
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		byID := make(map[string]int, len(file.Entries))
+		for i := range file.Entries {
+			byID[file.Entries[i].ID] = i
+		}
+		for _, update := range updates {
+			i, ok := byID[update.Before.ID]
+			if !ok || file.Entries[i] != update.Before {
+				return fmt.Errorf("GC root attempt entry %q changed before its marker could be recorded", update.Before.ID)
+			}
+			file.Entries[i] = update.After
+		}
+		attempts, err := appendGCRootAttempt(file.GCRootAttempts, canonicalRoot, startedAt)
+		if err != nil {
+			return err
+		}
+		file.GCRootAttempts = attempts
+		if err := s.saveUnlocked(file); err != nil {
+			return err
+		}
+		updated = file
+		return nil
+	})
+	return updated, err
+}
+
+func appendGCRootAttempt(existing []GCRootAttempt, canonicalRoot string, startedAt time.Time) ([]GCRootAttempt, error) {
+	windowStart := startedAt.Add(-GCRootAttemptWindow)
+	next := make([]GCRootAttempt, 0, MaxGCRootAttempts)
+	recentRoots := make(map[string]struct{}, MaxGCRootAttempts)
+	for _, attempt := range existing {
+		if attempt.StartedAt.Before(windowStart) {
+			continue
+		}
+		if _, duplicate := recentRoots[attempt.CanonicalRoot]; duplicate {
+			continue
+		}
+		recentRoots[attempt.CanonicalRoot] = struct{}{}
+		next = append(next, attempt)
+	}
+	if _, duplicate := recentRoots[canonicalRoot]; duplicate {
+		return nil, fmt.Errorf("canonical root %q already consumed a GC attempt in the rolling window", canonicalRoot)
+	}
+	if len(recentRoots) >= MaxGCRootAttempts {
+		return nil, fmt.Errorf("hard maximum of %d distinct GC roots in the rolling window is exhausted", MaxGCRootAttempts)
+	}
+	next = append(next, GCRootAttempt{CanonicalRoot: canonicalRoot, StartedAt: startedAt})
+	sort.Slice(next, func(i, j int) bool {
+		if next[i].StartedAt.Equal(next[j].StartedAt) {
+			return next[i].CanonicalRoot < next[j].CanonicalRoot
+		}
+		return next[i].StartedAt.Before(next[j].StartedAt)
+	})
+	return next, nil
+}
+
+func validateGCRootBatch(batch GCRootBatch) error {
+	if strings.TrimSpace(batch.ID) == "" || strings.TrimSpace(batch.CanonicalRoot) == "" || batch.StartedAt.IsZero() {
+		return errors.New("GC root batch id, canonical root, and start time are required")
+	}
+	if batch.Phase != GCRootBatchPreflight && batch.Phase != GCRootBatchRetiring {
+		return fmt.Errorf("GC root batch %q has invalid phase %q", batch.ID, batch.Phase)
+	}
+	if len(batch.Members) == 0 {
+		return fmt.Errorf("GC root batch %q has no members", batch.ID)
+	}
+	if len(batch.Members) > MaxGCRootBatchMembers {
+		return fmt.Errorf("GC root batch %q has %d members; hard maximum is %d", batch.ID, len(batch.Members), MaxGCRootBatchMembers)
+	}
+	canonicalRoot, err := canonicalRegistryRoot(batch.CanonicalRoot)
+	if err != nil || canonicalRoot != batch.CanonicalRoot {
+		return fmt.Errorf("GC root batch %q canonical root %q is invalid", batch.ID, batch.CanonicalRoot)
+	}
+	seen := make(map[string]struct{}, len(batch.Members))
+	agents := make(map[string]struct{}, len(batch.Members))
+	for _, member := range batch.Members {
+		if member.EntryID == "" || member.Root == "" || member.Agent == "" || member.Adapter == "" || member.Target == "" {
+			return fmt.Errorf("GC root batch %q has an incomplete member", batch.ID)
+		}
+		if _, exists := seen[member.EntryID]; exists {
+			return fmt.Errorf("GC root batch %q contains duplicate member %q", batch.ID, member.EntryID)
+		}
+		memberRoot, err := canonicalRegistryRoot(member.Root)
+		if err != nil || memberRoot != canonicalRoot {
+			return fmt.Errorf("GC root batch %q member %q is outside canonical root %q", batch.ID, member.EntryID, canonicalRoot)
+		}
+		if !member.WakeOwnerPresent || !member.WakeOwner.Strong() || !member.WakeBinding.Complete() {
+			return fmt.Errorf("GC root batch %q member %q lacks a strong owner-bound wake binding", batch.ID, member.EntryID)
+		}
+		if _, duplicate := agents[member.Agent]; duplicate {
+			return fmt.Errorf("GC root batch %q contains multiple live members for agent %q", batch.ID, member.Agent)
+		}
+		agents[member.Agent] = struct{}{}
+		seen[member.EntryID] = struct{}{}
+	}
+	return nil
+}
+
+func validateRegistryFile(file File) error {
+	if len(file.GCRootBatches) > 1 {
+		return fmt.Errorf("registry contains %d active GC root batches", len(file.GCRootBatches))
+	}
+	if len(file.GCRootAttempts) > MaxGCRootAttempts {
+		return fmt.Errorf("registry contains %d GC root attempts; hard maximum is %d", len(file.GCRootAttempts), MaxGCRootAttempts)
+	}
+	attemptKeys := make(map[string]struct{}, len(file.GCRootAttempts))
+	for _, attempt := range file.GCRootAttempts {
+		root, err := canonicalRegistryRoot(attempt.CanonicalRoot)
+		if err != nil || root != attempt.CanonicalRoot || attempt.StartedAt.IsZero() {
+			return fmt.Errorf("registry contains an invalid GC root attempt for %q", attempt.CanonicalRoot)
+		}
+		key := root + "\x00" + attempt.StartedAt.UTC().Format(time.RFC3339Nano)
+		if _, duplicate := attemptKeys[key]; duplicate {
+			return fmt.Errorf("registry contains duplicate GC root attempt %q", key)
+		}
+		attemptKeys[key] = struct{}{}
+	}
+
+	byID := make(map[string]Entry, len(file.Entries))
+	for _, entry := range file.Entries {
+		if _, duplicate := byID[entry.ID]; duplicate {
+			return fmt.Errorf("registry contains duplicate entry id %q", entry.ID)
+		}
+		byID[entry.ID] = entry
+	}
+
+	for _, batch := range file.GCRootBatches {
+		if err := validateGCRootBatch(batch); err != nil {
+			return err
+		}
+		attemptKey := batch.CanonicalRoot + "\x00" + batch.StartedAt.UTC().Format(time.RFC3339Nano)
+		if _, ok := attemptKeys[attemptKey]; !ok {
+			return fmt.Errorf("GC root batch %q lacks its durable rolling-window attempt", batch.ID)
+		}
+		members := make(map[string]GCRootBatchMember, len(batch.Members))
+		for _, member := range batch.Members {
+			entry, ok := byID[member.EntryID]
+			if !ok || !member.Matches(entry) {
+				return fmt.Errorf("GC root batch %q member %q does not match the current registry row", batch.ID, member.EntryID)
+			}
+			if entry.State != StateRetired && (entry.LegacyUnbound || entry.Transition.Active() || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete()) {
+				return fmt.Errorf("GC root batch %q current member %q is not transition-free and strongly owner-bound", batch.ID, member.EntryID)
+			}
+			members[member.EntryID] = member
+		}
+		for _, entry := range file.Entries {
+			if entry.State == StateRetired {
+				continue
+			}
+			root, err := canonicalRegistryRoot(entry.Root)
+			if err != nil {
+				return err
+			}
+			if root == batch.CanonicalRoot {
+				if _, frozen := members[entry.ID]; !frozen {
+					return fmt.Errorf("GC root batch %q omits current listener %q from its frozen membership", batch.ID, entry.ID)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalRegistryRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("root is empty")
+	}
+	abs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(real), nil
+	}
+	return filepath.Clean(abs), nil
+}
+
+// AdvanceGCRootBatch moves an immutable batch from preflight to retirement.
+// The exact phase comparison makes a duplicate/replayed transition harmless.
+func (s *Store) AdvanceGCRootBatch(id string, from, to GCRootBatchPhase) (bool, error) {
+	advanced := false
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		for i := range file.GCRootBatches {
+			batch := &file.GCRootBatches[i]
+			if batch.ID != id {
+				continue
+			}
+			if batch.Phase == to {
+				return nil
+			}
+			if batch.Phase != from {
+				return fmt.Errorf("GC root batch %q phase is %q, want %q", id, batch.Phase, from)
+			}
+			batch.Phase = to
+			if err := s.saveUnlocked(file); err != nil {
+				return err
+			}
+			advanced = true
+			return nil
+		}
+		return fmt.Errorf("GC root batch %q not found", id)
+	})
+	return advanced, err
+}
+
+// FinishGCRootBatch removes only the durable coordinator record. Per-entry
+// LastGCRootBatchAt markers remain as the rolling-window ledger.
+func (s *Store) FinishGCRootBatch(id string) (bool, error) {
+	finished := false
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		for i, batch := range file.GCRootBatches {
+			if batch.ID != id {
+				continue
+			}
+			file.GCRootBatches = append(file.GCRootBatches[:i], file.GCRootBatches[i+1:]...)
+			if err := s.saveUnlocked(file); err != nil {
+				return err
+			}
+			finished = true
+			return nil
+		}
+		return nil
+	})
+	return finished, err
+}
+
 func (s *Store) Forget(id string) (bool, error) {
 	removed, err := s.ForgetMany([]string{id})
 	return removed == 1, err
@@ -690,6 +1146,47 @@ func sortEntries(entries []Entry) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].ID < entries[j].ID
 	})
+}
+
+func validateSingleLiveSessionEntry(entries []Entry, root, agent string) error {
+	count := 0
+	for _, entry := range entries {
+		if entry.State != StateRetired && entry.Root == root && entry.Agent == agent {
+			count++
+		}
+	}
+	if count > 1 {
+		return fmt.Errorf("%w: root=%q agent=%q count=%d", ErrAmbiguousSession, root, agent, count)
+	}
+	return nil
+}
+
+func entryIDs(entries []Entry) map[string]struct{} {
+	ids := make(map[string]struct{}, len(entries)+1)
+	for _, entry := range entries {
+		ids[entry.ID] = struct{}{}
+	}
+	return ids
+}
+
+// nextRetiredArchiveID assigns history a durable identity distinct from the
+// live tuple ID. The ID is derived once from the exact retired snapshot and is
+// never recomputed when later GC observations update that archival row.
+func nextRetiredArchiveID(entry Entry, occupied map[string]struct{}) string {
+	payload, _ := json.Marshal(entry) // Entry contains only JSON-supported value fields.
+	for sequence := 0; ; sequence++ {
+		material := make([]byte, 0, len(payload)+32)
+		material = append(material, "retired-archive-v1\x00"...)
+		material = append(material, payload...)
+		material = append(material, fmt.Sprintf("\x00%d", sequence)...)
+		sum := sha256.Sum256(material)
+		id := "retired-" + hex.EncodeToString(sum[:])
+		if _, exists := occupied[id]; exists {
+			continue
+		}
+		occupied[id] = struct{}{}
+		return id
+	}
 }
 
 func conflictingTargetOwner(entries []Entry, candidate Entry, ignoreSameRootAgent bool) (Entry, bool) {

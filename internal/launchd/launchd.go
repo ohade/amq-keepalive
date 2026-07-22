@@ -27,7 +27,6 @@ type Options struct {
 	AutoGC       bool
 	OwnerGrace   time.Duration
 	Retention    time.Duration
-	GCMaxPerPass int
 	GCTimeout    time.Duration
 	StdoutPath   string
 	StderrPath   string
@@ -113,14 +112,11 @@ func NormalizeOptions(opts Options) (Options, error) {
 	if opts.Interval <= 0 {
 		opts.Interval = time.Minute
 	}
-	if opts.OwnerGrace <= 0 {
+	if opts.OwnerGrace < 5*time.Minute {
 		opts.OwnerGrace = 5 * time.Minute
 	}
-	if opts.Retention <= 0 {
+	if opts.Retention < 24*time.Hour {
 		opts.Retention = 24 * time.Hour
-	}
-	if opts.GCMaxPerPass <= 0 {
-		opts.GCMaxPerPass = 1
 	}
 	if opts.GCTimeout <= 0 || opts.GCTimeout > 5*time.Second {
 		opts.GCTimeout = 5 * time.Second
@@ -211,7 +207,6 @@ func BuildPlist(opts Options) []byte {
 		"--auto-gc=" + strconv.FormatBool(opts.AutoGC),
 		"--owner-gone-grace", opts.OwnerGrace.String(),
 		"--retired-retention", opts.Retention.String(),
-		"--gc-max-per-pass", strconv.Itoa(opts.GCMaxPerPass),
 		"--gc-timeout", opts.GCTimeout.String(),
 	}
 	var buf bytes.Buffer
