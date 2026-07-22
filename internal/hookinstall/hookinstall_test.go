@@ -67,7 +67,7 @@ func TestInstallBothWritesScriptAndMergesConfigs(t *testing.T) {
 	if countCommand(codex, result.Commands[AgentCodex]) != 1 {
 		t.Fatalf("Codex command not installed exactly once:\n%s", mustMarshal(t, codex))
 	}
-	if !strings.Contains(mustMarshal(t, codex), `"timeout": 6000`) {
+	if !strings.Contains(mustMarshal(t, codex), `"timeout": 6`) {
 		t.Fatalf("Codex hook timeout missing or wrong:\n%s", mustMarshal(t, codex))
 	}
 }
@@ -98,6 +98,57 @@ func TestInstallIsIdempotent(t *testing.T) {
 	doc := readJSON(t, claudeConfig)
 	if countCommand(doc, first.Commands[AgentClaude]) != 1 {
 		t.Fatalf("command count != 1 after repeat install:\n%s", mustMarshal(t, doc))
+	}
+}
+
+func TestInstallRecognizesWrappedExistingCodexScript(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := writeExecutable(t, filepath.Join(dir, "amq-keepalive"))
+	scriptPath := filepath.Join(dir, "hooks", "amq-keepalive-session-start.sh")
+	codexConfig := filepath.Join(dir, "hooks.json")
+	wrappedCommand := "HOME='/Users/test' AMQ_KEEPALIVE_AMQ='/opt/homebrew/bin/amq' " +
+		"AMQ_KEEPALIVE_BIN=" + shellQuote(binaryPath) + " '/bin/bash' " + shellQuote(scriptPath)
+	doc := map[string]interface{}{
+		"hooks": map[string]interface{}{
+			"SessionStart": []interface{}{
+				map[string]interface{}{
+					"hooks": []interface{}{
+						map[string]interface{}{
+							"type":    "command",
+							"command": wrappedCommand,
+							"timeout": 15,
+						},
+					},
+				},
+			},
+		},
+	}
+	original := []byte(mustMarshal(t, doc) + "\n")
+	mustWrite(t, codexConfig, original)
+
+	result, err := Install(Options{
+		Agent:       AgentCodex,
+		ScriptPath:  scriptPath,
+		BinaryPath:  binaryPath,
+		CodexConfig: codexConfig,
+		Timeout:     10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if result.Configs[AgentCodex].Changed {
+		t.Fatal("wrapped existing Codex hook was rewritten or duplicated")
+	}
+	after, err := os.ReadFile(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("existing Codex config changed:\n%s", after)
+	}
+	installed := readJSON(t, codexConfig)
+	if countCommand(installed, wrappedCommand) != 1 {
+		t.Fatalf("wrapped hook count != 1:\n%s", mustMarshal(t, installed))
 	}
 }
 

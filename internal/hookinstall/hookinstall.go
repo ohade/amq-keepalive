@@ -401,7 +401,7 @@ func Install(opts Options) (Result, error) {
 		result.Commands[AgentClaude] = command
 		result.Snippets[AgentClaude] = snippet
 		if !normalized.DryRun {
-			fileResult, err := installClaudeHook(normalized.ClaudeConfig, command, hookTimeoutSeconds)
+			fileResult, err := installClaudeHook(normalized.ClaudeConfig, command, normalized.ScriptPath, hookTimeoutSeconds)
 			if err != nil {
 				return Result{}, err
 			}
@@ -413,7 +413,7 @@ func Install(opts Options) (Result, error) {
 		result.Commands[AgentCodex] = command
 		result.Snippets[AgentCodex] = snippet
 		if !normalized.DryRun {
-			fileResult, err := installCodexHook(normalized.CodexConfig, command, hookTimeoutSeconds)
+			fileResult, err := installCodexHook(normalized.CodexConfig, command, normalized.ScriptPath, hookTimeoutSeconds)
 			if err != nil {
 				return Result{}, err
 			}
@@ -485,7 +485,7 @@ func NormalizeOptions(opts Options) (Options, error) {
 	return opts, nil
 }
 
-func installClaudeHook(path, command string, hookTimeoutSeconds int) (FileResult, error) {
+func installClaudeHook(path, command, scriptPath string, hookTimeoutSeconds int) (FileResult, error) {
 	doc, err := loadJSONObject(path)
 	if err != nil {
 		return FileResult{}, err
@@ -499,7 +499,7 @@ func installClaudeHook(path, command string, hookTimeoutSeconds int) (FileResult
 		return FileResult{}, err
 	}
 	changed := false
-	if !claudeHasCommand(sessionStart, command) {
+	if !hasHookCommand(sessionStart, command, scriptPath) {
 		sessionStart = append(sessionStart, claudeSessionStartEntry(command, hookTimeoutSeconds))
 		hooks["SessionStart"] = sessionStart
 		doc["hooks"] = hooks
@@ -508,7 +508,7 @@ func installClaudeHook(path, command string, hookTimeoutSeconds int) (FileResult
 	return saveJSONIfChanged(path, doc, changed)
 }
 
-func installCodexHook(path, command string, hookTimeoutSeconds int) (FileResult, error) {
+func installCodexHook(path, command, scriptPath string, hookTimeoutSeconds int) (FileResult, error) {
 	doc, err := loadJSONObject(path)
 	if err != nil {
 		return FileResult{}, err
@@ -522,7 +522,7 @@ func installCodexHook(path, command string, hookTimeoutSeconds int) (FileResult,
 		return FileResult{}, err
 	}
 	changed := false
-	if !codexHasCommand(sessionStart, command) {
+	if !hasHookCommand(sessionStart, command, scriptPath) {
 		hook := codexHook(command, hookTimeoutSeconds)
 		if len(sessionStart) == 0 {
 			sessionStart = append(sessionStart, map[string]interface{}{"hooks": []interface{}{hook}})
@@ -568,14 +568,15 @@ func codexSessionStartEntry(command string, hookTimeoutSeconds int) map[string]i
 }
 
 func codexHook(command string, hookTimeoutSeconds int) map[string]interface{} {
+	// Codex hooks.json uses seconds, not milliseconds.
 	return map[string]interface{}{
 		"type":    "command",
 		"command": command,
-		"timeout": hookTimeoutSeconds * 1000,
+		"timeout": hookTimeoutSeconds,
 	}
 }
 
-func claudeHasCommand(entries []interface{}, command string) bool {
+func hasHookCommand(entries []interface{}, command, scriptPath string) bool {
 	for _, entry := range entries {
 		obj, ok := entry.(map[string]interface{})
 		if !ok {
@@ -583,16 +584,30 @@ func claudeHasCommand(entries []interface{}, command string) bool {
 		}
 		for _, hook := range interfaceArray(obj["hooks"]) {
 			hookObj, ok := hook.(map[string]interface{})
-			if ok && strings.TrimSpace(fmt.Sprint(hookObj["command"])) == command {
-				return true
+			if ok {
+				existing := strings.TrimSpace(fmt.Sprint(hookObj["command"]))
+				if existing == command || commandReferencesScript(existing, scriptPath) {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-func codexHasCommand(entries []interface{}, command string) bool {
-	return claudeHasCommand(entries, command)
+func commandReferencesScript(command, scriptPath string) bool {
+	if command == "" || scriptPath == "" {
+		return false
+	}
+	if strings.Contains(command, shellQuote(scriptPath)) || strings.Contains(command, `"`+scriptPath+`"`) {
+		return true
+	}
+	for _, field := range strings.Fields(command) {
+		if strings.Trim(field, `"'`) == scriptPath {
+			return true
+		}
+	}
+	return false
 }
 
 func loadJSONObject(path string) (map[string]interface{}, error) {

@@ -205,7 +205,7 @@ Manual Codex SessionStart hook snippet:
   "hooks": [
     {
       "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' '/absolute/path/to/amq-keepalive-session-start.sh'",
-      "timeout": 15000,
+      "timeout": 15,
       "type": "command"
     }
   ]
