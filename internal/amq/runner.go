@@ -189,8 +189,11 @@ func (c CLI) Env(ctx context.Context) (Env, error) {
 		return Env{}, fmt.Errorf("amq env failed: %w: %s", err, strings.TrimSpace(stderr))
 	}
 	var env Env
-	if err := json.Unmarshal(stdout, &env); err != nil {
+	if err := decodeStrictJSON(stdout, &env); err != nil {
 		return Env{}, fmt.Errorf("parse amq env: %w", err)
+	}
+	if env.SchemaVersion != 1 {
+		return Env{}, fmt.Errorf("parse amq env: unsupported schema_version %d", env.SchemaVersion)
 	}
 	return env, nil
 }
@@ -256,7 +259,7 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) (WakeBinding, 
 	if err != nil {
 		return WakeBinding{}, err
 	}
-	defer os.Remove(resultFile)
+	defer func() { _ = os.Remove(resultFile) }()
 
 	if req.Root != "" {
 		args = append(args, "-root", req.Root)
@@ -412,7 +415,7 @@ func BaselineDigest(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	after, err := file.Stat()
 	if err != nil {
 		return "", err
@@ -628,6 +631,34 @@ func readWakeCommandResult(path string) (WakeCommandResult, error) {
 	return result, nil
 }
 
+// ValidateExistingWakeBlocker binds a structured start failure to the exact
+// owner-bound wake which a reattach transaction is considering for retirement.
+// A reason code alone is not proof that the persisted old generation is the
+// blocker reported by AMQ.
+func ValidateExistingWakeBlocker(root, agent string, binding WakeBinding, result WakeCommandResult) error {
+	if result.Schema != 1 || result.Status != "failed" || result.ReasonCode != "existing_wake_blocking" {
+		return errors.New("wake failure does not describe an existing-wake blocker")
+	}
+	if !binding.Complete() {
+		return errors.New("persisted wake binding is incomplete")
+	}
+	wantRoot, err := canonicalPath(root)
+	if err != nil {
+		return fmt.Errorf("canonicalize expected blocker root: %w", err)
+	}
+	gotRoot, err := canonicalPath(result.Root)
+	if err != nil || gotRoot != wantRoot || result.Agent != agent {
+		return errors.New("wake blocker root/agent identity mismatch")
+	}
+	if result.CurrentWakeMode != "owner_bound" {
+		return fmt.Errorf("wake blocker mode %q is not owner_bound", result.CurrentWakeMode)
+	}
+	if result.CurrentGeneration != binding.Generation || result.CurrentTargetDigest != binding.TargetDigest {
+		return errors.New("wake blocker generation/digest mismatch")
+	}
+	return nil
+}
+
 func readSecureJSONFile(path string, destination any) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -643,7 +674,7 @@ func readSecureJSONFile(path string, destination any) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	opened, err := file.Stat()
 	if err != nil {
 		return err
@@ -652,6 +683,7 @@ func readSecureJSONFile(path string, destination any) error {
 		return errors.New("lifecycle result changed while opening")
 	}
 	decoder := json.NewDecoder(io.LimitReader(file, maxLifecycleResultBytes+1))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
 	}
@@ -666,11 +698,14 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 		return RetireWakeResult{}, errors.New("empty amq wake retire output")
 	}
 	var result RetireWakeResult
-	if err := json.Unmarshal(data, &result); err != nil {
+	if err := decodeStrictJSON(data, &result); err != nil {
 		return RetireWakeResult{}, fmt.Errorf("parse amq wake retire JSON: %w", err)
 	}
 	result.Status = strings.TrimSpace(result.Status)
 	result.ReasonCode = strings.TrimSpace(result.ReasonCode)
+	if result.Schema != 1 {
+		return RetireWakeResult{}, fmt.Errorf("amq wake retire response has unsupported schema %d", result.Schema)
+	}
 	if result.Status == "" || result.ReasonCode == "" {
 		return RetireWakeResult{}, errors.New("amq wake retire response lacks status or reason_code")
 	}
@@ -700,6 +735,18 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 		return RetireWakeResult{}, fmt.Errorf("amq wake retire response has unknown status %q", result.Status)
 	}
 	return result, nil
+}
+
+func decodeStrictJSON(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("JSON response contains trailing data")
+	}
+	return nil
 }
 
 func validateRetireEcho(req RetireWakeRequest, result RetireWakeResult) error {

@@ -1,8 +1,10 @@
 package amq
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -383,7 +385,7 @@ done
 func TestRetireWakeParsesStructuredNonzeroAndRequiresExactEcho(t *testing.T) {
 	dir := t.TempDir()
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
-printf '{"status":"refused","reason_code":"owner_live","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"refused","reason_code":"owner_live","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
 exit 1
 `)
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
@@ -405,7 +407,7 @@ func TestRetireWakeAcceptsOnlyIdentityConfirmedSupersededBinding(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
-printf '{"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_target_digest":"sha256:target-2","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_target_digest":"sha256:target-2","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
 `)
 	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
 		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
@@ -420,7 +422,7 @@ func TestRetireWakeAcceptsExplicitRawSupersededBinding(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
-printf '{"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_wake_mode":"raw"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_wake_mode":"raw"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
 `)
 	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
 		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
@@ -461,6 +463,284 @@ func TestReadWakeBindingRejectsTrailingJSON(t *testing.T) {
 	}
 	if _, err := readWakeBinding(path); err == nil || !strings.Contains(err.Error(), "trailing JSON") {
 		t.Fatalf("readWakeBinding() error=%v", err)
+	}
+}
+
+func TestLifecycleJSONRejectsUnknownFieldsWrongSchemaAndTrailingData(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown":  `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","generation":"g","target_digest":"d","extra":true}`,
+		"schema":   `{"schema":2,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","generation":"g","target_digest":"d"}`,
+		"trailing": `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","generation":"g","target_digest":"d"} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseRetireResult([]byte(body)); err == nil {
+				t.Fatalf("parseRetireResult(%s) succeeded", body)
+			}
+		})
+	}
+	ready := filepath.Join(t.TempDir(), "ready.json")
+	if err := os.WriteFile(ready, []byte(`{"schema":1,"generation":"g","target_digest":"d","extra":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readWakeBinding(ready); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("readWakeBinding unknown-field error=%v", err)
+	}
+}
+
+func TestEnvRequiresSchemaOneAndStrictJSON(t *testing.T) {
+	for name, payload := range map[string]string{
+		"wrong-schema": `{"schema_version":2,"capabilities":["wake_gc_v1"]}`,
+		"unknown":      `{"schema_version":1,"capabilities":["wake_gc_v1"],"extra":true}`,
+		"trailing":     `{"schema_version":1,"capabilities":["wake_gc_v1"]} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("AMQ_KEEPALIVE_ENV_PAYLOAD", payload)
+			fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), "#!/bin/sh\nprintf '%s\\n' \"$AMQ_KEEPALIVE_ENV_PAYLOAD\"\n")
+			if _, err := NewCLI(fakeAMQ).Env(context.Background()); err == nil {
+				t.Fatalf("Env accepted %s", payload)
+			}
+		})
+	}
+}
+
+func TestValidateExistingWakeBlockerRequiresExactIdentity(t *testing.T) {
+	root := t.TempDir()
+	binding := WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"}
+	valid := WakeCommandResult{
+		Schema: 1, Status: "failed", ReasonCode: "existing_wake_blocking",
+		Root: root, Agent: "codex", CurrentWakeMode: "owner_bound",
+		CurrentGeneration: binding.Generation, CurrentTargetDigest: binding.TargetDigest,
+	}
+	if err := ValidateExistingWakeBlocker(root, "codex", binding, valid); err != nil {
+		t.Fatalf("valid blocker rejected: %v", err)
+	}
+	mutations := []func(*WakeCommandResult){
+		func(v *WakeCommandResult) { v.Root = "" },
+		func(v *WakeCommandResult) { v.Agent = "claude" },
+		func(v *WakeCommandResult) { v.CurrentWakeMode = "raw" },
+		func(v *WakeCommandResult) { v.CurrentGeneration = "generation-2" },
+		func(v *WakeCommandResult) { v.CurrentTargetDigest = "sha256:target-2" },
+	}
+	for index, mutate := range mutations {
+		candidate := valid
+		mutate(&candidate)
+		if err := ValidateExistingWakeBlocker(root, "codex", binding, candidate); err == nil {
+			t.Fatalf("mutation %d accepted: %#v", index, candidate)
+		}
+	}
+}
+
+func TestParseRetireResultStatusContract(t *testing.T) {
+	valid := map[string]string{
+		"eligible":        "owner_gone",
+		"retired":         "retired_exact",
+		"already_retired": "tombstone_match",
+		"superseded":      "generation_superseded",
+		"error":           "internal_error",
+		"refused":         "owner_live",
+	}
+	for status, reason := range valid {
+		t.Run("valid "+status, func(t *testing.T) {
+			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q}`, status, reason)
+			result, err := parseRetireResult([]byte(body))
+			if err != nil || result.Status != status || result.ReasonCode != reason {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
+	invalid := map[string]string{
+		"eligible":        "not_owner_gone",
+		"retired":         "not_retired_exact",
+		"already_retired": "not_tombstone_match",
+		"superseded":      "not_generation_superseded",
+		"error":           "not_internal_error",
+		"unknown":         "unknown_reason",
+	}
+	for status, reason := range invalid {
+		t.Run("invalid "+status, func(t *testing.T) {
+			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q}`, status, reason)
+			if _, err := parseRetireResult([]byte(body)); err == nil {
+				t.Fatalf("parseRetireResult(%s) succeeded", body)
+			}
+		})
+	}
+	for name, body := range map[string]string{
+		"empty":          " ",
+		"malformed":      "{",
+		"missing status": `{"schema":1,"reason_code":"owner_live"}`,
+		"missing reason": `{"schema":1,"status":"refused"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseRetireResult([]byte(body)); err == nil {
+				t.Fatalf("parseRetireResult(%q) succeeded", body)
+			}
+		})
+	}
+}
+
+func TestReadWakeCommandResultContract(t *testing.T) {
+	for _, reason := range []string{"existing_wake_blocking", "invalid_owner", "unverified_wake", "invalid_baseline", "internal_failure"} {
+		t.Run("valid "+reason, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "result.json")
+			body := fmt.Sprintf(`{"schema":1,"status":"failed","reason_code":%q}`, reason)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := readWakeCommandResult(path)
+			if err != nil || result.ReasonCode != reason {
+				t.Fatalf("result=%#v err=%v", result, err)
+			}
+		})
+	}
+	for name, body := range map[string]string{
+		"wrong schema": `{"schema":2,"status":"failed","reason_code":"invalid_owner"}`,
+		"wrong status": `{"schema":1,"status":"ok","reason_code":"invalid_owner"}`,
+		"missing code": `{"schema":1,"status":"failed"}`,
+		"unknown code": `{"schema":1,"status":"failed","reason_code":"surprise"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "result.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readWakeCommandResult(path); err == nil {
+				t.Fatalf("readWakeCommandResult(%s) succeeded", body)
+			}
+		})
+	}
+}
+
+func TestSecureLifecycleFileGuards(t *testing.T) {
+	var destination map[string]any
+	if err := readSecureJSONFile(filepath.Join(t.TempDir(), "missing.json"), &destination); err == nil {
+		t.Fatal("missing lifecycle file accepted")
+	}
+
+	dir := t.TempDir()
+	insecure := filepath.Join(dir, "insecure.json")
+	if err := os.WriteFile(insecure, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := readSecureJSONFile(insecure, &destination); err == nil {
+		t.Fatal("insecure lifecycle file accepted")
+	}
+
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := readSecureJSONFile(link, &destination); err == nil {
+		t.Fatal("symlink lifecycle file accepted")
+	}
+
+	oversized := filepath.Join(dir, "oversized.json")
+	if err := os.WriteFile(oversized, bytes.Repeat([]byte("x"), maxLifecycleResultBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := readSecureJSONFile(oversized, &destination); err == nil {
+		t.Fatal("oversized lifecycle file accepted")
+	}
+}
+
+func TestWakeBindingAndBlockerContractBranches(t *testing.T) {
+	for name, body := range map[string]string{
+		"wrong schema":       `{"schema":2,"generation":"generation-1","target_digest":"sha256:target-1"}`,
+		"missing generation": `{"schema":1,"target_digest":"sha256:target-1"}`,
+		"missing digest":     `{"schema":1,"generation":"generation-1"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ready.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readWakeBinding(path); err == nil {
+				t.Fatalf("readWakeBinding(%s) succeeded", body)
+			}
+		})
+	}
+
+	root := t.TempDir()
+	binding := WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"}
+	valid := WakeCommandResult{
+		Schema: 1, Status: "failed", ReasonCode: "existing_wake_blocking",
+		Root: root, Agent: "codex", CurrentWakeMode: "owner_bound",
+		CurrentGeneration: binding.Generation, CurrentTargetDigest: binding.TargetDigest,
+	}
+	for name, check := range map[string]func() error{
+		"wrong result contract": func() error {
+			candidate := valid
+			candidate.Schema = 2
+			return ValidateExistingWakeBlocker(root, "codex", binding, candidate)
+		},
+		"incomplete binding": func() error {
+			return ValidateExistingWakeBlocker(root, "codex", WakeBinding{}, valid)
+		},
+		"empty expected root": func() error {
+			return ValidateExistingWakeBlocker("", "codex", binding, valid)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := check(); err == nil {
+				t.Fatal("invalid blocker accepted")
+			}
+		})
+	}
+}
+
+func TestValidateRetireEchoContract(t *testing.T) {
+	root := t.TempDir()
+	request := RetireWakeRequest{Root: root, Me: "codex", Generation: "generation-1", TargetDigest: "sha256:target-1"}
+	valid := RetireWakeResult{
+		Status: "retired", ReasonCode: "retired_exact", Root: root, Agent: request.Me,
+		Generation: request.Generation, TargetDigest: request.TargetDigest,
+	}
+	if err := validateRetireEcho(request, valid); err != nil {
+		t.Fatalf("valid echo rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		req    RetireWakeRequest
+		result RetireWakeResult
+	}{
+		{name: "empty request root", req: func() RetireWakeRequest { value := request; value.Root = ""; return value }(), result: valid},
+		{name: "wrong response root", req: request, result: func() RetireWakeResult { value := valid; value.Root = ""; return value }()},
+		{name: "wrong agent", req: request, result: func() RetireWakeResult { value := valid; value.Agent = "claude"; return value }()},
+		{name: "wrong generation", req: request, result: func() RetireWakeResult { value := valid; value.Generation = "generation-2"; return value }()},
+		{name: "unproven superseded", req: request, result: func() RetireWakeResult {
+			value := valid
+			value.Status = "superseded"
+			value.ReasonCode = "generation_superseded"
+			return value
+		}()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateRetireEcho(test.req, test.result); err == nil {
+				t.Fatal("invalid echo accepted")
+			}
+		})
+	}
+	if _, err := canonicalPath(""); err == nil {
+		t.Fatal("empty canonical path accepted")
+	}
+}
+
+func TestWakeOwnerLengthNULAndEnvironmentBranches(t *testing.T) {
+	if _, err := ParseWakeOwner(strings.Repeat("x", 4097)); err == nil {
+		t.Fatal("oversized wake owner accepted")
+	}
+	if _, err := ParseWakeOwner(`{"pid":42,"process_start":"start\u0000bad","boot_id":"boot"}`); err == nil {
+		t.Fatal("wake owner containing NUL accepted")
+	}
+	t.Setenv("AMQ_WAKE_OWNER_ERROR", "")
+	t.Setenv("AMQ_WAKE_OWNER", `{"pid":42,"process_start":"start-1","boot_id":"boot-1","session_id":42}`)
+	if owner, err := WakeOwnerFromEnvironment(); err != nil || !owner.Strong() {
+		t.Fatalf("owner=%#v err=%v", owner, err)
 	}
 }
 

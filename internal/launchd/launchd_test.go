@@ -20,12 +20,14 @@ func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 		AutoGC:       true,
 		OwnerGrace:   7 * time.Minute,
 		Retention:    48 * time.Hour,
-		GCMaxPerPass: 2,
 		GCTimeout:    3 * time.Second,
 		StdoutPath:   "/Users/test/Library/Logs/amq-keepalive/out.log",
 		StderrPath:   "/Users/test/Library/Logs/amq-keepalive/err.log",
 	}
 	plist := BuildPlist(opts)
+	if bytes.Contains(plist, []byte("--gc-max-per-pass")) {
+		t.Fatalf("new plist emitted deprecated GC cap:\n%s", plist)
+	}
 
 	for _, want := range []string{
 		"<key>Label</key>",
@@ -45,8 +47,6 @@ func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 		"<string>7m0s</string>",
 		"<string>--retired-retention</string>",
 		"<string>48h0m0s</string>",
-		"<string>--gc-max-per-pass</string>",
-		"<string>2</string>",
 		"<string>--gc-timeout</string>",
 		"<string>3s</string>",
 		"<key>RunAtLoad</key>",

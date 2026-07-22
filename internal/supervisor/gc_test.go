@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,6 +151,240 @@ func TestGarbageCollectorLegacyAndRetentionPolicy(t *testing.T) {
 	retired.RetiredAt = now.Add(-24 * time.Hour)
 	if _, result := collector.Process(context.Background(), retired, true); result.Status != GCStatusPurgeCandidate || !result.Purge {
 		t.Fatalf("retention result=%#v", result)
+	}
+}
+
+func TestGarbageCollectorEnforcesInternalSafetyFloors(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	wake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("eligible", "owner_gone")}}}
+	collector := GarbageCollector{
+		Wake: wake, InjectVia: "/bin/sh", CapabilityAvailable: true,
+		Policy: GCPolicy{OwnerGrace: time.Second, RetiredRetention: time.Second, Timeout: 10 * time.Second},
+		Now:    func() time.Time { return now },
+	}
+	entry := gcTestEntry()
+	entry.OwnerGoneSince = now.Add(-time.Minute)
+	updated, result := collector.Process(context.Background(), entry, true)
+	if result.Status != GCStatusOwnerGoneSeen || updated.State == registry.StateRetired || len(wake.requests) != 1 {
+		t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+	}
+	if wake.requests[0].Timeout != MaxLifecycleTimeout {
+		t.Fatalf("timeout=%s want=%s", wake.requests[0].Timeout, MaxLifecycleTimeout)
+	}
+
+	retired := gcTestEntry()
+	retired.State = registry.StateRetired
+	retired.RetiredAt = now.Add(-time.Hour)
+	if _, retained := collector.Process(context.Background(), retired, true); retained.Purge || retained.Status == GCStatusPurgeCandidate {
+		t.Fatalf("sub-floor retention purged row: %#v", retained)
+	}
+}
+
+func TestRetirePreflightedRejectsTransitioningMemberWithoutLifecycleIO(t *testing.T) {
+	wake := &fakeLifecycle{}
+	collector := GarbageCollector{Wake: wake, InjectVia: "/bin/sh", CapabilityAvailable: true}
+	entry := gcTestEntry()
+	entry.Transition = registry.ReattachTransition{Phase: registry.TransitionReserved}
+	updated, result := collector.RetirePreflighted(context.Background(), entry)
+	if updated != entry || result.Status != GCStatusSkipped || result.ReasonCode != "batch_member_invalid" || len(wake.requests) != 0 {
+		t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+	}
+}
+
+func TestGarbageCollectorPreflightSafetyMatrix(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		want   string
+		mutate func(*GarbageCollector, *registry.Entry)
+	}{
+		{
+			name: "retired retention active",
+			want: "retention_active",
+			mutate: func(_ *GarbageCollector, entry *registry.Entry) {
+				entry.State = registry.StateRetired
+				entry.RetiredAt = now.Add(-time.Hour)
+			},
+		},
+		{
+			name: "reattach transition active",
+			want: "transition_active",
+			mutate: func(_ *GarbageCollector, entry *registry.Entry) {
+				entry.Transition = registry.ReattachTransition{Phase: registry.TransitionReserved}
+			},
+		},
+		{
+			name: "capability check failed",
+			want: "capability_check_failed",
+			mutate: func(collector *GarbageCollector, _ *registry.Entry) {
+				collector.CapabilityError = errors.New("env unavailable")
+			},
+		},
+		{
+			name: "capability unavailable",
+			want: "capability_unavailable",
+			mutate: func(collector *GarbageCollector, _ *registry.Entry) {
+				collector.CapabilityAvailable = false
+			},
+		},
+		{
+			name: "binding unavailable",
+			want: "binding_unavailable",
+			mutate: func(_ *GarbageCollector, entry *registry.Entry) {
+				entry.WakeBinding = registry.WakeBinding{}
+			},
+		},
+		{
+			name: "lifecycle unavailable",
+			want: "lifecycle_unavailable",
+			mutate: func(collector *GarbageCollector, _ *registry.Entry) {
+				collector.Wake = nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wake := &fakeLifecycle{}
+			collector := GarbageCollector{
+				Wake: wake, InjectVia: "/bin/sh", CapabilityAvailable: true,
+				Now: func() time.Time { return now },
+			}
+			entry := gcTestEntry()
+			test.mutate(&collector, &entry)
+			_, result := collector.ProcessWithBudget(context.Background(), entry, true, true)
+			if result.ReasonCode != test.want || len(wake.requests) != 0 {
+				t.Fatalf("result=%#v requests=%#v", result, wake.requests)
+			}
+		})
+	}
+}
+
+func TestGarbageCollectorBudgetAndUnprovenOwnerBranches(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	newCollector := func(wake *fakeLifecycle) GarbageCollector {
+		return GarbageCollector{
+			Wake: wake, InjectVia: "/bin/sh", CapabilityAvailable: true,
+			Policy: GCPolicy{OwnerGrace: MinOwnerGoneGrace},
+			Now:    func() time.Time { return now },
+		}
+	}
+
+	t.Run("dry run safe check cannot mutate", func(t *testing.T) {
+		wake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("already_retired", "tombstone_match")}}}
+		updated, result := newCollector(wake).ProcessWithBudget(context.Background(), gcTestEntry(), false, false)
+		if result.Status != GCStatusEligible || updated.State != registry.StateActive || len(wake.requests) != 1 || !wake.requests[0].Check {
+			t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+		}
+	})
+
+	t.Run("unproven owner clears stale observation without lifecycle failure", func(t *testing.T) {
+		wake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("refused", "owner_uninspectable")}}}
+		entry := gcTestEntry()
+		entry.OwnerGoneSince = now.Add(-time.Hour)
+		entry.GCFailureCount = 2
+		entry.GCBackoffUntil = now.Add(-time.Minute)
+		updated, result := newCollector(wake).Process(context.Background(), entry, true)
+		if result.Status != GCStatusSkipped || !updated.OwnerGoneSince.IsZero() || updated.GCFailureCount != 0 || !updated.GCBackoffUntil.IsZero() {
+			t.Fatalf("updated=%#v result=%#v", updated, result)
+		}
+	})
+
+	t.Run("first observation dry run remains non-mutating", func(t *testing.T) {
+		wake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("eligible", "owner_gone")}}}
+		entry := gcTestEntry()
+		updated, result := newCollector(wake).Process(context.Background(), entry, false)
+		if updated != entry || result.Status != GCStatusOwnerGoneSeen || result.Reason != "first positive owner-gone observation; dry-run did not persist it" {
+			t.Fatalf("updated=%#v result=%#v", updated, result)
+		}
+	})
+
+	t.Run("grace satisfied but retirement budget exhausted", func(t *testing.T) {
+		wake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("eligible", "owner_gone")}}}
+		entry := gcTestEntry()
+		entry.OwnerGoneSince = now.Add(-MinOwnerGoneGrace)
+		updated, result := newCollector(wake).ProcessWithBudget(context.Background(), entry, true, false)
+		if updated.State != registry.StateActive || result.Status != GCStatusEligible || len(wake.requests) != 1 {
+			t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		second gcReply
+		want   string
+	}{
+		{name: "retire lifecycle error", second: gcReply{err: errors.New("retire failed")}, want: "retire failed"},
+		{name: "retire response unproven", second: gcReply{result: gcResultFor("refused", "owner_live")}, want: "retirement did not positively prove"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wake := &fakeLifecycle{replies: []gcReply{{result: gcResultFor("eligible", "owner_gone")}, test.second}}
+			entry := gcTestEntry()
+			entry.OwnerGoneSince = now.Add(-MinOwnerGoneGrace)
+			updated, result := newCollector(wake).Process(context.Background(), entry, true)
+			if result.Status != GCStatusSkipped || updated.State != registry.StateActive || updated.GCFailureCount != 1 || len(wake.requests) != 2 || !strings.Contains(result.Reason, test.want) {
+				t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+			}
+		})
+	}
+}
+
+func TestRetirePreflightedOutcomeMatrix(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	superseded := gcResultFor("superseded", "generation_superseded")
+	superseded.CurrentGeneration = "generation-2"
+	superseded.CurrentTargetDigest = "sha256:target-2"
+	superseded.CurrentWakeMode = "owner_bound"
+	tests := []struct {
+		name       string
+		reply      gcReply
+		wantState  registry.State
+		wantStatus string
+		wantFails  int
+	}{
+		{name: "superseded terminalizes old row", reply: gcReply{result: superseded}, wantState: registry.StateRetired, wantStatus: GCStatusSkipped},
+		{name: "retired exact", reply: gcReply{result: gcResultFor("retired", "retired_exact")}, wantState: registry.StateRetired, wantStatus: GCStatusRetired},
+		{name: "lifecycle error backs off", reply: gcReply{err: errors.New("retire failed")}, wantState: registry.StateActive, wantStatus: GCStatusSkipped, wantFails: 1},
+		{name: "unproven result backs off", reply: gcReply{result: gcResultFor("eligible", "owner_gone")}, wantState: registry.StateActive, wantStatus: GCStatusSkipped, wantFails: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wake := &fakeLifecycle{replies: []gcReply{test.reply}}
+			collector := GarbageCollector{
+				Wake: wake, InjectVia: "/bin/sh", CapabilityAvailable: true,
+				Now: func() time.Time { return now },
+			}
+			updated, result := collector.RetirePreflighted(context.Background(), gcTestEntry())
+			if updated.State != test.wantState || result.Status != test.wantStatus || updated.GCFailureCount != test.wantFails || len(wake.requests) != 1 || wake.requests[0].Check {
+				t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+			}
+		})
+	}
+}
+
+func TestGarbageCollectorSafetyHelpers(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	entry := gcTestEntry()
+	entry.GCFailureCount = 5
+	updated, result := gcFailure(entry, now, true, GCResult{Reason: "boom"})
+	if result.ReasonCode != "lifecycle_error" || updated.GCFailureCount != 6 || !updated.GCBackoffUntil.Equal(now.Add(15*time.Minute)) {
+		t.Fatalf("updated=%#v result=%#v", updated, result)
+	}
+	if got := gcReasonKey(GCResult{Reason: "fallback"}); got != "fallback" {
+		t.Fatalf("gcReasonKey=%q", got)
+	}
+	if _, err := canonicalRetirementRoot(""); err == nil {
+		t.Fatal("empty retirement root accepted")
+	}
+	if EligibleRetirementResult(amq.RetireWakeRequest{}, amq.RetireWakeResult{Status: "eligible", ReasonCode: "owner_gone"}) {
+		t.Fatal("eligible result with empty identity accepted")
+	}
+	collector := GarbageCollector{Policy: GCPolicy{OwnerGrace: 10 * time.Minute, RetiredRetention: 48 * time.Hour, Timeout: time.Second}}
+	if collector.ownerGrace() != 10*time.Minute || collector.retention() != 48*time.Hour || collector.timeout() != time.Second {
+		t.Fatalf("policy helpers ignored explicit safe values: %#v", collector.Policy)
+	}
+	before := time.Now().UTC()
+	if got := collector.now(); got.Before(before) || got.After(time.Now().UTC().Add(time.Second)) {
+		t.Fatalf("default now=%s before=%s", got, before)
 	}
 }
 

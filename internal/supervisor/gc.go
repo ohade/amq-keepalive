@@ -3,6 +3,8 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ohade/amq-keepalive/internal/amq"
@@ -15,6 +17,15 @@ const (
 	GCStatusEligible       = "eligible"
 	GCStatusRetired        = "retired"
 	GCStatusPurgeCandidate = "purge_candidate"
+
+	MinOwnerGoneGrace     = 5 * time.Minute
+	MinRetiredRetention   = 24 * time.Hour
+	MaxLifecycleTimeout   = 5 * time.Second
+	MaxAgentsPerRootBatch = registry.MaxGCRootBatchMembers
+	MaxRootsPerGCWindow   = registry.MaxGCRootAttempts
+	GCRootWindow          = registry.GCRootAttemptWindow
+	GCCatchUpInterval     = 5 * time.Second
+	GCRootTerminalBackoff = 15 * time.Minute
 )
 
 type WakeLifecycle interface {
@@ -51,7 +62,16 @@ type GarbageCollector struct {
 	Now                 func() time.Time
 }
 
-func (g GarbageCollector) Process(ctx context.Context, entry registry.Entry, apply bool) (updated registry.Entry, result GCResult) {
+func (g GarbageCollector) Process(ctx context.Context, entry registry.Entry, apply bool) (registry.Entry, GCResult) {
+	return g.ProcessWithBudget(ctx, entry, apply, apply)
+}
+
+// ProcessWithBudget separates persistence of non-destructive observations from
+// authorization to retire one exact wake. A caller which has exhausted its
+// retirement budget must continue recording owner-gone observations and
+// lifecycle backoff without issuing another mutating retire.
+func (g GarbageCollector) ProcessWithBudget(ctx context.Context, entry registry.Entry, persist, allowRetire bool) (updated registry.Entry, result GCResult) {
+	allowRetire = persist && allowRetire
 	now := g.now()
 	result = GCResult{
 		EntryID: entry.ID, Status: GCStatusSkipped,
@@ -61,7 +81,7 @@ func (g GarbageCollector) Process(ctx context.Context, entry registry.Entry, app
 	}
 	updated = entry
 	defer func() {
-		if !apply {
+		if !persist {
 			return
 		}
 		updated.LastGCDecision = result.Status
@@ -121,30 +141,43 @@ func (g GarbageCollector) Process(ctx context.Context, entry registry.Entry, app
 	result.ReasonCode = checked.ReasonCode
 	result.RetirementStatus = checked.Status
 	if SafeRetirementResult(checkReq, checked) {
+		if persist && (checked.Status == "already_retired" || checked.Status == "retired" || checked.Status == "superseded") {
+			return markRetired(entry, now, checked), retiredResult(result, checked)
+		}
+		if !allowRetire {
+			result.Status = GCStatusEligible
+			result.Reason = "old exact wake is inactive, but this pass cannot consume another retirement"
+			return entry, result
+		}
 		return markRetired(entry, now, checked), retiredResult(result, checked)
 	}
 	if checked.Status == "refused" && checked.ReasonCode == "owner_live" {
-		entry.OwnerGoneSince = time.Time{}
-		entry = clearGCFailure(entry)
+		if persist {
+			entry.OwnerGoneSince = time.Time{}
+			entry = clearGCFailure(entry)
+		}
 		result.Reason = fmt.Sprintf("owner absence was not positively established: %s", checked.ReasonCode)
 		return entry, result
 	}
-	if checkErr != nil || checked.Status != "eligible" {
+	if checkErr != nil || !EligibleRetirementResult(checkReq, checked) {
 		if checkErr != nil {
 			result.Reason = checkErr.Error()
-			return gcFailure(entry, now, apply, result)
-		} else {
+			return gcFailure(entry, now, persist, result)
+		}
+		if persist {
 			entry.OwnerGoneSince = time.Time{}
 			entry = clearGCFailure(entry)
-			result.Reason = fmt.Sprintf("owner absence was not positively established: %s", checked.ReasonCode)
 		}
+		result.Reason = fmt.Sprintf("owner absence was not positively established: %s", checked.ReasonCode)
 		return entry, result
 	}
-	entry = clearGCFailure(entry)
+	if persist {
+		entry = clearGCFailure(entry)
+	}
 
 	if entry.OwnerGoneSince.IsZero() {
 		result.Status = GCStatusOwnerGoneSeen
-		if apply {
+		if persist {
 			entry.OwnerGoneSince = now
 			result.Reason = "first positive owner-gone observation recorded"
 		} else {
@@ -160,7 +193,7 @@ func (g GarbageCollector) Process(ctx context.Context, entry registry.Entry, app
 	}
 	result.Status = GCStatusEligible
 	result.Reason = "two positive owner-gone observations satisfy the grace period"
-	if !apply {
+	if !allowRetire {
 		return entry, result
 	}
 
@@ -174,11 +207,11 @@ func (g GarbageCollector) Process(ctx context.Context, entry registry.Entry, app
 	if retireErr != nil {
 		result.Status = GCStatusSkipped
 		result.Reason = retireErr.Error()
-		return gcFailure(entry, now, apply, result)
+		return gcFailure(entry, now, persist, result)
 	}
 	result.Status = GCStatusSkipped
 	result.Reason = "retirement did not positively prove the old generation inactive"
-	return gcFailure(entry, now, apply, result)
+	return gcFailure(entry, now, persist, result)
 }
 
 func (g GarbageCollector) request(entry registry.Entry, check bool) amq.RetireWakeRequest {
@@ -191,6 +224,9 @@ func (g GarbageCollector) request(entry registry.Entry, check bool) amq.RetireWa
 }
 
 func SafeRetirementResult(req amq.RetireWakeRequest, result amq.RetireWakeResult) bool {
+	if !retirementResultMatches(req, result) {
+		return false
+	}
 	switch result.Status {
 	case "retired":
 		return result.ReasonCode == "retired_exact"
@@ -201,6 +237,76 @@ func SafeRetirementResult(req amq.RetireWakeRequest, result amq.RetireWakeResult
 	default:
 		return false
 	}
+}
+
+// EligibleRetirementResult accepts only an exact echo of the generation-bound
+// owner-gone check. The concrete AMQ CLI validates this too, but keeping the
+// invariant here protects alternate WakeLifecycle implementations and tests.
+func EligibleRetirementResult(req amq.RetireWakeRequest, result amq.RetireWakeResult) bool {
+	return result.Status == "eligible" && result.ReasonCode == "owner_gone" && retirementResultMatches(req, result)
+}
+
+func retirementResultMatches(req amq.RetireWakeRequest, result amq.RetireWakeResult) bool {
+	wantRoot, err := canonicalRetirementRoot(req.Root)
+	if err != nil {
+		return false
+	}
+	gotRoot, err := canonicalRetirementRoot(result.Root)
+	return err == nil && gotRoot == wantRoot && result.Agent == req.Me &&
+		result.Generation == req.Generation && result.TargetDigest == req.TargetDigest
+}
+
+func canonicalRetirementRoot(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("retirement root is empty")
+	}
+	abs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real, nil
+	}
+	return abs, nil
+}
+
+// RetirePreflighted applies one exact retirement after a root-wide preflight
+// has succeeded and been durably transitioned into its retiring phase. It does
+// not repeat the check, but AMQ still revalidates owner absence because the
+// mutation request retains RequireOwnerGone.
+func (g GarbageCollector) RetirePreflighted(ctx context.Context, entry registry.Entry) (registry.Entry, GCResult) {
+	now := g.now()
+	result := GCResult{
+		EntryID: entry.ID, Status: GCStatusSkipped,
+		Capability:      g.CapabilityAvailable,
+		OwnerBound:      entry.WakeOwnerPresent && entry.WakeOwner.Strong() && !entry.LegacyUnbound,
+		BindingComplete: entry.WakeBinding.Complete(),
+	}
+	if !result.Capability || !result.OwnerBound || !result.BindingComplete || g.Wake == nil || entry.State == registry.StateRetired || entry.Transition.Active() {
+		result.ReasonCode = "batch_member_invalid"
+		result.Reason = "frozen GC batch member is no longer eligible for exact retirement"
+		return entry, result
+	}
+	request := g.request(entry, false)
+	retired, retireErr := g.Wake.RetireWake(ctx, request)
+	result.AMQTouched = true
+	result.ReasonCode = retired.ReasonCode
+	result.RetirementStatus = retired.Status
+	if retired.Status == "superseded" && SafeRetirementResult(request, retired) {
+		updated := markRetired(entry, now, retired)
+		result.Status = GCStatusSkipped
+		result.Reason = "the frozen generation is gone, but a different wake generation replaced it"
+		return updated, result
+	}
+	if SafeRetirementResult(request, retired) {
+		return markRetired(entry, now, retired), retiredResult(result, retired)
+	}
+	if retireErr != nil {
+		result.Reason = retireErr.Error()
+	} else {
+		result.Reason = "retirement did not positively prove the frozen generation inactive"
+	}
+	return gcFailure(entry, now, true, result)
 }
 
 func markRetired(entry registry.Entry, now time.Time, result amq.RetireWakeResult) registry.Entry {
@@ -267,22 +373,22 @@ func (g GarbageCollector) now() time.Time {
 }
 
 func (g GarbageCollector) ownerGrace() time.Duration {
-	if g.Policy.OwnerGrace < 0 {
-		return 5 * time.Minute
+	if g.Policy.OwnerGrace < MinOwnerGoneGrace {
+		return MinOwnerGoneGrace
 	}
 	return g.Policy.OwnerGrace
 }
 
 func (g GarbageCollector) retention() time.Duration {
-	if g.Policy.RetiredRetention < 0 {
-		return 24 * time.Hour
+	if g.Policy.RetiredRetention < MinRetiredRetention {
+		return MinRetiredRetention
 	}
 	return g.Policy.RetiredRetention
 }
 
 func (g GarbageCollector) timeout() time.Duration {
-	if g.Policy.Timeout > 0 && g.Policy.Timeout <= 5*time.Second {
+	if g.Policy.Timeout > 0 && g.Policy.Timeout <= MaxLifecycleTimeout {
 		return g.Policy.Timeout
 	}
-	return 5 * time.Second
+	return MaxLifecycleTimeout
 }
