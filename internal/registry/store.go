@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,35 +17,97 @@ import (
 )
 
 const (
-	SchemaVersion = 1
+	SchemaVersion = 2
 
 	StateAttached State = "attached"
 	StateActive   State = "active"
 	StateDetached State = "detached"
 	StateStale    State = "stale"
+	StateRetired  State = "retired"
+
+	TransitionNone          TransitionPhase = ""
+	TransitionReserved      TransitionPhase = "reserved"
+	TransitionRetirePending TransitionPhase = "retire_pending"
+	TransitionOldRetired    TransitionPhase = "old_retired"
 )
 
 type State string
 
+type TransitionPhase string
+
+// WakeOwner is deliberately a value-only type. Entry values are optimistic
+// compare-and-swap tokens, so lifecycle metadata must remain comparable.
+type WakeOwner struct {
+	PID          int    `json:"pid"`
+	ProcessStart string `json:"process_start"`
+	BootID       string `json:"boot_id"`
+	SessionID    int    `json:"session_id,omitempty"`
+}
+
+func (o WakeOwner) Strong() bool {
+	return o.PID > 0 && strings.TrimSpace(o.ProcessStart) != "" && strings.TrimSpace(o.BootID) != "" && o.SessionID >= 0
+}
+
+type WakeBinding struct {
+	Generation   string `json:"generation"`
+	TargetDigest string `json:"target_digest"`
+}
+
+func (b WakeBinding) Complete() bool {
+	return strings.TrimSpace(b.Generation) != "" && strings.TrimSpace(b.TargetDigest) != ""
+}
+
+// ReattachTransition records the old exact wake which a new reservation may
+// have to retire. It intentionally contains no pointers, maps, or slices.
+type ReattachTransition struct {
+	Phase          TransitionPhase `json:"phase,omitempty"`
+	Revision       int64           `json:"revision,omitempty"`
+	OldID          string          `json:"old_id,omitempty"`
+	OldRoot        string          `json:"old_root,omitempty"`
+	OldAgent       string          `json:"old_agent,omitempty"`
+	OldAdapter     string          `json:"old_adapter,omitempty"`
+	OldTarget      string          `json:"old_target,omitempty"`
+	OldBaseline    string          `json:"old_baseline_file,omitempty"`
+	OldBaselineSum string          `json:"old_baseline_digest,omitempty"`
+	OldOwnerSet    bool            `json:"old_owner_present,omitempty"`
+	OldOwner       WakeOwner       `json:"old_owner,omitempty"`
+	OldBinding     WakeBinding     `json:"old_binding,omitempty"`
+}
+
+func (t ReattachTransition) Active() bool { return t.Phase != TransitionNone }
+
 type Entry struct {
-	ID                     string    `json:"id"`
-	Root                   string    `json:"root"`
-	BaseRoot               string    `json:"base_root,omitempty"`
-	SessionName            string    `json:"session_name,omitempty"`
-	Agent                  string    `json:"agent"`
-	Adapter                string    `json:"adapter"`
-	Target                 string    `json:"target"`
-	BaselineFile           string    `json:"baseline_file,omitempty"`
-	BaselineDigest         string    `json:"baseline_digest,omitempty"`
-	State                  State     `json:"state"`
-	LastAttach             time.Time `json:"last_attach,omitempty"`
-	LastSeenBySupervisor   time.Time `json:"last_seen_by_supervisor,omitempty"`
-	FailureCount           int       `json:"failure_count,omitempty"`
-	BackoffUntil           time.Time `json:"backoff_until,omitempty"`
-	NextHealthCheck        time.Time `json:"next_health_check,omitempty"`
-	DetachedSince          time.Time `json:"detached_since,omitempty"`
-	LastError              string    `json:"last_error,omitempty"`
-	LastSupervisorDecision string    `json:"last_supervisor_decision,omitempty"`
+	ID                     string             `json:"id"`
+	Root                   string             `json:"root"`
+	BaseRoot               string             `json:"base_root,omitempty"`
+	SessionName            string             `json:"session_name,omitempty"`
+	Agent                  string             `json:"agent"`
+	Adapter                string             `json:"adapter"`
+	Target                 string             `json:"target"`
+	BaselineFile           string             `json:"baseline_file,omitempty"`
+	BaselineDigest         string             `json:"baseline_digest,omitempty"`
+	State                  State              `json:"state"`
+	LastAttach             time.Time          `json:"last_attach,omitempty"`
+	LastSeenBySupervisor   time.Time          `json:"last_seen_by_supervisor,omitempty"`
+	FailureCount           int                `json:"failure_count,omitempty"`
+	BackoffUntil           time.Time          `json:"backoff_until,omitempty"`
+	NextHealthCheck        time.Time          `json:"next_health_check,omitempty"`
+	DetachedSince          time.Time          `json:"detached_since,omitempty"`
+	LastError              string             `json:"last_error,omitempty"`
+	LastSupervisorDecision string             `json:"last_supervisor_decision,omitempty"`
+	LegacyUnbound          bool               `json:"legacy_unbound,omitempty"`
+	WakeOwnerPresent       bool               `json:"wake_owner_present,omitempty"`
+	WakeOwner              WakeOwner          `json:"wake_owner,omitempty"`
+	WakeBinding            WakeBinding        `json:"wake_binding,omitempty"`
+	OwnerGoneSince         time.Time          `json:"owner_gone_since,omitempty"`
+	RetiredAt              time.Time          `json:"retired_at,omitempty"`
+	RetirementOutcome      string             `json:"retirement_outcome,omitempty"`
+	RetirementReason       string             `json:"retirement_reason,omitempty"`
+	GCFailureCount         int                `json:"gc_failure_count,omitempty"`
+	GCBackoffUntil         time.Time          `json:"gc_backoff_until,omitempty"`
+	LastGCDecision         string             `json:"last_gc_decision,omitempty"`
+	LastGCReason           string             `json:"last_gc_reason,omitempty"`
+	Transition             ReattachTransition `json:"reattach_transition,omitempty"`
 }
 
 type File struct {
@@ -189,13 +252,71 @@ func (s *Store) loadUnlocked() (File, error) {
 		return File{}, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
 	if file.SchemaVersion == 0 {
+		file.SchemaVersion = 1
+	}
+	if file.SchemaVersion == 1 {
+		if err := s.backupV1Registry(data); err != nil {
+			return File{}, fmt.Errorf("back up registry schema v1: %w", err)
+		}
+		for i := range file.Entries {
+			file.Entries[i].LegacyUnbound = true
+			file.Entries[i].WakeOwnerPresent = false
+			file.Entries[i].WakeOwner = WakeOwner{}
+			file.Entries[i].WakeBinding = WakeBinding{}
+		}
 		file.SchemaVersion = SchemaVersion
+		if err := s.saveUnlocked(file); err != nil {
+			return File{}, fmt.Errorf("migrate registry schema v1: %w", err)
+		}
 	}
 	if file.SchemaVersion != SchemaVersion {
 		return File{}, fmt.Errorf("unsupported registry schema version %d", file.SchemaVersion)
 	}
 	sortEntries(file.Entries)
 	return file, nil
+}
+
+func (s *Store) backupV1Registry(data []byte) error {
+	path := s.Path + ".v1.bak"
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return fmt.Errorf("existing migration backup %q is not a secure 0600 regular file", path)
+		}
+		existing, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if !bytes.Equal(existing, data) {
+			return fmt.Errorf("existing migration backup %q does not match the schema v1 registry", path)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		_ = file.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	ok = true
+	return syncDir(filepath.Dir(path))
 }
 
 func (s *Store) Save(file File) error {
@@ -291,14 +412,38 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 			return targetOwnedError(prepared, owner)
 		}
 		next := make([]Entry, 0, len(file.Entries)+1)
+		livePrevious := make([]Entry, 0, 1)
+		var revision int64
 		for _, existing := range file.Entries {
 			// AMQ permits one wake process per root and agent. Reattach therefore
 			// replaces the old registration even when the terminal adapter changed.
 			if existing.Root == prepared.Root && existing.Agent == prepared.Agent {
 				removed = append(removed, existing)
+				if existing.State != StateRetired {
+					livePrevious = append(livePrevious, existing)
+				}
+				if existing.Transition.Revision > revision {
+					revision = existing.Transition.Revision
+				}
 				continue
 			}
 			next = append(next, existing)
+		}
+		if len(livePrevious) == 1 {
+			old := livePrevious[0]
+			if old.Transition.Active() {
+				prepared.Transition = old.Transition
+				prepared.Transition.Revision = revision + 1
+			} else {
+				prepared.Transition = ReattachTransition{
+					Phase: TransitionReserved, Revision: revision + 1,
+					OldID: old.ID, OldRoot: old.Root, OldAgent: old.Agent,
+					OldAdapter: old.Adapter, OldTarget: old.Target,
+					OldBaseline: old.BaselineFile, OldBaselineSum: old.BaselineDigest,
+					OldOwnerSet: old.WakeOwnerPresent, OldOwner: old.WakeOwner,
+					OldBinding: old.WakeBinding,
+				}
+			}
 		}
 		next = append(next, prepared)
 		file.Entries = next
@@ -550,6 +695,9 @@ func sortEntries(entries []Entry) {
 func conflictingTargetOwner(entries []Entry, candidate Entry, ignoreSameRootAgent bool) (Entry, bool) {
 	candidateTarget := canonicalStoredTarget(candidate.Adapter, candidate.Target)
 	for _, existing := range entries {
+		if existing.State == StateRetired {
+			continue
+		}
 		if existing.ID == candidate.ID {
 			continue
 		}

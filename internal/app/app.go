@@ -26,7 +26,13 @@ type App struct {
 	Stderr io.Writer
 }
 
-var errIdentitySafeWakeRetireUnavailable = errors.New("destructive AMQ wake retirement is disabled until AMQ exposes a positively verifiable identity-safe-retire capability from #235")
+type wakeLifecycle interface {
+	supervisor.WakeRunner
+	Env(context.Context) (amq.Env, error)
+	RetireWake(context.Context, amq.RetireWakeRequest) (amq.RetireWakeResult, error)
+}
+
+var errIdentitySafeWakeRetireUnavailable = errors.New("AMQ does not advertise the wake_gc_v1 identity-safe-retire capability")
 
 func (a App) Run(ctx context.Context, args []string) int {
 	if a.Stdout == nil {
@@ -54,7 +60,7 @@ func (a App) Run(ctx context.Context, args []string) int {
 	case "inject":
 		err = a.inject(ctx, args[1:])
 	case "doctor":
-		err = a.doctor(args[1:])
+		err = a.doctor(ctx, args[1:])
 	case "gc":
 		err = a.gc(ctx, args[1:])
 	case "retire-session":
@@ -129,7 +135,7 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 	self := fs.String("self", executablePath(), "amq-keepalive executable path for --inject-via")
 	wakeTimeout := fs.Duration("wake-ready-timeout", 10*time.Second, "maximum time to wait for amq wake readiness")
 	noStart := fs.Bool("no-start", false, "register without starting/reconciling wake")
-	retireDetached := fs.Bool("retire-detached", false, "attempt non-destructive exact-target convergence; retirement remains disabled until AMQ #235")
+	retireDetached := fs.Bool("retire-detached", true, "recover a blocked reattach through owner-bound exact wake retirement")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -153,22 +159,25 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 
 func (a App) registerWithOptions(ctx context.Context, opts registerOptions) error {
 	envCLI := amq.NewCLI(opts.AMQPath)
+	wakeOwner, wakeOwnerErr := amq.WakeOwnerFromEnvironment()
+	var amqEnvironment amq.Env
+	var amqEnvironmentErr error
 	if opts.Root == "" || opts.Me == "" || opts.BaseRoot == "" || opts.SessionName == "" {
-		env, err := envCLI.Env(ctx)
-		if err != nil && (opts.Root == "" || opts.Me == "") {
-			return err
+		amqEnvironment, amqEnvironmentErr = envCLI.Env(ctx)
+		if amqEnvironmentErr != nil && (opts.Root == "" || opts.Me == "") {
+			return amqEnvironmentErr
 		}
 		if opts.Root == "" {
-			opts.Root = env.Root
+			opts.Root = amqEnvironment.Root
 		}
 		if opts.BaseRoot == "" {
-			opts.BaseRoot = env.BaseRoot
+			opts.BaseRoot = amqEnvironment.BaseRoot
 		}
 		if opts.SessionName == "" {
-			opts.SessionName = env.SessionName
+			opts.SessionName = amqEnvironment.SessionName
 		}
 		if opts.Me == "" {
-			opts.Me = env.Me
+			opts.Me = amqEnvironment.Me
 		}
 	}
 	opts.Root, opts.BaseRoot = normalizeAMQPaths(opts.Root, opts.BaseRoot, opts.SessionName)
@@ -209,16 +218,21 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 	}
 	store := registry.New(opts.RegistryPath)
 	next := registry.Entry{
-		ID:             registry.EntryID(opts.Root, opts.Me, opts.AdapterName, opts.Target),
-		Root:           opts.Root,
-		BaseRoot:       opts.BaseRoot,
-		SessionName:    opts.SessionName,
-		Agent:          opts.Me,
-		Adapter:        opts.AdapterName,
-		Target:         opts.Target,
-		BaselineFile:   opts.BaselineFile,
-		BaselineDigest: opts.BaselineDigest,
-		State:          registry.StateAttached,
+		ID:               registry.EntryID(opts.Root, opts.Me, opts.AdapterName, opts.Target),
+		Root:             opts.Root,
+		BaseRoot:         opts.BaseRoot,
+		SessionName:      opts.SessionName,
+		Agent:            opts.Me,
+		Adapter:          opts.AdapterName,
+		Target:           opts.Target,
+		BaselineFile:     opts.BaselineFile,
+		BaselineDigest:   opts.BaselineDigest,
+		State:            registry.StateAttached,
+		WakeOwnerPresent: wakeOwnerErr == nil,
+		WakeOwner: registry.WakeOwner{
+			PID: wakeOwner.PID, ProcessStart: wakeOwner.ProcessStart,
+			BootID: wakeOwner.BootID, SessionID: wakeOwner.SessionID,
+		},
 	}
 	reconciler := supervisor.Reconciler{
 		Wake:        envCLI,
@@ -262,11 +276,23 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 				return err
 			}
 			next = entry
+			if readinessErr := managedWakeReadinessError(wakeOwnerErr, amqEnvironmentErr, amqEnvironment); readinessErr != nil {
+				next.LastError = readinessErr.Error()
+				next.LastSupervisorDecision = supervisor.ActionBackoff
+				if updateErr := store.UpdateEntry(next); updateErr != nil {
+					return errors.Join(readinessErr, updateErr)
+				}
+				return readinessErr
+			}
 			wakeReady := false
 			if !opts.NoStart {
 				if opts.RetireDetached {
 					var recoverErr error
-					next, wakeReady, recoverErr = recoverDetachedRegistration(ctx, removed, adapters, reconciler, next)
+					previousForRecovery := removed
+					if next.Transition.Active() {
+						previousForRecovery = []registry.Entry{transitionPreviousEntry(next.Transition)}
+					}
+					next, wakeReady, recoverErr = recoverDetachedRegistration(ctx, store, previousForRecovery, envCLI, reconciler, next)
 					if recoverErr != nil {
 						return resolveRegistrationReadinessFailure(store, entry, next, removed, recoverErr)
 					}
@@ -279,6 +305,7 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 					next = updated
 				}
 			}
+			next.Transition = registry.ReattachTransition{}
 			if err := store.UpdateEntry(next); err != nil {
 				return fmt.Errorf("wake is ready and its attached registry reservation remains recoverable, but marking it active failed: %w", err)
 			}
@@ -289,6 +316,14 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 		entry, err = store.Upsert(next)
 		if err != nil || opts.NoStart {
 			return err
+		}
+		if readinessErr := managedWakeReadinessError(wakeOwnerErr, amqEnvironmentErr, amqEnvironment); readinessErr != nil {
+			entry.LastError = readinessErr.Error()
+			entry.LastSupervisorDecision = supervisor.ActionBackoff
+			if updateErr := store.UpdateEntry(entry); updateErr != nil {
+				return errors.Join(readinessErr, updateErr)
+			}
+			return readinessErr
 		}
 		updated, result := reconciler.Reconcile(ctx, entry)
 		if updateErr := store.UpdateEntry(updated); updateErr != nil {
@@ -309,6 +344,16 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 	return printJSON(a.Stdout, entry)
 }
 
+func managedWakeReadinessError(ownerErr, environmentErr error, _ amq.Env) error {
+	if ownerErr != nil {
+		return fmt.Errorf("AMQ wake unavailable; messages remain queued: %w", ownerErr)
+	}
+	if environmentErr != nil {
+		return fmt.Errorf("AMQ wake unavailable; messages remain queued: capability check failed: %w", environmentErr)
+	}
+	return nil
+}
+
 func resolveRegistrationReadinessFailure(
 	store *registry.Store,
 	reservation registry.Entry,
@@ -316,7 +361,9 @@ func resolveRegistrationReadinessFailure(
 	removed []registry.Entry,
 	readinessErr error,
 ) error {
-	if errors.Is(readinessErr, amq.ErrWakeReadinessUncertain) {
+	if errors.Is(readinessErr, amq.ErrWakeReadinessUncertain) ||
+		candidate.Transition.Phase == registry.TransitionRetirePending ||
+		candidate.Transition.Phase == registry.TransitionOldRetired {
 		if candidate != reservation {
 			if updateErr := store.UpdateEntry(candidate); updateErr != nil {
 				return errors.Join(
@@ -324,6 +371,12 @@ func resolveRegistrationReadinessFailure(
 					fmt.Errorf("wake readiness is uncertain and the attached reservation remains, but recording its retry state failed: %w", updateErr),
 				)
 			}
+		}
+		if candidate.Transition.Phase == registry.TransitionRetirePending {
+			return fmt.Errorf("old wake retirement has an ambiguous outcome; the new inactive registry transition was preserved for exact recovery: %w", readinessErr)
+		}
+		if candidate.Transition.Phase == registry.TransitionOldRetired {
+			return fmt.Errorf("old wake is retired; the new inactive registry transition was preserved for supervisor convergence: %w", readinessErr)
 		}
 		return fmt.Errorf("wake readiness is uncertain; the attached registry reservation was preserved for supervisor convergence: %w", readinessErr)
 	}
@@ -403,23 +456,24 @@ func checkPhysicalTargetAvailable(
 	return nil
 }
 
-// recoverDetachedRegistration is the narrow recovery path for a recreated
-// terminal. It never retargets a live wake: the previously registered adapter
-// target must be independently proven absent. It first asks AMQ's atomic wake
-// start path to converge on the new exact target, which handles an already
-// absent lock without requiring retirement. If a live old wake blocks that
-// start, this release fails closed: destructive wake retirement remains gated
-// until AMQ can positively attest the #235 identity-safe-retire capability.
+// recoverDetachedRegistration converges a durable old-to-new reservation. It
+// always starts the new wake first. Only an exact, owner-gone, generation-bound
+// old wake may be retired; after that positive transition the old registry row
+// is never restored, even if the retry fails.
 func recoverDetachedRegistration(
 	ctx context.Context,
+	store *registry.Store,
 	previousEntries []registry.Entry,
-	adapters adapter.Registry,
+	lifecycle interface {
+		Env(context.Context) (amq.Env, error)
+		RetireWake(context.Context, amq.RetireWakeRequest) (amq.RetireWakeResult, error)
+	},
 	reconciler supervisor.Reconciler,
 	next registry.Entry,
 ) (registry.Entry, bool, error) {
 	matches := make([]registry.Entry, 0, 1)
 	for _, entry := range previousEntries {
-		if entry.Root == next.Root && entry.Agent == next.Agent {
+		if entry.Root == next.Root && entry.Agent == next.Agent && entry.State != registry.StateRetired {
 			matches = append(matches, entry)
 		}
 	}
@@ -433,36 +487,83 @@ func recoverDetachedRegistration(
 	if previous.Adapter == next.Adapter && previous.Target == next.Target {
 		return next, false, nil
 	}
-	previousAdapter, err := adapters.Get(previous.Adapter)
-	if err != nil {
-		return next, false, fmt.Errorf("load previous adapter %s: %w", previous.Adapter, err)
-	}
-	if normalizer, ok := previousAdapter.(adapter.TargetNormalizer); ok {
-		previous.Target, err = normalizer.NormalizeTarget(previous.Target)
-		if err != nil {
-			return next, false, fmt.Errorf("normalize previous target for %s: %w", previous.Agent, err)
-		}
-	}
-	probeErr := previousAdapter.Probe(ctx, previous.Target)
-	if probeErr == nil {
-		return next, false, nil
-	}
-	if !errors.Is(probeErr, adapter.ErrTargetNotFound) {
-		return next, false, fmt.Errorf("refusing detached wake recovery for %s because target absence is not proven: %w", previous.Agent, probeErr)
-	}
 
 	updated, initialStart := reconciler.StartFresh(ctx, next)
-	if initialStart.Error == nil {
+	if initialStart.Error == nil && initialStart.Action == supervisor.ActionEnsured {
 		return updated, true, nil
+	}
+	if initialStart.Error == nil {
+		return updated, false, fmt.Errorf("recover detached %s wake start was deferred with action %q", previous.Agent, initialStart.Action)
 	}
 	if errors.Is(initialStart.Error, amq.ErrWakeReadinessUncertain) {
 		return updated, false, fmt.Errorf("recover detached %s wake has uncertain readiness: %w", previous.Agent, initialStart.Error)
 	}
-
-	return next, false, fmt.Errorf(
-		"recover detached %s wake: exact-target start failed: %v; %w",
-		previous.Agent, initialStart.Error, errIdentitySafeWakeRetireUnavailable,
-	)
+	if next.Transition.Phase == registry.TransitionOldRetired {
+		return updated, false, fmt.Errorf("old wake is already retired; new inactive reservation retained for supervisor retry: %w", initialStart.Error)
+	}
+	var structuredStart *amq.WakeStartError
+	if !errors.As(initialStart.Error, &structuredStart) || structuredStart.Result.ReasonCode != "existing_wake_blocking" {
+		return updated, false, fmt.Errorf("recover detached %s wake: exact-target start did not prove an old-wake conflict; refusing retirement: %w", previous.Agent, initialStart.Error)
+	}
+	if !previous.WakeOwnerPresent || !previous.WakeOwner.Strong() || !previous.WakeBinding.Complete() {
+		return updated, false, fmt.Errorf("recover detached %s wake: exact-target start failed: %v; old wake lacks owner-bound generation metadata", previous.Agent, initialStart.Error)
+	}
+	environment, environmentErr := lifecycle.Env(ctx)
+	if environmentErr != nil {
+		return updated, false, fmt.Errorf("recover detached %s wake: wake_gc_v1 capability check failed: %w", previous.Agent, environmentErr)
+	}
+	if !environment.HasCapability(amq.CapabilityWakeGCV1) {
+		return updated, false, fmt.Errorf("recover detached %s wake: AMQ does not advertise wake_gc_v1; refusing retirement", previous.Agent)
+	}
+	request := amq.RetireWakeRequest{
+		Root: previous.Root, Me: previous.Agent, InjectVia: reconciler.InjectVia,
+		Adapter: previous.Adapter, Target: previous.Target,
+		Generation: previous.WakeBinding.Generation, TargetDigest: previous.WakeBinding.TargetDigest,
+		RequireOwnerGone: true, Timeout: 5 * time.Second,
+	}
+	checkRequest := request
+	checkRequest.Check = true
+	checked, checkErr := lifecycle.RetireWake(ctx, checkRequest)
+	if !supervisor.SafeRetirementResult(checkRequest, checked) && (checkErr != nil || checked.Status != "eligible") {
+		if checkErr == nil {
+			checkErr = fmt.Errorf("status=%q reason_code=%q", checked.Status, checked.ReasonCode)
+		}
+		return updated, false, fmt.Errorf("recover detached %s wake: owner-gone check refused: %w", previous.Agent, checkErr)
+	}
+	retired := checked
+	retireErr := checkErr
+	if checked.Status == "eligible" {
+		next.Transition.Phase = registry.TransitionRetirePending
+		if err := store.UpdateEntry(next); err != nil {
+			return next, false, fmt.Errorf("refusing old wake retirement because the durable pending transition could not be recorded: %w", err)
+		}
+		retired, retireErr = lifecycle.RetireWake(ctx, request)
+	}
+	if !supervisor.SafeRetirementResult(request, retired) {
+		if retireErr == nil {
+			retireErr = errors.New("AMQ did not positively prove the old generation inactive")
+		}
+		pending := next
+		pending.FailureCount = updated.FailureCount
+		pending.BackoffUntil = updated.BackoffUntil
+		pending.LastError = retireErr.Error()
+		pending.LastSupervisorDecision = supervisor.ActionStartFailed
+		return pending, false, fmt.Errorf("recover detached %s wake retirement refused: %w", previous.Agent, retireErr)
+	}
+	next.Transition.Phase = registry.TransitionOldRetired
+	next.RetirementOutcome = retired.Status
+	next.RetirementReason = retired.ReasonCode
+	if err := store.UpdateEntry(next); err != nil {
+		return next, false, fmt.Errorf("old wake is retired but preserving the new transition failed: %w", err)
+	}
+	updated, retried := reconciler.StartFresh(ctx, next)
+	if retried.Error != nil || retried.Action != supervisor.ActionEnsured {
+		if retried.Error == nil {
+			retried.Error = fmt.Errorf("wake start was deferred with action %q", retried.Action)
+		}
+		return updated, false, fmt.Errorf("old wake is retired; new inactive reservation retained for supervisor retry: %w", retried.Error)
+	}
+	return updated, true, nil
 }
 
 func (a App) supervise(ctx context.Context, args []string) error {
@@ -474,15 +575,24 @@ func (a App) supervise(ctx context.Context, args []string) error {
 	once := fs.Bool("once", false, "run one supervisor pass")
 	interval := fs.Duration("interval", time.Minute, "supervisor interval")
 	wakeTimeout := fs.Duration("wake-ready-timeout", 10*time.Second, "maximum time to wait for amq wake readiness")
+	autoGC := fs.Bool("auto-gc", false, "retire owner-bound wakes after two positive owner-gone observations")
+	ownerGrace := fs.Duration("owner-gone-grace", 5*time.Minute, "minimum interval between positive owner-gone observations")
+	retiredRetention := fs.Duration("retired-retention", 24*time.Hour, "diagnostic retention for retired registry rows")
+	gcMax := fs.Int("gc-max-per-pass", 1, "maximum wake retirements per supervisor pass")
+	gcTimeout := fs.Duration("gc-timeout", 5*time.Second, "deadline for each AMQ lifecycle command")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *interval <= 0 {
 		return errors.New("--interval must be greater than zero")
 	}
+	if *ownerGrace < 0 || *retiredRetention < 0 || *gcMax < 1 || *gcTimeout <= 0 || *gcTimeout > 5*time.Second {
+		return errors.New("GC policy requires non-negative grace/retention, max >= 1, and timeout in (0,5s]")
+	}
+	gcPolicy := supervisor.GCPolicy{AutoGC: *autoGC, OwnerGrace: *ownerGrace, RetiredRetention: *retiredRetention, Timeout: *gcTimeout}
 
 	runOnce := func(emitJSON bool) error {
-		results, err := a.superviseOnce(ctx, *registryPath, amq.NewCLI(*amqPath), *self, *wakeTimeout)
+		results, err := a.superviseOnceWithGC(ctx, *registryPath, amq.NewCLI(*amqPath), *self, *wakeTimeout, gcPolicy, *gcMax)
 		if err != nil {
 			return err
 		}
@@ -509,8 +619,24 @@ func (a App) supervise(ctx context.Context, args []string) error {
 }
 
 func (a App) superviseOnce(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration) ([]supervisor.Result, error) {
+	return a.superviseOnceWithGC(ctx, registryPath, wake, self, wakeTimeout, supervisor.GCPolicy{}, 1)
+}
+
+func (a App) superviseOnceWithGC(ctx context.Context, registryPath string, wake supervisor.WakeRunner, self string, wakeTimeout time.Duration, gcPolicy supervisor.GCPolicy, gcMax int) ([]supervisor.Result, error) {
 	store := registry.New(registryPath)
 	var results []supervisor.Result
+	var capability bool
+	var capabilityErr error
+	lifecycle, lifecycleOK := wake.(wakeLifecycle)
+	if gcPolicy.AutoGC {
+		if !lifecycleOK {
+			capabilityErr = errors.New("wake runner does not implement owner-bound lifecycle operations")
+		} else if environment, err := lifecycle.Env(ctx); err != nil {
+			capabilityErr = err
+		} else {
+			capability = environment.HasCapability(amq.CapabilityWakeGCV1)
+		}
+	}
 	err := store.WithRegistrationLockContext(ctx, func() error {
 		file, err := store.Load()
 		if err != nil {
@@ -524,6 +650,8 @@ func (a App) superviseOnce(ctx context.Context, registryPath string, wake superv
 		}
 		results = make([]supervisor.Result, 0, len(file.Entries))
 		updates := make([]registry.EntryUpdate, 0, len(file.Entries))
+		purges := make([]registry.Entry, 0)
+		retiredThisPass := 0
 		for _, entry := range file.Entries {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				results = append(results, supervisor.Result{Action: supervisor.ActionDeferred, Error: ctxErr})
@@ -540,6 +668,84 @@ func (a App) superviseOnce(ctx context.Context, registryPath string, wake superv
 				InjectVia:   self,
 				WakeTimeout: wakeTimeout,
 			}
+			if entry.Transition.Active() {
+				if !lifecycleOK {
+					updated, startResult := reconciler.StartFresh(ctx, entry)
+					if startResult.Error == nil && startResult.Action == supervisor.ActionEnsured {
+						updated.Transition = registry.ReattachTransition{}
+						if err := store.UpdateEntry(updated); err != nil {
+							return err
+						}
+						a.logReconcileTransition(entry, updated, startResult)
+						results = append(results, startResult)
+						continue
+					}
+					startErr := startResult.Error
+					if startErr == nil {
+						startErr = fmt.Errorf("wake start was deferred with action %q", startResult.Action)
+					}
+					updated.LastError = "reattach start remains blocked and wake_gc_v1 lifecycle operations are unavailable: " + startErr.Error()
+					updated.LastSupervisorDecision = supervisor.ActionBackoff
+					if err := store.UpdateEntry(updated); err != nil {
+						return err
+					}
+					blockedResult := supervisor.Result{Action: supervisor.ActionBackoff, AMQTouched: startResult.AMQTouched, Error: errors.New(updated.LastError)}
+					a.logReconcileTransition(entry, updated, blockedResult)
+					results = append(results, blockedResult)
+					continue
+				}
+				old := transitionPreviousEntry(entry.Transition)
+				updated, ready, recoverErr := recoverDetachedRegistration(ctx, store, []registry.Entry{old}, lifecycle, reconciler, entry)
+				if ready {
+					updated.Transition = registry.ReattachTransition{}
+					if err := store.UpdateEntry(updated); err != nil {
+						return err
+					}
+					recoveredResult := supervisor.Result{Action: supervisor.ActionEnsured, AMQTouched: true}
+					a.logReconcileTransition(entry, updated, recoveredResult)
+					results = append(results, recoveredResult)
+					continue
+				}
+				if recoverErr != nil {
+					updated.LastError = recoverErr.Error()
+					updated.LastSupervisorDecision = supervisor.ActionStartFailed
+					if err := store.UpdateEntry(updated); err != nil {
+						return err
+					}
+					failedResult := supervisor.Result{Action: supervisor.ActionStartFailed, AMQTouched: true, Error: recoverErr}
+					a.logReconcileTransition(entry, updated, failedResult)
+					results = append(results, failedResult)
+					continue
+				}
+			}
+			if gcPolicy.AutoGC {
+				collector := supervisor.GarbageCollector{
+					Wake: lifecycle, InjectVia: self, CapabilityAvailable: capability,
+					CapabilityError: capabilityErr, Policy: gcPolicy,
+				}
+				apply := retiredThisPass < gcMax
+				gcUpdated, gcResult := collector.Process(ctx, entry, apply)
+				if gcResult.Purge {
+					purges = append(purges, previous)
+					results = append(results, supervisor.Result{Action: supervisor.GCStatusPurgeCandidate, GC: &gcResult})
+					continue
+				}
+				entry = gcUpdated
+				a.logGCTransition(previous, entry, gcResult)
+				if previous.State != registry.StateRetired && entry.State == registry.StateRetired {
+					retiredThisPass++
+				}
+				if gcResult.Status == supervisor.GCStatusRetired ||
+					gcResult.Status == supervisor.GCStatusOwnerGoneSeen ||
+					gcResult.Status == supervisor.GCStatusEligible ||
+					entry.State == registry.StateRetired {
+					if previous != entry {
+						updates = append(updates, registry.EntryUpdate{Before: previous, After: entry})
+					}
+					results = append(results, supervisor.Result{Action: gcResult.Status, AMQTouched: gcResult.AMQTouched, GC: &gcResult})
+					continue
+				}
+			}
 			updated, result := reconciler.Reconcile(ctx, entry)
 			if previous != updated {
 				updates = append(updates, registry.EntryUpdate{Before: previous, After: updated})
@@ -547,10 +753,27 @@ func (a App) superviseOnce(ctx context.Context, registryPath string, wake superv
 			a.logReconcileTransition(previous, updated, result)
 			results = append(results, result)
 		}
-		_, err = store.UpdateEntries(updates)
-		return err
+		if _, err = store.UpdateEntries(updates); err != nil {
+			return err
+		}
+		for _, entry := range purges {
+			if _, err := store.ForgetIfUnchanged(entry); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return results, err
+}
+
+func transitionPreviousEntry(transition registry.ReattachTransition) registry.Entry {
+	return registry.Entry{
+		ID: transition.OldID, Root: transition.OldRoot, Agent: transition.OldAgent,
+		Adapter: transition.OldAdapter, Target: transition.OldTarget,
+		BaselineFile: transition.OldBaseline, BaselineDigest: transition.OldBaselineSum,
+		WakeOwnerPresent: transition.OldOwnerSet, WakeOwner: transition.OldOwner,
+		WakeBinding: transition.OldBinding, State: registry.StateAttached,
+	}
 }
 
 func (a App) logReconcileTransition(previous, updated registry.Entry, result supervisor.Result) {
@@ -586,6 +809,25 @@ func (a App) logReconcileTransition(previous, updated registry.Entry, result sup
 			updated.Target,
 		)
 	}
+}
+
+func (a App) logGCTransition(previous, updated registry.Entry, result supervisor.GCResult) {
+	if previous.LastGCDecision == updated.LastGCDecision && previous.LastGCReason == updated.LastGCReason {
+		return
+	}
+	w := a.Stderr
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w,
+		"amq-keepalive gc: status=%s reason_code=%q root=%q agent=%q generation=%q reason=%q\n",
+		result.Status,
+		result.ReasonCode,
+		updated.Root,
+		updated.Agent,
+		updated.WakeBinding.Generation,
+		result.Reason,
+	)
 }
 
 type fixedProbeError struct {
@@ -669,6 +911,9 @@ type targetOwnerKey struct {
 func targetOwnershipConflicts(file registry.File, adapters adapter.Registry) map[string]error {
 	groups := make(map[targetOwnerKey][]registry.Entry)
 	for _, entry := range file.Entries {
+		if entry.State == registry.StateRetired {
+			continue
+		}
 		selected, err := adapters.Get(entry.Adapter)
 		if err != nil {
 			continue
@@ -710,6 +955,9 @@ func physicalOwnershipConflicts(ctx context.Context, file registry.File, probes 
 	groups := make(map[physicalTargetOwnerKey][]registry.Entry)
 	conflicts := make(map[string]error)
 	for _, entry := range file.Entries {
+		if entry.State == registry.StateRetired {
+			continue
+		}
 		probe, ok := probes[entry.Adapter].(ownershipProbe)
 		if !ok {
 			continue
@@ -755,6 +1003,9 @@ func mergeOwnershipConflicts(destination, source map[string]error) {
 
 func anyEntryDue(entries []registry.Entry, now time.Time) bool {
 	for _, entry := range entries {
+		if entry.State == registry.StateRetired {
+			continue
+		}
 		if !entry.NextHealthCheck.IsZero() && now.Before(entry.NextHealthCheck) {
 			continue
 		}
@@ -778,10 +1029,26 @@ func (a App) inject(ctx context.Context, args []string) error {
 	return selected.Inject(ctx, args[1], args[2])
 }
 
-func (a App) doctor(args []string) error {
+type doctorEntry struct {
+	Entry           registry.Entry `json:"entry"`
+	OwnerStatus     string         `json:"owner_status"`
+	BindingStatus   string         `json:"binding_status"`
+	OwnerGoneAge    string         `json:"owner_gone_age,omitempty"`
+	TransitionPhase string         `json:"transition_phase,omitempty"`
+}
+
+type doctorResult struct {
+	SchemaVersion    int           `json:"schema_version"`
+	WakeGCCapability bool          `json:"wake_gc_capability"`
+	CapabilityError  string        `json:"capability_error,omitempty"`
+	Entries          []doctorEntry `json:"entries"`
+}
+
+func (a App) doctor(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 	registryPath := fs.String("registry", mustDefaultRegistryPath(), "registry file path")
+	amqPath := fs.String("amq", "amq", "amq executable path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -790,111 +1057,133 @@ func (a App) doctor(args []string) error {
 	if err != nil {
 		return err
 	}
-	return printJSON(a.Stdout, file)
-}
-
-type gcEntryResult struct {
-	ID            string    `json:"id"`
-	Root          string    `json:"root"`
-	Agent         string    `json:"agent"`
-	Adapter       string    `json:"adapter"`
-	Target        string    `json:"target"`
-	DetachedSince time.Time `json:"detached_since,omitempty"`
-	Status        string    `json:"status"`
-	Reason        string    `json:"reason,omitempty"`
-	PID           int       `json:"pid,omitempty"`
+	result := doctorResult{SchemaVersion: file.SchemaVersion}
+	if environment, envErr := amq.NewCLI(*amqPath).Env(ctx); envErr != nil {
+		result.CapabilityError = envErr.Error()
+	} else {
+		result.WakeGCCapability = environment.HasCapability(amq.CapabilityWakeGCV1)
+	}
+	now := time.Now().UTC()
+	for _, entry := range file.Entries {
+		item := doctorEntry{Entry: entry, TransitionPhase: string(entry.Transition.Phase)}
+		switch {
+		case entry.LegacyUnbound:
+			item.OwnerStatus = "legacy_unbound"
+		case entry.WakeOwnerPresent && entry.WakeOwner.Strong():
+			item.OwnerStatus = "strong"
+		default:
+			item.OwnerStatus = "missing_or_incomplete"
+		}
+		if entry.WakeBinding.Complete() {
+			item.BindingStatus = "exact"
+		} else {
+			item.BindingStatus = "missing_or_incomplete"
+		}
+		if !entry.OwnerGoneSince.IsZero() {
+			item.OwnerGoneAge = now.Sub(entry.OwnerGoneSince).Round(time.Second).String()
+		}
+		result.Entries = append(result.Entries, item)
+	}
+	return printJSON(a.Stdout, result)
 }
 
 type gcResult struct {
-	Applied        bool            `json:"applied"`
-	MinDetachedAge string          `json:"min_detached_age"`
-	Entries        []gcEntryResult `json:"entries"`
+	Applied          bool                  `json:"applied"`
+	WakeGCCapability bool                  `json:"wake_gc_capability"`
+	CapabilityError  string                `json:"capability_error,omitempty"`
+	OwnerGoneGrace   string                `json:"owner_gone_grace"`
+	RetiredRetention string                `json:"retired_retention"`
+	Entries          []supervisor.GCResult `json:"entries"`
 }
 
-// gc is a read-only classifier. Destructive apply remains hard-gated until AMQ
-// exposes a positive identity-safe-retire capability from #235.
 func (a App) gc(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 	registryPath := fs.String("registry", mustDefaultRegistryPath(), "registry file path")
-	fs.String("amq", "amq", "reserved for identity-safe apply after AMQ #235")
-	fs.String("self", executablePath(), "reserved for identity-safe apply after AMQ #235")
-	minDetachedAge := fs.Duration("min-detached-age", 24*time.Hour, "minimum proven-detached age before cleanup")
-	apply := fs.Bool("apply", false, "reserved; currently disabled until AMQ identity-safe retirement #235")
+	amqPath := fs.String("amq", "amq", "amq executable path")
+	self := fs.String("self", executablePath(), "amq-keepalive executable path for exact injector identity")
+	ownerGrace := fs.Duration("owner-gone-grace", 5*time.Minute, "minimum interval between positive owner-gone observations")
+	legacyAge := fs.Duration("min-detached-age", -1, "deprecated alias for --owner-gone-grace")
+	retiredRetention := fs.Duration("retired-retention", 24*time.Hour, "diagnostic retention for retired registry rows")
+	maxRetirements := fs.Int("max-retirements", 1, "maximum wake retirements in this invocation")
+	timeout := fs.Duration("timeout", 5*time.Second, "deadline for each AMQ lifecycle command")
+	apply := fs.Bool("apply", false, "persist observations and retire eligible exact wakes")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *minDetachedAge < 0 {
-		return errors.New("--min-detached-age must not be negative")
+	if *legacyAge >= 0 {
+		*ownerGrace = *legacyAge
 	}
-	if *apply {
-		return fmt.Errorf("gc --apply: %w", errIdentitySafeWakeRetireUnavailable)
+	if *ownerGrace < 0 || *retiredRetention < 0 || *maxRetirements < 1 || *timeout <= 0 || *timeout > 5*time.Second {
+		return errors.New("GC policy requires non-negative grace/retention, max >= 1, and timeout in (0,5s]")
 	}
 
 	store := registry.New(*registryPath)
-	file, err := store.Load()
+	cli := amq.NewCLI(*amqPath)
+	capability := false
+	var capabilityErr error
+	if environment, err := cli.Env(ctx); err != nil {
+		capabilityErr = err
+	} else {
+		capability = environment.HasCapability(amq.CapabilityWakeGCV1)
+	}
+	result := gcResult{
+		Applied: *apply, WakeGCCapability: capability,
+		OwnerGoneGrace: ownerGrace.String(), RetiredRetention: retiredRetention.String(),
+	}
+	if capabilityErr != nil {
+		result.CapabilityError = capabilityErr.Error()
+	}
+	policy := supervisor.GCPolicy{AutoGC: *apply, OwnerGrace: *ownerGrace, RetiredRetention: *retiredRetention, Timeout: *timeout}
+	err := store.WithRegistrationLockContext(ctx, func() error {
+		file, err := store.Load()
+		if err != nil {
+			return err
+		}
+		updates := make([]registry.EntryUpdate, 0)
+		purges := make([]registry.Entry, 0)
+		retired := 0
+		for _, entry := range file.Entries {
+			collector := supervisor.GarbageCollector{
+				Wake: cli, InjectVia: *self, CapabilityAvailable: capability,
+				CapabilityError: capabilityErr, Policy: policy,
+			}
+			updated, item := collector.Process(ctx, entry, *apply && retired < *maxRetirements)
+			if entry.State != registry.StateRetired && updated.State == registry.StateRetired {
+				retired++
+			}
+			if item.Purge && *apply {
+				purges = append(purges, entry)
+			} else if updated != entry && *apply {
+				updates = append(updates, registry.EntryUpdate{Before: entry, After: updated})
+			}
+			result.Entries = append(result.Entries, item)
+		}
+		if _, err := store.UpdateEntries(updates); err != nil {
+			return err
+		}
+		for _, entry := range purges {
+			if _, err := store.ForgetIfUnchanged(entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	adapters := adapter.DefaultRegistry()
-	probes := passProbes(file.Entries, adapters)
-	conflicts := targetOwnershipConflicts(file, adapters)
-	mergeOwnershipConflicts(conflicts, physicalOwnershipConflicts(ctx, file, probes))
-	now := time.Now().UTC()
-	result := gcResult{Applied: *apply, MinDetachedAge: minDetachedAge.String()}
-	for _, entry := range file.Entries {
-		item := gcEntryResult{
-			ID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter,
-			Target: entry.Target, DetachedSince: entry.DetachedSince,
-		}
-		result.Entries = append(result.Entries, item)
-		index := len(result.Entries) - 1
-		if entry.State != registry.StateDetached {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = "entry is not detached"
-			continue
-		}
-		if entry.DetachedSince.IsZero() {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = "detached_since is not yet established by the fixed supervisor"
-			continue
-		}
-		if age := now.Sub(entry.DetachedSince); age < *minDetachedAge {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = fmt.Sprintf("detached for %s; minimum is %s", age.Round(time.Second), minDetachedAge.String())
-			continue
-		}
-		if conflictErr, ok := conflicts[entry.ID]; ok {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = conflictErr.Error()
-			continue
-		}
-		selected, selectErr := adapters.Get(entry.Adapter)
-		if selectErr != nil {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = selectErr.Error()
-			continue
-		}
-		target, normalizeErr := normalizedTarget(selected, entry.Target)
-		if normalizeErr != nil {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = normalizeErr.Error()
-			continue
-		}
-		probeErr := probes[entry.Adapter].Probe(ctx, target)
-		if probeErr == nil {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = "adapter target currently exists"
-			continue
-		}
-		if !errors.Is(probeErr, adapter.ErrTargetNotFound) {
-			result.Entries[index].Status = "skipped"
-			result.Entries[index].Reason = "target absence is ambiguous: " + probeErr.Error()
-			continue
-		}
-		result.Entries[index].Status = "candidate"
+	if err := printJSON(a.Stdout, result); err != nil {
+		return err
 	}
-	return printJSON(a.Stdout, result)
+	if *apply {
+		if capabilityErr != nil {
+			return fmt.Errorf("gc --apply capability check failed: %w", capabilityErr)
+		}
+		if !capability {
+			return fmt.Errorf("gc --apply: %w", errIdentitySafeWakeRetireUnavailable)
+		}
+	}
+	return nil
 }
 
 func normalizedTarget(selected adapter.Adapter, target string) (string, error) {
@@ -1047,9 +1336,17 @@ func (a App) installLaunchd(ctx context.Context, args []string) error {
 	amqPath := fs.String("amq", "amq", "amq executable path")
 	self := fs.String("self", executablePath(), "amq-keepalive executable path")
 	interval := fs.Duration("interval", time.Minute, "supervisor interval")
+	autoGC := fs.Bool("auto-gc", false, "enable owner-bound automatic wake retirement")
+	ownerGrace := fs.Duration("owner-gone-grace", 5*time.Minute, "minimum interval between positive owner-gone observations")
+	retention := fs.Duration("retired-retention", 24*time.Hour, "diagnostic retention for retired registry rows")
+	gcMax := fs.Int("gc-max-per-pass", 1, "maximum wake retirements per supervisor pass")
+	gcTimeout := fs.Duration("gc-timeout", 5*time.Second, "deadline for each AMQ lifecycle command")
 	noLoad := fs.Bool("no-load", false, "write plist without loading it")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *interval <= 0 || *ownerGrace <= 0 || *retention <= 0 || *gcMax < 1 || *gcTimeout <= 0 || *gcTimeout > 5*time.Second {
+		return errors.New("launchd policy requires positive interval/grace/retention, max >= 1, and timeout in (0,5s]")
 	}
 	opts := launchd.Options{
 		Label:        *label,
@@ -1058,6 +1355,11 @@ func (a App) installLaunchd(ctx context.Context, args []string) error {
 		RegistryPath: *registryPath,
 		AMQPath:      *amqPath,
 		Interval:     *interval,
+		AutoGC:       *autoGC,
+		OwnerGrace:   *ownerGrace,
+		Retention:    *retention,
+		GCMaxPerPass: *gcMax,
+		GCTimeout:    *gcTimeout,
 		Load:         !*noLoad,
 	}
 	normalized, err := launchd.NormalizeOptions(opts)

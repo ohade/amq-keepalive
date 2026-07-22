@@ -27,19 +27,23 @@ done
 if [ -z "$ready" ]; then
   exit 11
 fi
-printf ready > "$ready"
+printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$ready"
 `)
 
-	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+	binding, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root:      "/tmp/amq-root",
 		Me:        "codex",
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
 		Timeout:   5 * time.Second,
+		Owner:     testWakeOwner(),
 	})
 	if err != nil {
 		t.Fatalf("StartWake() error = %v", err)
+	}
+	if !binding.Complete() {
+		t.Fatalf("binding = %#v", binding)
 	}
 	data, err := os.ReadFile(argsLog)
 	if err != nil {
@@ -56,7 +60,9 @@ printf ready > "$ready"
 		"-inject-arg\nghostty\n",
 		"-inject-arg\nghostty:terminal:abc\n",
 		"--accept-existing-wake\n",
+		"--require-owner\n",
 		"-ready-file\n",
+		"--result-file\n",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("args log missing %q:\n%s", want, args)
@@ -80,14 +86,14 @@ func TestStartWakePassesExactRegisteredBaseline(t *testing.T) {
 printf '%s\n' "$@" > "$AMQ_KEEPALIVE_ARGS_LOG"
 previous=""
 for arg in "$@"; do
-  if [ "$previous" = "-ready-file" ]; then printf ready > "$arg"; fi
+  if [ "$previous" = "-ready-file" ]; then printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$arg"; fi
   previous="$arg"
 done
 `)
-	if err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+	if _, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
 		Adapter: "cmux", Target: "cmux:surface:abc", BaselineFile: baseline,
-		BaselineDigest: digest, Timeout: 5 * time.Second,
+		BaselineDigest: digest, Timeout: 5 * time.Second, Owner: testWakeOwner(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +122,9 @@ func TestStartWakeRejectsChangedOrUnsafeBaselineBeforeExec(t *testing.T) {
 	if err := os.WriteFile(baseline, []byte("second\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err = NewCLI(filepath.Join(dir, "must-not-run")).StartWake(context.Background(), StartWakeRequest{
+	_, err = NewCLI(filepath.Join(dir, "must-not-run")).StartWake(context.Background(), StartWakeRequest{
 		InjectVia: "/tmp/amq-keepalive", Adapter: "cmux", Target: "cmux:surface:abc",
-		BaselineFile: baseline, BaselineDigest: digest,
+		BaselineFile: baseline, BaselineDigest: digest, Owner: testWakeOwner(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "digest changed") {
 		t.Fatalf("changed baseline error = %v", err)
@@ -138,13 +144,14 @@ func TestStartWakeFailsWhenProcessExitsBeforeReady(t *testing.T) {
 exit 7
 `)
 
-	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+	_, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root:      "/tmp/amq-root",
 		Me:        "codex",
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
 		Timeout:   5 * time.Second,
+		Owner:     testWakeOwner(),
 	})
 	if err == nil {
 		t.Fatal("StartWake() error = nil, want readiness failure")
@@ -171,15 +178,15 @@ for arg in "$@"; do
 done
 [ -n "$ready" ] || exit 11
 printf '%s' "$ready" > "$AMQ_KEEPALIVE_READY_PATH_LOG"
-printf ready > "$ready"
+printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$ready"
 while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 [ -d "${ready%/*}" ] || exit 12
 : > "$AMQ_KEEPALIVE_POST_READY"
 `)
 
-	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+	_, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
-		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second,
+		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second, Owner: testWakeOwner(),
 	})
 	if err != nil {
 		t.Fatalf("StartWake() error = %v", err)
@@ -221,7 +228,7 @@ for arg in "$@"; do
 done
 [ -n "$ready" ] || exit 11
 printf '%s' "$ready" > "$AMQ_KEEPALIVE_READY_PATH_LOG"
-printf ready > "$ready"
+printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$ready"
 while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do
   if [ -f "$AMQ_KEEPALIVE_CHECK" ]; then : > "$AMQ_KEEPALIVE_ALIVE"; fi
   sleep 0.01
@@ -229,9 +236,9 @@ done
 `)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	err := NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
+	_, err := NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
 		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
-		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second,
+		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second, Owner: testWakeOwner(),
 	})
 	if err != nil {
 		t.Fatalf("StartWake() error = %v", err)
@@ -271,17 +278,18 @@ done
 [ -n "$ready" ] || exit 11
 : > "$AMQ_KEEPALIVE_STARTED"
 while [ ! -f "$AMQ_KEEPALIVE_ALLOW_READY" ]; do sleep 0.01; done
-printf ready > "$ready"
+printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$ready"
 : > "$AMQ_KEEPALIVE_LATE_READY"
 while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 `)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
+		_, err := NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
 			Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
-			Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second,
+			Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second, Owner: testWakeOwner(),
 		})
+		done <- err
 	}()
 	waitForFile(t, started, 2*time.Second)
 	cancel()
@@ -305,13 +313,14 @@ sleep 0.2
 `)
 
 	start := time.Now()
-	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+	_, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root:      "/tmp/amq-root",
 		Me:        "codex",
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
 		Timeout:   50 * time.Millisecond,
+		Owner:     testWakeOwner(),
 	})
 	if err == nil {
 		t.Fatal("StartWake() error = nil, want readiness timeout")
@@ -321,6 +330,147 @@ sleep 0.2
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("StartWake took %s, want timeout branch to return promptly", elapsed)
+	}
+}
+
+func TestWakeOwnerParsingRequiresStrongIdentityAndSurfacesCaptureError(t *testing.T) {
+	owner, err := ParseWakeOwner(`{"pid":42,"process_start":"start-1","boot_id":"boot-1","session_id":42}`)
+	if err != nil || !owner.Strong() {
+		t.Fatalf("owner=%#v err=%v", owner, err)
+	}
+	for _, raw := range []string{"", `{"pid":42}`, `{"pid":42,"process_start":"start-1","boot_id":"boot-1","extra":true}`, `{"pid":42,"process_start":"start-1","boot_id":"boot-1"} {}`} {
+		if _, err := ParseWakeOwner(raw); err == nil {
+			t.Fatalf("ParseWakeOwner(%q) succeeded", raw)
+		}
+	}
+	t.Setenv("AMQ_WAKE_OWNER", `{"pid":42,"process_start":"start-1","boot_id":"boot-1"}`)
+	t.Setenv("AMQ_WAKE_OWNER_ERROR", "owner capture unavailable")
+	if _, err := WakeOwnerFromEnvironment(); err == nil || !strings.Contains(err.Error(), "owner capture unavailable") {
+		t.Fatalf("capture error=%v", err)
+	}
+}
+
+func TestStartWakePassesOnlyRequestedOwnerEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	ownerLog := filepath.Join(dir, "owner.log")
+	t.Setenv("AMQ_KEEPALIVE_OWNER_LOG", ownerLog)
+	t.Setenv("AMQ_WAKE_OWNER", `{"pid":999,"process_start":"stale","boot_id":"stale"}`)
+	t.Setenv("AMQ_WAKE_OWNER_ERROR", "stale daemon error")
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '%s\n%s\n' "$AMQ_WAKE_OWNER" "${AMQ_WAKE_OWNER_ERROR-unset}" > "$AMQ_KEEPALIVE_OWNER_LOG"
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-ready-file" ]; then printf '{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"}\n' > "$arg"; fi
+  previous="$arg"
+done
+`)
+	if _, err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
+		Owner: testWakeOwner(), Timeout: time.Second,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(ownerLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"pid":42,"process_start":"start-1","boot_id":"boot-1","session_id":42}` + "\nunset\n"
+	if string(data) != want {
+		t.Fatalf("owner env=%q want=%q", data, want)
+	}
+}
+
+func TestRetireWakeParsesStructuredNonzeroAndRequiresExactEcho(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '{"status":"refused","reason_code":"owner_live","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+exit 1
+`)
+	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
+	request := RetireWakeRequest{
+		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
+		Generation: "generation-1", TargetDigest: "sha256:target-1", RequireOwnerGone: true, Check: true,
+	}
+	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), request)
+	if err == nil || result.Status != "refused" || result.ReasonCode != "owner_live" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	request.Generation = "different"
+	if _, err := NewCLI(fakeAMQ).RetireWake(context.Background(), request); err == nil || !strings.Contains(err.Error(), "generation/digest mismatch") {
+		t.Fatalf("mismatch error=%v", err)
+	}
+}
+
+func TestRetireWakeAcceptsOnlyIdentityConfirmedSupersededBinding(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '{"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_target_digest":"sha256:target-2","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+`)
+	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
+		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
+		Generation: "generation-1", TargetDigest: "sha256:target-1", RequireOwnerGone: true,
+	})
+	if err != nil || result.Status != "superseded" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestRetireWakeAcceptsExplicitRawSupersededBinding(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '{"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_wake_mode":"raw"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+`)
+	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
+		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
+		Generation: "generation-1", TargetDigest: "sha256:target-1", RequireOwnerGone: true,
+	})
+	if err != nil || result.Status != "superseded" || result.CurrentWakeMode != "raw" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestSupersededReplacementProofRejectsAmbiguousModes(t *testing.T) {
+	request := RetireWakeRequest{Generation: "generation-1", TargetDigest: "sha256:target-1"}
+	base := RetireWakeResult{
+		Status: "superseded", ReasonCode: "generation_superseded",
+		CurrentGeneration: "generation-2", CurrentTargetDigest: "sha256:target-2",
+	}
+	for _, result := range []RetireWakeResult{
+		base,
+		func() RetireWakeResult { value := base; value.CurrentWakeMode = "unknown"; return value }(),
+		func() RetireWakeResult { value := base; value.CurrentWakeMode = "raw"; return value }(),
+		func() RetireWakeResult {
+			value := base
+			value.CurrentWakeMode = "owner_bound"
+			value.CurrentGeneration = request.Generation
+			return value
+		}(),
+	} {
+		if SupersededProvesReplacement(request, result) {
+			t.Fatalf("ambiguous result accepted: %#v", result)
+		}
+	}
+}
+
+func TestReadWakeBindingRejectsTrailingJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready.json")
+	if err := os.WriteFile(path, []byte(`{"schema":1,"generation":"generation-1","target_digest":"sha256:target-1"} {}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readWakeBinding(path); err == nil || !strings.Contains(err.Error(), "trailing JSON") {
+		t.Fatalf("readWakeBinding() error=%v", err)
+	}
+}
+
+func TestBoundedBufferDiscardsExcessWithoutBlockingChild(t *testing.T) {
+	buffer := newBoundedBuffer(3)
+	if written, err := buffer.Write([]byte("hello")); err != nil || written != 5 {
+		t.Fatalf("Write() written=%d err=%v", written, err)
+	}
+	if got := buffer.String(); got != "hel" || !buffer.Exceeded() {
+		t.Fatalf("buffer=%q exceeded=%v", got, buffer.Exceeded())
 	}
 }
 
@@ -362,10 +512,15 @@ func TestNewWakeReadyPathScavengesOnlyStaleMarkers(t *testing.T) {
 func writeExecutable(t *testing.T, path string, body string) string {
 	t.Helper()
 	t.Setenv("AMQ_KEEPALIVE_CACHE_DIR", filepath.Join(filepath.Dir(path), "cache"))
+	body = strings.Replace(body, "#!/bin/sh\n", "#!/bin/sh\numask 077\n", 1)
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write executable: %v", err)
 	}
 	return path
+}
+
+func testWakeOwner() WakeOwner {
+	return WakeOwner{PID: 42, ProcessStart: "start-1", BootID: "boot-1", SessionID: 42}
 }
 
 func waitForFile(t *testing.T, path string, timeout time.Duration) {

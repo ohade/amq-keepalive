@@ -31,7 +31,7 @@ type Adapter interface {
 }
 
 type WakeRunner interface {
-	StartWake(ctx context.Context, req amq.StartWakeRequest) error
+	StartWake(ctx context.Context, req amq.StartWakeRequest) (amq.WakeBinding, error)
 }
 
 type Reconciler struct {
@@ -49,9 +49,10 @@ type Reconciler struct {
 }
 
 type Result struct {
-	Action     string
-	AMQTouched bool
-	Error      error
+	Action     string    `json:"action"`
+	AMQTouched bool      `json:"amq_touched"`
+	Error      error     `json:"-"`
+	GC         *GCResult `json:"gc,omitempty"`
 }
 
 func (r Reconciler) Reconcile(ctx context.Context, entry registry.Entry) (registry.Entry, Result) {
@@ -88,6 +89,13 @@ func (r Reconciler) checkLocalReadiness(ctx context.Context, entry registry.Entr
 	if !entry.BackoffUntil.IsZero() && now.Before(entry.BackoffUntil) {
 		return entry, Result{Action: ActionDeferred}, true
 	}
+	if entry.State == registry.StateRetired {
+		return entry, Result{Action: ActionDeferred}, true
+	}
+	if entry.LegacyUnbound || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong() {
+		updated, result := r.markBackoff(entry, now, errors.New("owner-bound wake metadata is unavailable"), ActionBackoff, false)
+		return updated, result, true
+	}
 	entry.LastSeenBySupervisor = now
 
 	if r.Adapter == nil {
@@ -114,7 +122,7 @@ func (r Reconciler) checkLocalReadiness(ctx context.Context, entry registry.Entr
 }
 
 func (r Reconciler) ensureWake(ctx context.Context, entry registry.Entry, now time.Time) (registry.Entry, Result) {
-	err := r.Wake.StartWake(ctx, amq.StartWakeRequest{
+	binding, err := r.Wake.StartWake(ctx, amq.StartWakeRequest{
 		Root:           entry.Root,
 		Me:             entry.Agent,
 		InjectVia:      r.InjectVia,
@@ -123,8 +131,17 @@ func (r Reconciler) ensureWake(ctx context.Context, entry registry.Entry, now ti
 		BaselineFile:   entry.BaselineFile,
 		BaselineDigest: entry.BaselineDigest,
 		Timeout:        r.WakeTimeout,
+		Owner: amq.WakeOwner{
+			PID: entry.WakeOwner.PID, ProcessStart: entry.WakeOwner.ProcessStart,
+			BootID: entry.WakeOwner.BootID, SessionID: entry.WakeOwner.SessionID,
+		},
 	})
 	if err == nil {
+		if !binding.Complete() {
+			return r.markBackoff(entry, now, errors.New("amq wake returned an incomplete binding"), ActionStartFailed, true)
+		}
+		entry.WakeBinding = registry.WakeBinding{Generation: binding.Generation, TargetDigest: binding.TargetDigest}
+		entry.OwnerGoneSince = time.Time{}
 		return r.markActive(entry, now, ActionEnsured), Result{Action: ActionEnsured, AMQTouched: true}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {

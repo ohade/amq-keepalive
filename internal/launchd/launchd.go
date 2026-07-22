@@ -24,6 +24,11 @@ type Options struct {
 	RegistryPath string
 	AMQPath      string
 	Interval     time.Duration
+	AutoGC       bool
+	OwnerGrace   time.Duration
+	Retention    time.Duration
+	GCMaxPerPass int
+	GCTimeout    time.Duration
 	StdoutPath   string
 	StderrPath   string
 	Load         bool
@@ -108,6 +113,18 @@ func NormalizeOptions(opts Options) (Options, error) {
 	if opts.Interval <= 0 {
 		opts.Interval = time.Minute
 	}
+	if opts.OwnerGrace <= 0 {
+		opts.OwnerGrace = 5 * time.Minute
+	}
+	if opts.Retention <= 0 {
+		opts.Retention = 24 * time.Hour
+	}
+	if opts.GCMaxPerPass <= 0 {
+		opts.GCMaxPerPass = 1
+	}
+	if opts.GCTimeout <= 0 || opts.GCTimeout > 5*time.Second {
+		opts.GCTimeout = 5 * time.Second
+	}
 	if opts.PlistPath == "" {
 		path, err := DefaultPlistPath(opts.Label)
 		if err != nil {
@@ -191,6 +208,11 @@ func BuildPlist(opts Options) []byte {
 		"--amq", opts.AMQPath,
 		"--self", opts.BinaryPath,
 		"--interval", opts.Interval.String(),
+		"--auto-gc=" + strconv.FormatBool(opts.AutoGC),
+		"--owner-gone-grace", opts.OwnerGrace.String(),
+		"--retired-retention", opts.Retention.String(),
+		"--gc-max-per-pass", strconv.Itoa(opts.GCMaxPerPass),
+		"--gc-timeout", opts.GCTimeout.String(),
 	}
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
