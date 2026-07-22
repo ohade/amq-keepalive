@@ -1,14 +1,19 @@
 package registry
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+var _ = func(first, second Entry) bool { return first == second }
 
 func TestStoreUpsertRoundTripAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".amq-keepalive", "registry.json")
@@ -510,6 +515,126 @@ func TestStoreCorruptRegistryReturnsTypedError(t *testing.T) {
 	_, err := store.Load()
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Load() error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestStoreMigratesV1WithSecureBackupAndLegacyFailClosedState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active"}]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := New(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SchemaVersion != 2 || len(loaded.Entries) != 1 || !loaded.Entries[0].LegacyUnbound || loaded.Entries[0].WakeOwnerPresent {
+		t.Fatalf("migrated registry=%#v", loaded)
+	}
+	backup := path + ".v1.bak"
+	backupData, err := os.ReadFile(backup)
+	if err != nil || !bytes.Equal(backupData, v1) {
+		t.Fatalf("backup=%q err=%v", backupData, err)
+	}
+	if info, err := os.Stat(backup); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode=%v err=%v", info.Mode().Perm(), err)
+	}
+	var disk File
+	data, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(data, &disk) != nil || disk.SchemaVersion != 2 {
+		t.Fatalf("migrated disk=%q err=%v", data, err)
+	}
+}
+
+func TestStoreRefusesV1MigrationWhenExistingBackupDoesNotMatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".v1.bak", []byte("different\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path).Load(); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("Load() error=%v, want mismatched backup refusal", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, v1) {
+		t.Fatalf("v1 registry changed after refusal: data=%q err=%v", data, err)
+	}
+}
+
+func TestReplaceSessionAdapterPersistsComparableReattachTransition(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	old, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/old",
+		WakeOwnerPresent: true,
+		WakeOwner:        WakeOwner{PID: 42, ProcessStart: "start-1", BootID: "boot-1", SessionID: 42},
+		WakeBinding:      WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, removed, err := store.ReplaceSessionAdapter(Entry{Root: old.Root, Agent: old.Agent, Adapter: "file", Target: "/tmp/new"})
+	if err != nil || len(removed) != 1 {
+		t.Fatalf("next=%#v removed=%#v err=%v", next, removed, err)
+	}
+	transition := next.Transition
+	if transition.Phase != TransitionReserved || transition.Revision != 1 || transition.OldID != old.ID ||
+		transition.OldOwner != old.WakeOwner || transition.OldBinding != old.WakeBinding {
+		t.Fatalf("transition=%#v old=%#v", transition, old)
+	}
+	replacement, removedAgain, err := store.ReplaceSessionAdapter(Entry{
+		Root: old.Root, Agent: old.Agent, Adapter: "file", Target: "/tmp/newer",
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 84, ProcessStart: "start-2", BootID: "boot-1"},
+	})
+	if err != nil || len(removedAgain) != 1 {
+		t.Fatalf("replacement=%#v removed=%#v err=%v", replacement, removedAgain, err)
+	}
+	if replacement.Transition.Revision != 2 || replacement.Transition.OldID != old.ID ||
+		replacement.Transition.OldBinding != old.WakeBinding {
+		t.Fatalf("nested transition lost original exact wake: %#v", replacement.Transition)
+	}
+}
+
+func TestRetiredEntryDoesNotBlockImmediateTargetReplacement(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if _, err := store.Upsert(Entry{Root: "/tmp/old", Agent: "codex", Adapter: "file", Target: "/tmp/shared", State: StateRetired}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Upsert(Entry{Root: "/tmp/new", Agent: "claude", Adapter: "file", Target: "/tmp/shared"}); err != nil {
+		t.Fatalf("retired row blocked replacement: %v", err)
+	}
+}
+
+func TestReplaceSessionAdapterIgnoresRetiredHistoryWhenSelectingLiveTransition(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	retired, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/retired", State: StateRetired,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 10, ProcessStart: "old", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "retired-generation", TargetDigest: "retired-digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/live", State: StateActive,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 20, ProcessStart: "live", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "live-generation", TargetDigest: "live-digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, removed, err := store.ReplaceSessionAdapter(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/next",
+	})
+	if err != nil || len(removed) != 2 {
+		t.Fatalf("next=%#v removed=%#v err=%v", next, removed, err)
+	}
+	if next.Transition.OldID != live.ID || next.Transition.OldID == retired.ID || next.Transition.OldBinding != live.WakeBinding {
+		t.Fatalf("transition=%#v retired=%#v live=%#v", next.Transition, retired, live)
 	}
 }
 

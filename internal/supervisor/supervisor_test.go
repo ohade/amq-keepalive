@@ -24,9 +24,9 @@ func (f *fakeWake) RepairWake(ctx context.Context, root, me string) (amq.WakeRep
 	return amq.WakeRepairResult{Status: "repaired", Reason: "would restore persisted target"}, nil
 }
 
-func (f *fakeWake) StartWake(ctx context.Context, req amq.StartWakeRequest) error {
+func (f *fakeWake) StartWake(ctx context.Context, req amq.StartWakeRequest) (amq.WakeBinding, error) {
 	f.starts = append(f.starts, req)
-	return f.startErr
+	return amq.WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"}, f.startErr
 }
 
 type probeAdapter struct {
@@ -315,12 +315,14 @@ func testReconciler(wake *fakeWake, adapter probeAdapter, now time.Time) Reconci
 
 func testEntry() registry.Entry {
 	return registry.Entry{
-		ID:      "entry-1",
-		Root:    "/tmp/amq-root",
-		Agent:   "codex",
-		Adapter: "file",
-		Target:  "/tmp/inbox.txt",
-		State:   registry.StateAttached,
+		ID:               "entry-1",
+		Root:             "/tmp/amq-root",
+		Agent:            "codex",
+		Adapter:          "file",
+		Target:           "/tmp/inbox.txt",
+		State:            registry.StateAttached,
+		WakeOwnerPresent: true,
+		WakeOwner:        registry.WakeOwner{PID: 42, ProcessStart: "start-1", BootID: "boot-1", SessionID: 42},
 	}
 }
 
