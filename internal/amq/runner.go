@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/executable"
 )
 
 var ErrAlreadyRunning = errors.New("amq wake already running")
@@ -185,17 +187,19 @@ func (e *WakeStartError) Error() string {
 func (e *WakeStartError) Unwrap() error { return e.Cause }
 
 type RetireWakeRequest struct {
-	Root             string
-	Me               string
-	InjectVia        string
-	Adapter          string
-	Target           string
-	Generation       string
-	TargetDigest     string
-	RequireOwnerGone bool
-	Check            bool
-	Manual           bool
-	Timeout          time.Duration
+	Root                   string
+	Me                     string
+	InjectVia              string
+	Adapter                string
+	Target                 string
+	Generation             string
+	TargetDigest           string
+	RequireOwnerGone       bool
+	Check                  bool
+	Manual                 bool
+	Timeout                time.Duration
+	ExpectedAMQIdentity    executable.Identity
+	ExpectedInjectIdentity executable.Identity
 }
 
 type CLI struct {
@@ -412,6 +416,9 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeR
 		return RetireWakeResult{}, errors.New("exact root, agent, injector, adapter, and target are required")
 	}
 	if req.Manual {
+		if err := c.validateManualExecutableBindings(req); err != nil {
+			return RetireWakeResult{}, err
+		}
 		if req.RequireOwnerGone {
 			return RetireWakeResult{}, errors.New("manual retirement cannot require automated owner-gone proof")
 		}
@@ -448,7 +455,14 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeR
 	}
 	commandCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	stdout, stderr, runErr := c.run(commandCtx, args...)
+	var stdout []byte
+	var stderr string
+	var runErr error
+	if req.Manual {
+		stdout, stderr, runErr = c.runExpected(commandCtx, req.ExpectedAMQIdentity, req.ExpectedInjectIdentity, args...)
+	} else {
+		stdout, stderr, runErr = c.run(commandCtx, args...)
+	}
 	var result RetireWakeResult
 	var parseErr error
 	if req.Manual {
@@ -531,6 +545,65 @@ type wakeProcessResult struct {
 
 func (c CLI) run(ctx context.Context, args ...string) ([]byte, string, error) {
 	cmd := exec.CommandContext(ctx, c.Path, args...)
+	return runCommand(cmd)
+}
+
+func (c CLI) validateManualExecutableBindings(req RetireWakeRequest) error {
+	if !req.ExpectedAMQIdentity.Complete() || !req.ExpectedInjectIdentity.Complete() {
+		return errors.New("manual retirement requires complete AMQ and inject-via executable identities")
+	}
+	amqPath, err := canonicalExecutablePath(c.Path)
+	if err != nil {
+		return fmt.Errorf("resolve AMQ executable for manual retirement: %w", err)
+	}
+	injectPath, err := canonicalExecutablePath(req.InjectVia)
+	if err != nil {
+		return fmt.Errorf("resolve inject-via executable for manual retirement: %w", err)
+	}
+	if amqPath != req.ExpectedAMQIdentity.Path || injectPath != req.ExpectedInjectIdentity.Path {
+		return errors.New("manual retirement executable path does not match the confirmed executable identity")
+	}
+	return nil
+}
+
+func canonicalExecutablePath(path string) (string, error) {
+	if !strings.ContainsRune(path, filepath.Separator) {
+		resolved, err := exec.LookPath(path)
+		if err != nil {
+			return "", err
+		}
+		path = resolved
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(real), nil
+}
+
+func (c CLI) runExpected(ctx context.Context, amqIdentity, injectIdentity executable.Identity, args ...string) ([]byte, string, error) {
+	// A Darwin verified snapshot must never become an updater target. The
+	// manual retirement path is short-lived and already release-pinned by its
+	// executable identity, so suppress AMQ's unrelated self-update check.
+	args = append([]string{"--no-update-check"}, args...)
+	cmd, cleanup, err := executable.CommandContext(ctx, amqIdentity, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("verify AMQ executable: %w", err)
+	}
+	defer cleanup()
+	// Revalidate inject-via only after AMQ is pinned and immediately before the
+	// subprocess inspects that target path.
+	if err := executable.Verify(injectIdentity); err != nil {
+		return nil, "", fmt.Errorf("verify inject-via executable: %w", err)
+	}
+	return runCommand(cmd)
+}
+
+func runCommand(cmd *exec.Cmd) ([]byte, string, error) {
 	cmd.Env = environmentWithout(os.Environ(), "AMQ_WAKE_OWNER", "AMQ_WAKE_OWNER_ERROR")
 	stdout := newBoundedBuffer(maxCLIOutputBytes)
 	stderr := newBoundedBuffer(maxCLIOutputBytes)
@@ -813,7 +886,8 @@ func parseRetireResultWithPolicy(data []byte, requireBinding bool) (RetireWakeRe
 			"target_mismatch", "owner_missing", "owner_live", "owner_uninspectable", "generation_changed",
 			"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
 			"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
-			"manual_target_missing", "manual_target_mismatch", "manual_wake_changed":
+			"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
+			"manual_retirement_proof_mismatch":
 		default:
 			return RetireWakeResult{}, fmt.Errorf("refused response has unknown reason_code %q", result.ReasonCode)
 		}

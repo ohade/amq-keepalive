@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ohade/amq-keepalive/internal/amq"
+	"github.com/ohade/amq-keepalive/internal/executable"
 	"github.com/ohade/amq-keepalive/internal/registry"
 	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
@@ -1301,15 +1302,23 @@ func TestPendingManualRetirementBlocksWholeRootGCWithoutMutation(t *testing.T) {
 		ID: "legacy", Root: root, Agent: "legacy", Adapter: "file", Target: filepath.Join(root, "legacy.target"),
 		State: registry.StateDetached, LegacyUnbound: true, NextHealthCheck: now.Add(24 * time.Hour),
 	}
+	identity, err := executable.Capture("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
 	pending.ManualRetirementIntent = registry.ManualRetirementIntent{
 		PlanID: strings.Repeat("a", 64), RowDigest: strings.Repeat("b", 64), Root: root,
 		Agent: pending.Agent, Adapter: pending.Adapter, Target: pending.Target,
-		AMQExecutable: "/bin/sh", InjectVia: "/bin/sh", TimeoutNanos: int64(time.Second),
-		Generation: "legacy-generation", TargetDigest: "sha256:legacy", StartedAt: now,
+		AMQExecutable: identity.Path, InjectVia: identity.Path, AMQIdentity: identity, InjectIdentity: identity,
+		TimeoutNanos: int64(time.Second),
+		Generation:   "legacy-generation", TargetDigest: "sha256:legacy", StartedAt: now,
 	}
 	sibling := gcRootBatchEntry("owner-bound", root, now.Add(-10*time.Minute))
 	sibling.NextHealthCheck = now.Add(24 * time.Hour)
-	entries := []registry.Entry{pending, sibling}
+	expired := sibling
+	expired.ID, expired.Agent, expired.Target = "retired-sibling", "retired", filepath.Join(root, "retired.target")
+	expired.State, expired.RetiredAt = registry.StateRetired, now.Add(-48*time.Hour)
+	entries := []registry.Entry{pending, sibling, expired}
 	plan, err := planGCRootBatch(entries, now, gcBatchPolicy())
 	if err != nil || plan.Canonical != "" || len(plan.Members) != 0 {
 		t.Fatalf("pending root plan=%#v err=%v", plan, err)
@@ -1333,6 +1342,30 @@ func TestPendingManualRetirementBlocksWholeRootGCWithoutMutation(t *testing.T) {
 	after, err := store.Load()
 	if err != nil || !reflect.DeepEqual(before, after) {
 		t.Fatalf("pending root changed:\nbefore=%#v\nafter=%#v\nerr=%v", before, after, err)
+	}
+	beforeBytes, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeAMQ := filepath.Join(dir, "amq")
+	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
+if [ "$1" = "env" ]; then
+  printf '{"schema_version":1,"amq_version":"test","root":"/tmp/root","base_root":"/tmp","session_name":"root","in_session":true,"me":"worker","project":"test","root_source":"flag","peers":{},"capabilities":["wake_gc_v1"]}\n'
+  exit 0
+fi
+exit 97
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: io.Discard, Now: func() time.Time { return now }}).gc(context.Background(), []string{
+		"--registry", registryPath, "--amq", fakeAMQ, "--self", "/bin/sh", "--apply",
+	}); err != nil {
+		t.Fatalf("standalone gc --apply: %v output=%s", err, stdout.String())
+	}
+	afterBytes, err := os.ReadFile(registryPath)
+	if err != nil || !bytes.Equal(beforeBytes, afterBytes) {
+		t.Fatalf("standalone gc --apply changed frozen root bytes: err=%v\nbefore=%s\nafter=%s", err, beforeBytes, afterBytes)
 	}
 }
 

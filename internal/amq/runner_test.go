@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/executable"
 )
 
 func TestStartWakeWaitsForReadyFileAndPassesTarget(t *testing.T) {
@@ -438,9 +440,19 @@ generation=generation-1
 printf '{"schema":1,"status":"%s","reason_code":"%s","root":"%s","agent":"codex","lock":"%s/agents/codex/.wake.lock","target":"%s/agents/codex/.wake.target","generation":"%s","target_digest":"sha256:target-1","future_field":true}\n' "$status" "$reason" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$generation"
 `)
 	cli := NewCLI(fakeAMQ)
+	self := writeExecutable(t, filepath.Join(dir, "amq-keepalive"), "#!/bin/sh\nexit 0\n")
+	amqIdentity, err := executable.Capture(fakeAMQ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfIdentity, err := executable.Capture(self)
+	if err != nil {
+		t.Fatal(err)
+	}
 	base := RetireWakeRequest{
-		Root: dir, Me: "codex", InjectVia: "/opt/amq-keepalive", Adapter: "synthetic", Target: "surface-alpha",
+		Root: dir, Me: "codex", InjectVia: selfIdentity.Path, Adapter: "synthetic", Target: "surface-alpha",
 		Manual: true, Check: true, Timeout: time.Second,
+		ExpectedAMQIdentity: amqIdentity, ExpectedInjectIdentity: selfIdentity,
 	}
 	checked, err := cli.RetireWake(context.Background(), base)
 	if err != nil || checked.Status != "eligible" || checked.ReasonCode != "manual_eligible" || checked.Generation == "" || checked.TargetDigest == "" {
@@ -484,6 +496,65 @@ printf '{"schema":1,"status":"%s","reason_code":"%s","root":"%s","agent":"codex"
 	t.Setenv("AMQ_KEEPALIVE_MANUAL_MODE", "unexpected")
 	if _, err := cli.RetireWake(context.Background(), mutation); err == nil || !strings.Contains(err.Error(), "unexpected status/reason") {
 		t.Fatalf("unexpected manual completion error=%v", err)
+	}
+	beforeSwapLog, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(self, []byte("#!/bin/sh\nexit 91\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cli.RetireWake(context.Background(), mutation); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("same-path inject-via replacement error=%v", err)
+	}
+	afterSwapLog, err := os.ReadFile(argsLog)
+	if err != nil || !bytes.Equal(beforeSwapLog, afterSwapLog) {
+		t.Fatalf("inject-via mismatch executed AMQ: err=%v before=%q after=%q", err, beforeSwapLog, afterSwapLog)
+	}
+}
+
+func TestManualExecutableBindingValidationBranches(t *testing.T) {
+	dir := t.TempDir()
+	amqPath := writeExecutable(t, filepath.Join(dir, "amq"), "#!/bin/sh\nexit 0\n")
+	injectPath := writeExecutable(t, filepath.Join(dir, "inject"), "#!/bin/sh\nexit 0\n")
+	amqIdentity, err := executable.Capture(amqPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectIdentity, err := executable.Capture(injectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := RetireWakeRequest{
+		InjectVia: injectPath, ExpectedAMQIdentity: amqIdentity, ExpectedInjectIdentity: injectIdentity,
+	}
+	cli := NewCLI(amqPath)
+	if err := cli.validateManualExecutableBindings(req); err != nil {
+		t.Fatalf("valid bindings rejected: %v", err)
+	}
+	missingAMQ := cli
+	missingAMQ.Path = filepath.Join(dir, "missing-amq")
+	if err := missingAMQ.validateManualExecutableBindings(req); err == nil || !strings.Contains(err.Error(), "resolve AMQ") {
+		t.Fatalf("missing AMQ path error=%v", err)
+	}
+	missingInject := req
+	missingInject.InjectVia = filepath.Join(dir, "missing-inject")
+	if err := cli.validateManualExecutableBindings(missingInject); err == nil || !strings.Contains(err.Error(), "resolve inject-via") {
+		t.Fatalf("missing inject path error=%v", err)
+	}
+	otherAMQ := writeExecutable(t, filepath.Join(dir, "other-amq"), "#!/bin/sh\nexit 0\n")
+	if err := NewCLI(otherAMQ).validateManualExecutableBindings(req); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched path error=%v", err)
+	}
+	t.Setenv("PATH", dir)
+	if resolved, err := canonicalExecutablePath("amq"); err != nil || resolved != amqIdentity.Path {
+		t.Fatalf("LookPath resolution=%q err=%v", resolved, err)
+	}
+	if err := os.WriteFile(amqPath, []byte("#!/bin/sh\nexit 9\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cli.runExpected(context.Background(), amqIdentity, injectIdentity, "env"); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("changed AMQ runExpected error=%v", err)
 	}
 }
 
@@ -640,6 +711,21 @@ func TestAMQProducerGoldenFixtures(t *testing.T) {
 	}, startFailure); err != nil {
 		t.Fatalf("wake start failure fixture lost blocker proof: %v", err)
 	}
+
+	for _, fixture := range []string{
+		"wake-retire-manual-binding-mismatch-v1.json",
+		"wake-retire-manual-retirement-proof-mismatch-v1.json",
+	} {
+		data, err := os.ReadFile(filepath.Join("testdata", fixture))
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := parseManualRetireResult(data)
+		if err != nil || result.Status != "refused" ||
+			(result.ReasonCode != "manual_binding_mismatch" && result.ReasonCode != "manual_retirement_proof_mismatch") {
+			t.Fatalf("manual refusal producer fixture %s result=%#v err=%v", fixture, result, err)
+		}
+	}
 }
 
 func TestAMQBinaryProducerContracts(t *testing.T) {
@@ -707,7 +793,7 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	firstResultPath := filepath.Join(root, "first-result.json")
 	firstWake := exec.Command(contractBin, "--no-update-check", "wake",
 		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
-		"--inject-arg", "contract-first", "--ready-file", firstReadyPath,
+		"--inject-arg", "inject", "--inject-arg", "file", "--inject-arg", "contract-target", "--ready-file", firstReadyPath,
 		"--result-file", firstResultPath,
 	)
 	var firstOutput bytes.Buffer
@@ -736,6 +822,19 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read first AMQ wake binding: %v; output=%s", err, firstOutput.String())
 	}
+	bindingMismatchCommand := exec.Command(contractBin, "wake", "retire", "--json", "--manual", "--check",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
+		"--inject-arg", "inject", "--inject-arg", "file", "--inject-arg", "contract-target",
+		"--if-generation", "different-generation", "--if-target-digest", "sha256:different",
+	)
+	bindingMismatchData, bindingMismatchErr := bindingMismatchCommand.Output()
+	if bindingMismatchErr == nil {
+		t.Fatal("real AMQ producer accepted a mismatched manual binding")
+	}
+	bindingMismatch, err := parseManualRetireResult(bindingMismatchData)
+	if err != nil || bindingMismatch.Status != "refused" || bindingMismatch.ReasonCode != "manual_binding_mismatch" {
+		t.Fatalf("real AMQ manual binding mismatch producer result=%#v err=%v output=%s", bindingMismatch, err, bindingMismatchData)
+	}
 	secondResultPath := filepath.Join(root, "second-result.json")
 	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSecond()
@@ -758,6 +857,41 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	}
 	if err := ValidateExistingWakeBlocker(root, "worker", binding, startFailure); err == nil {
 		t.Fatalf("AMQ ownerless blocker was accepted as owner-bound retirement proof: result=%#v", startFailure)
+	}
+	amqIdentity, err := executable.Capture(contractBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectIdentity, err := executable.Capture(injector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualRequest := RetireWakeRequest{
+		Root: canonicalRoot, Me: "worker", InjectVia: injectIdentity.Path, Adapter: "file", Target: "contract-target",
+		Manual: true, Check: true, Timeout: 5 * time.Second,
+		ExpectedAMQIdentity: amqIdentity, ExpectedInjectIdentity: injectIdentity,
+	}
+	checked, err := NewCLI(contractBin).RetireWake(context.Background(), manualRequest)
+	if err != nil || checked.Status != "eligible" || checked.Generation != binding.Generation || checked.TargetDigest != binding.TargetDigest {
+		t.Fatalf("verified-snapshot real AMQ preflight result=%#v err=%v", checked, err)
+	}
+	manualRequest.Check = false
+	manualRequest.Generation, manualRequest.TargetDigest = checked.Generation, checked.TargetDigest
+	retired, err := NewCLI(contractBin).RetireWake(context.Background(), manualRequest)
+	if err != nil || retired.Status != "retired" {
+		t.Fatalf("verified-snapshot real AMQ retirement result=%#v err=%v", retired, err)
+	}
+	proofMismatchCommand := exec.Command(contractBin, "wake", "retire", "--json", "--manual",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector, "--inject-arg", "contract-different",
+		"--if-generation", binding.Generation, "--if-target-digest", binding.TargetDigest,
+	)
+	proofMismatchData, proofMismatchErr := proofMismatchCommand.Output()
+	if proofMismatchErr == nil {
+		t.Fatal("real AMQ producer accepted mismatched manual retirement proof")
+	}
+	proofMismatch, err := parseManualRetireResult(proofMismatchData)
+	if err != nil || proofMismatch.Status != "refused" || proofMismatch.ReasonCode != "manual_retirement_proof_mismatch" {
+		t.Fatalf("real AMQ manual proof mismatch producer result=%#v err=%v output=%s", proofMismatch, err, proofMismatchData)
 	}
 }
 
@@ -831,6 +965,18 @@ func TestParseRetireResultStatusContract(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseRetireResult([]byte(body)); err == nil {
 				t.Fatalf("parseRetireResult(%q) succeeded", body)
+			}
+		})
+	}
+}
+
+func TestParseManualRetireResultAcceptsExactProducerRefusalEnums(t *testing.T) {
+	for _, reason := range []string{"manual_binding_mismatch", "manual_retirement_proof_mismatch"} {
+		t.Run(reason, func(t *testing.T) {
+			body := fmt.Sprintf(`{"schema":1,"status":"refused","reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox","generation":"generation-1","target_digest":"sha256:target-1"}`, reason)
+			result, err := parseManualRetireResult([]byte(body))
+			if err != nil || result.Status != "refused" || result.ReasonCode != reason {
+				t.Fatalf("producer refusal result=%#v err=%v", result, err)
 			}
 		})
 	}

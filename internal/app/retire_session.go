@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/ohade/amq-keepalive/internal/adapter"
 	"github.com/ohade/amq-keepalive/internal/amq"
+	"github.com/ohade/amq-keepalive/internal/executable"
 	"github.com/ohade/amq-keepalive/internal/registry"
 	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
@@ -49,16 +49,18 @@ type retireSessionPlanMember struct {
 }
 
 type retireSessionPlan struct {
-	Schema        int                       `json:"schema"`
-	PlanID        string                    `json:"plan_id"`
-	RegistryPath  string                    `json:"registry_path"`
-	Root          string                    `json:"root"`
-	Adapter       string                    `json:"adapter"`
-	Agents        []string                  `json:"agents"`
-	AMQExecutable string                    `json:"amq_executable"`
-	InjectVia     string                    `json:"inject_via"`
-	TimeoutNanos  int64                     `json:"timeout_nanos"`
-	Members       []retireSessionPlanMember `json:"members"`
+	Schema         int                       `json:"schema"`
+	PlanID         string                    `json:"plan_id"`
+	RegistryPath   string                    `json:"registry_path"`
+	Root           string                    `json:"root"`
+	Adapter        string                    `json:"adapter"`
+	Agents         []string                  `json:"agents"`
+	AMQExecutable  string                    `json:"amq_executable"`
+	InjectVia      string                    `json:"inject_via"`
+	AMQIdentity    executable.Identity       `json:"amq_identity"`
+	InjectIdentity executable.Identity       `json:"inject_via_identity"`
+	TimeoutNanos   int64                     `json:"timeout_nanos"`
+	Members        []retireSessionPlanMember `json:"members"`
 }
 
 type retireSessionAppliedMember struct {
@@ -239,11 +241,11 @@ func buildRetireSessionPlan(ctx context.Context, file registry.File, opts retire
 	if adapterName == "" || selected == nil || selected.Name() != adapterName {
 		return retireSessionPlan{}, fmt.Errorf("exact adapter %q is unavailable", adapterName)
 	}
-	amqExecutable, err := canonicalRetireSessionCommand(opts.AMQPath)
+	amqIdentity, err := executable.Capture(opts.AMQPath)
 	if err != nil {
 		return retireSessionPlan{}, fmt.Errorf("resolve --amq: %w", err)
 	}
-	injectVia, err := canonicalRetireSessionCommand(opts.Self)
+	injectIdentity, err := executable.Capture(opts.Self)
 	if err != nil {
 		return retireSessionPlan{}, fmt.Errorf("resolve --self: %w", err)
 	}
@@ -315,8 +317,9 @@ func buildRetireSessionPlan(ctx context.Context, file registry.File, opts retire
 	}
 	plan := retireSessionPlan{
 		Schema: retireSessionPlanSchema, RegistryPath: registryPath, Root: root, Adapter: adapterName,
-		Agents: append([]string(nil), agents...), AMQExecutable: amqExecutable,
-		InjectVia: injectVia, TimeoutNanos: int64(opts.Timeout), Members: members,
+		Agents: append([]string(nil), agents...), AMQExecutable: amqIdentity.Path,
+		InjectVia: injectIdentity.Path, AMQIdentity: amqIdentity, InjectIdentity: injectIdentity,
+		TimeoutNanos: int64(opts.Timeout), Members: members,
 	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -339,6 +342,7 @@ func manualRetireSessionRequest(plan retireSessionPlan, member retireSessionPlan
 		Root: plan.Root, Me: member.Agent, InjectVia: plan.InjectVia, Adapter: plan.Adapter, Target: member.Target,
 		Generation: binding.Generation, TargetDigest: binding.TargetDigest,
 		Manual: true, Check: check, Timeout: time.Duration(plan.TimeoutNanos),
+		ExpectedAMQIdentity: plan.AMQIdentity, ExpectedInjectIdentity: plan.InjectIdentity,
 	}
 }
 
@@ -346,6 +350,7 @@ func manualRetirementIntent(plan retireSessionPlan, member retireSessionPlanMemb
 	return registry.ManualRetirementIntent{
 		PlanID: plan.PlanID, RowDigest: member.RowDigest, Root: plan.Root, Agent: member.Agent,
 		Adapter: plan.Adapter, Target: member.Target, AMQExecutable: plan.AMQExecutable, InjectVia: plan.InjectVia,
+		AMQIdentity: plan.AMQIdentity, InjectIdentity: plan.InjectIdentity,
 		TimeoutNanos: plan.TimeoutNanos, Generation: binding.Generation, TargetDigest: binding.TargetDigest, StartedAt: now,
 	}
 }
@@ -353,7 +358,8 @@ func manualRetirementIntent(plan retireSessionPlan, member retireSessionPlanMemb
 func manualIntentMatchesPlan(intent registry.ManualRetirementIntent, plan retireSessionPlan, member retireSessionPlanMember) bool {
 	return intent.PlanID == plan.PlanID && intent.RowDigest == member.RowDigest && intent.Root == plan.Root &&
 		intent.Agent == member.Agent && intent.Adapter == plan.Adapter && intent.Target == member.Target &&
-		intent.AMQExecutable == plan.AMQExecutable && intent.InjectVia == plan.InjectVia && intent.TimeoutNanos == plan.TimeoutNanos &&
+		intent.AMQExecutable == plan.AMQExecutable && intent.InjectVia == plan.InjectVia &&
+		intent.AMQIdentity == plan.AMQIdentity && intent.InjectIdentity == plan.InjectIdentity && intent.TimeoutNanos == plan.TimeoutNanos &&
 		intent.Generation != "" && intent.TargetDigest != ""
 }
 
@@ -437,37 +443,6 @@ func canonicalRetireSessionRoot(path string) (string, error) {
 		return filepath.Clean(real), nil
 	}
 	return abs, nil
-}
-
-func canonicalRetireSessionCommand(command string) (string, error) {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return "", errors.New("command path is required")
-	}
-	if !strings.ContainsRune(command, filepath.Separator) {
-		resolved, err := exec.LookPath(command)
-		if err != nil {
-			return "", err
-		}
-		command = resolved
-	}
-	abs, err := filepath.Abs(filepath.Clean(command))
-	if err != nil {
-		return "", err
-	}
-	real, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", err
-	}
-	real = filepath.Clean(real)
-	info, err := os.Stat(real)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("%q is not a regular executable file", real)
-	}
-	return real, nil
 }
 
 func canonicalRetireSessionRegistry(path string) (string, error) {

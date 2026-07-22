@@ -16,6 +16,7 @@ import (
 
 	"github.com/ohade/amq-keepalive/internal/adapter"
 	"github.com/ohade/amq-keepalive/internal/amq"
+	"github.com/ohade/amq-keepalive/internal/executable"
 	"github.com/ohade/amq-keepalive/internal/hookinstall"
 	"github.com/ohade/amq-keepalive/internal/launchd"
 	"github.com/ohade/amq-keepalive/internal/registry"
@@ -1123,6 +1124,11 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 				pass.Results = append(pass.Results, result)
 				continue
 			}
+			if manualPendingEntries[entry.ID] {
+				item := manualRetirementRootBlockedGCResult(entry)
+				pass.Results = append(pass.Results, supervisor.Result{Action: supervisor.GCStatusSkipped, GC: &item})
+				continue
+			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				pass.Results = append(pass.Results, supervisor.Result{Action: supervisor.ActionDeferred, Error: ctxErr})
 				continue
@@ -1292,6 +1298,16 @@ func manualRetirementPendingRootEntries(entries []registry.Entry) (map[string]bo
 		_, blocked[id] = pendingRoots[root]
 	}
 	return blocked, nil
+}
+
+func manualRetirementRootBlockedGCResult(entry registry.Entry) supervisor.GCResult {
+	return supervisor.GCResult{
+		EntryID: entry.ID, Status: supervisor.GCStatusSkipped,
+		ReasonCode:      "manual_retirement_root_pending",
+		Reason:          "canonical root is frozen until every exact manual retirement receipt is reconciled",
+		OwnerBound:      entry.WakeOwnerPresent && entry.WakeOwner.Strong() && !entry.LegacyUnbound,
+		BindingComplete: entry.WakeBinding.Complete(),
+	}
 }
 
 func orderedBatchResults(entries []registry.Entry, selected map[string]supervisor.Result) []supervisor.Result {
@@ -2059,6 +2075,10 @@ func (a App) gc(ctx context.Context, args []string) error {
 		updates := make([]registry.EntryUpdate, 0)
 		purges := make([]registry.Entry, 0)
 		selected := make(map[string]supervisor.Result)
+		manualPendingEntries, pendingErr := manualRetirementPendingRootEntries(file.Entries)
+		if pendingErr != nil {
+			return pendingErr
+		}
 		if *apply {
 			batch, active, batchErr := activeGCRootBatch(file)
 			if batchErr != nil {
@@ -2115,6 +2135,10 @@ func (a App) gc(ctx context.Context, args []string) error {
 				if selectedResult.GC != nil {
 					result.Entries = append(result.Entries, *selectedResult.GC)
 				}
+				continue
+			}
+			if manualPendingEntries[entry.ID] {
+				result.Entries = append(result.Entries, manualRetirementRootBlockedGCResult(entry))
 				continue
 			}
 			collector := supervisor.GarbageCollector{
@@ -2309,14 +2333,16 @@ func (a App) retireSession(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	resolvedAMQ, err := canonicalRetireSessionCommand(*amqPath)
+	amqIdentity, err := executable.Capture(*amqPath)
 	if err != nil {
 		return fmt.Errorf("resolve --amq: %w", err)
 	}
-	resolvedSelf, err := canonicalRetireSessionCommand(*self)
+	selfIdentity, err := executable.Capture(*self)
 	if err != nil {
 		return fmt.Errorf("resolve --self: %w", err)
 	}
+	resolvedAMQ := amqIdentity.Path
+	resolvedSelf := selfIdentity.Path
 	result, runErr := a.retireSessionWithOptions(ctx, retireSessionOptions{
 		RegistryPath: *registryPath, Root: *rootFlag, AdapterName: *adapterName, Agents: *agentsFlag,
 		AMQPath: resolvedAMQ, Self: resolvedSelf, Apply: *apply, ConfirmPlan: *confirmPlan, Timeout: *timeout,

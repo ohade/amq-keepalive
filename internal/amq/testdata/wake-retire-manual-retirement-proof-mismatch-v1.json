@@ -1,0 +1,1 @@
+{"schema":1,"status":"refused","reason_code":"manual_retirement_proof_mismatch","agent":"worker","root":"/tmp/amq-contract","lock":"/tmp/amq-contract/agents/worker/.wake.lock","target":"/tmp/amq-contract/agents/worker/.wake.target","generation":"generation-actual","target_digest":"sha256:target-actual","reason":"manual retirement proof does not match the requested transport"}

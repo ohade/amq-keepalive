@@ -105,7 +105,10 @@ live wake. Use
 `--wake-ready-timeout` on `attach`, `reattach`, or `supervise` to adjust the
 readiness wait; the default is 10 seconds. This requires an AMQ build that
 supports `--accept-existing-wake` target verification and
-exact baseline manifests. Normal `attach` and `reattach` also require a strict
+exact baseline manifests. Readiness-marker maintenance scans and removes only a
+bounded number per start; cleanup failures are aggregated as warnings and do
+not turn an otherwise-positive ready acknowledgement into a false failure.
+Normal `attach` and `reattach` also require a strict
 `amq env --json` response advertising `wake_gc_v1` before any registry
 reservation or wake start; `--no-start` remains the explicit register-only
 escape hatch. If the capability probe fails, messages remain queued and no
@@ -150,9 +153,13 @@ The first invocation is genuinely read-only: it does not create a lock or
 backup, change the registry, or call AMQ. The deterministic `plan_id` binds the
 canonical registry and collaboration root, explicit sorted agents, exact legacy
 row digests and normalized missing targets, canonical AMQ and keepalive
-executables, and lifecycle timeout. Use exactly the same options for apply; any
-row, target, path, executable, or timeout drift invalidates the token before a
-signal.
+executables, their SHA-256 content and stable stat/ownership/mode identities,
+and lifecycle timeout. Use exactly the same options for apply; any row, target,
+path, executable content/metadata, or timeout drift invalidates the token before
+a signal. Every manual preflight and mutation reopens and rehashes both files.
+Linux executes AMQ from the verified descriptor; macOS executes a private
+fsynced snapshot copied from that descriptor because Darwin rejects executable
+`/dev/fd` paths.
 
 Apply repeats target-absence proof under the registration lock, preflights every
 agent through AMQ's explicit manual-retirement contract, and durably saves every
@@ -164,6 +171,10 @@ the registry save, the pending intent blocks reattach and automatic GC for that
 root; repeating the exact confirmed command accepts only AMQ's matching
 idempotent receipt and cannot signal that wake twice. Missing, raw, unverified,
 changed, or mismatched wakes remain unresolved and are reported loudly.
+While any member remains pending, the complete canonical root is frozen:
+sibling registration/reconciliation, retention purges, and root GC artifacts
+remain byte-equivalent. Only enrollment in the same exact plan or an exact
+pending-to-receipt transition can be saved.
 
 Detached registry cleanup is preview-first:
 
@@ -253,7 +264,8 @@ and runs the real producer/consumer contract. Release and cross-repository CI
 jobs should invoke this command directly; a missing or unbuildable source is a
 hard failure, never a silent skip. The consumer accepts additive unknown JSON
 fields for forward compatibility while still rejecting missing required
-fields, unknown enum values, trailing JSON, and unsupported schemas.
+fields, duplicate keys at any nesting depth, unknown enum values, trailing JSON,
+and unsupported schemas.
 
 Supported hook install:
 
