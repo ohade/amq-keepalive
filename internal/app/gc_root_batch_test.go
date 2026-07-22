@@ -1311,7 +1311,7 @@ func TestPendingManualRetirementBlocksWholeRootGCWithoutMutation(t *testing.T) {
 		Agent: pending.Agent, Adapter: pending.Adapter, Target: pending.Target,
 		AMQExecutable: identity.Path, InjectVia: identity.Path, AMQIdentity: identity, InjectIdentity: identity,
 		TimeoutNanos: int64(time.Second),
-		Generation:   "legacy-generation", TargetDigest: "sha256:legacy", StartedAt: now,
+		Generation:   "legacy-generation", TargetDigest: "sha256:legacy", ReasonCode: "manual_eligible", StartedAt: now,
 	}
 	sibling := gcRootBatchEntry("owner-bound", root, now.Add(-10*time.Minute))
 	sibling.NextHealthCheck = now.Add(24 * time.Hour)

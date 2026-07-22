@@ -1,0 +1,1 @@
+{"schema":1,"status":"retired","reason_code":"manual_absent_retired","agent":"worker","root":"/tmp/amq-contract","lock":"/tmp/amq-contract/agents/worker/.wake.lock","target":"/tmp/amq-contract/agents/worker/.wake.target","generation":"generation-absent-1","target_digest":"sha256:target-absent-1","reason":"legacy presence retired after exact missing-lock binding revalidation"}

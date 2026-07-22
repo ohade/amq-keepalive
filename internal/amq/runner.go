@@ -194,6 +194,7 @@ type RetireWakeRequest struct {
 	Target                 string
 	Generation             string
 	TargetDigest           string
+	ManualPreflightReason  string
 	RequireOwnerGone       bool
 	Check                  bool
 	Manual                 bool
@@ -201,6 +202,13 @@ type RetireWakeRequest struct {
 	ExpectedAMQIdentity    executable.Identity
 	ExpectedInjectIdentity executable.Identity
 }
+
+const (
+	ManualEligibleReason       = "manual_eligible"
+	ManualAbsentEligibleReason = "manual_absent_eligible"
+	ManualRetiredReason        = "manual_retired"
+	ManualAbsentRetiredReason  = "manual_absent_retired"
+)
 
 type CLI struct {
 	Path                 string
@@ -427,6 +435,12 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeR
 		}
 		if !req.Check && (req.Generation == "" || req.TargetDigest == "") {
 			return RetireWakeResult{}, errors.New("manual retirement requires the exact preflight generation and target digest")
+		}
+		if req.Check && req.ManualPreflightReason != "" {
+			return RetireWakeResult{}, errors.New("manual retirement check cannot claim a prior preflight reason")
+		}
+		if !req.Check && !manualPreflightReason(req.ManualPreflightReason) {
+			return RetireWakeResult{}, errors.New("manual retirement mutation requires an exact supported preflight reason")
 		}
 	} else if req.Generation == "" || req.TargetDigest == "" {
 		return RetireWakeResult{}, errors.New("automated retirement requires the exact generation and target digest")
@@ -828,14 +842,14 @@ func readSecureJSONFileWithPolicy(path string, destination any, allowUnknown boo
 }
 
 func parseRetireResult(data []byte) (RetireWakeResult, error) {
-	return parseRetireResultWithPolicy(data, true)
+	return parseRetireResultWithPolicy(data, true, false)
 }
 
 func parseManualRetireResult(data []byte) (RetireWakeResult, error) {
-	return parseRetireResultWithPolicy(data, false)
+	return parseRetireResultWithPolicy(data, false, true)
 }
 
-func parseRetireResultWithPolicy(data []byte, requireBinding bool) (RetireWakeResult, error) {
+func parseRetireResultWithPolicy(data []byte, requireBinding, manual bool) (RetireWakeResult, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return RetireWakeResult{}, errors.New("empty amq wake retire output")
 	}
@@ -860,11 +874,14 @@ func parseRetireResultWithPolicy(data []byte, requireBinding bool) (RetireWakeRe
 	}
 	switch result.Status {
 	case "eligible":
-		if result.ReasonCode != "owner_gone" && result.ReasonCode != "manual_eligible" {
+		valid := !manual && result.ReasonCode == "owner_gone" || manual && manualPreflightReason(result.ReasonCode)
+		if !valid {
 			return RetireWakeResult{}, errors.New("eligible retirement response has an unsupported reason_code")
 		}
 	case "retired":
-		if result.ReasonCode != "retired_exact" && result.ReasonCode != "manual_retired" {
+		valid := !manual && result.ReasonCode == "retired_exact" || manual &&
+			(result.ReasonCode == ManualRetiredReason || result.ReasonCode == ManualAbsentRetiredReason)
+		if !valid {
 			return RetireWakeResult{}, errors.New("retired response has an unsupported reason_code")
 		}
 	case "already_retired":
@@ -880,15 +897,8 @@ func parseRetireResultWithPolicy(data []byte, requireBinding bool) (RetireWakeRe
 			return RetireWakeResult{}, errors.New("error response must use reason_code internal_error")
 		}
 	case "refused":
-		switch result.ReasonCode {
-		case "invalid_automation_binding", "no_retirement_proof", "retirement_proof_mismatch", "unverified_replacement",
-			"wake_creating", "wake_unverified", "wake_state_unsupported", "raw_wake", "target_missing",
-			"target_mismatch", "owner_missing", "owner_live", "owner_uninspectable", "generation_changed",
-			"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
-			"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
-			"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
-			"manual_retirement_proof_mismatch":
-		default:
+		valid := manual && manualRefusalReason(result.ReasonCode) || !manual && automatedRefusalReason(result.ReasonCode)
+		if !valid {
 			return RetireWakeResult{}, fmt.Errorf("refused response has unknown reason_code %q", result.ReasonCode)
 		}
 	default:
@@ -974,13 +984,13 @@ func validateRetireEcho(req RetireWakeRequest, result RetireWakeResult) error {
 			if result.Status != "eligible" && result.Status != "refused" && result.Status != "error" {
 				return fmt.Errorf("manual retirement check returned unexpected status %q", result.Status)
 			}
-			if result.Status == "eligible" && (result.ReasonCode != "manual_eligible" || result.Generation == "" || result.TargetDigest == "") {
+			if result.Status == "eligible" && (!manualPreflightReason(result.ReasonCode) || result.Generation == "" || result.TargetDigest == "") {
 				return errors.New("manual retirement eligibility lacks exact generation/digest proof")
 			}
 			return nil
 		}
-		validCompletion := (result.Status == "retired" && result.ReasonCode == "manual_retired") ||
-			(result.Status == "already_retired" && result.ReasonCode == "tombstone_match")
+		validCompletion := (result.Status == "retired" && manualCompletionMatches(req.ManualPreflightReason, result.ReasonCode)) ||
+			(req.ManualPreflightReason == ManualEligibleReason && result.Status == "already_retired" && result.ReasonCode == "tombstone_match")
 		if !validCompletion {
 			return fmt.Errorf("manual retirement mutation returned unexpected status/reason %q/%q", result.Status, result.ReasonCode)
 		}
@@ -996,6 +1006,45 @@ func validateRetireEcho(req RetireWakeRequest, result RetireWakeResult) error {
 		return errors.New("amq wake retire superseded response does not prove a different current wake")
 	}
 	return nil
+}
+
+func manualPreflightReason(reason string) bool {
+	return reason == ManualEligibleReason || reason == ManualAbsentEligibleReason
+}
+
+func manualCompletionMatches(preflight, completion string) bool {
+	switch preflight {
+	case ManualEligibleReason:
+		return completion == ManualRetiredReason
+	case ManualAbsentEligibleReason:
+		return completion == ManualAbsentRetiredReason
+	default:
+		return false
+	}
+}
+
+func manualRefusalReason(reason string) bool {
+	switch reason {
+	case "manual_mode_required", "manual_mode_conflict", "manual_binding_required",
+		"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
+		"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
+		"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
+		"manual_retirement_proof_mismatch", "manual_absent_refused":
+		return true
+	default:
+		return false
+	}
+}
+
+func automatedRefusalReason(reason string) bool {
+	switch reason {
+	case "invalid_automation_binding", "no_retirement_proof", "retirement_proof_mismatch", "unverified_replacement",
+		"wake_creating", "wake_unverified", "wake_state_unsupported", "raw_wake", "target_missing",
+		"target_mismatch", "owner_missing", "owner_live", "owner_uninspectable", "generation_changed":
+		return true
+	default:
+		return false
+	}
 }
 
 func SupersededProvesReplacement(req RetireWakeRequest, result RetireWakeResult) bool {

@@ -64,22 +64,161 @@ func (f *retireSessionTestLifecycle) RetireWake(_ context.Context, request amq.R
 	if f.onRetire != nil {
 		f.onRetire(request)
 	}
+	if retired, exists := f.tombstones[request.Me]; exists && retired.Generation == request.Generation && retired.TargetDigest == request.TargetDigest {
+		return retireSessionTestResult(request, "already_retired", "tombstone_match", request.Generation, request.TargetDigest), nil
+	}
 	result, ok := f.retireResults[request.Me]
 	if !ok {
-		if retired, exists := f.tombstones[request.Me]; exists && retired.Generation == request.Generation && retired.TargetDigest == request.TargetDigest {
-			return retireSessionTestResult(request, "already_retired", "tombstone_match", request.Generation, request.TargetDigest), nil
-		}
 		result = retireSessionTestResult(request, "retired", "manual_retired", request.Generation, request.TargetDigest)
 	}
 	retireErr := f.retireErrors[request.Me]
-	if retireErr == nil && result.Status == "retired" && result.ReasonCode == "manual_retired" {
-		f.signalCount++
+	if retireErr == nil && result.Status == "retired" &&
+		(result.ReasonCode == amq.ManualRetiredReason || result.ReasonCode == amq.ManualAbsentRetiredReason) {
+		if result.ReasonCode == amq.ManualRetiredReason {
+			f.signalCount++
+		}
 		if f.tombstones == nil {
 			f.tombstones = make(map[string]amq.RetireWakeResult)
 		}
 		f.tombstones[request.Me] = result
 	}
 	return result, retireErr
+}
+
+func TestRetireSessionMissingLockContractPersistsAndReplaysExactBinding(t *testing.T) {
+	originalPersist := persistRetireSessionEntry
+	t.Cleanup(func() { persistRetireSessionEntry = originalPersist })
+	dir := t.TempDir()
+	_, store, opts := setupLegacyRetireSession(t, dir, "alpha")
+	probeRequest := amq.RetireWakeRequest{Root: opts.Root, Me: "alpha"}
+	checked := retireSessionTestResult(probeRequest, "eligible", amq.ManualAbsentEligibleReason, "generation-absent", "sha256:absent")
+	retired := retireSessionTestResult(probeRequest, "retired", amq.ManualAbsentRetiredReason, checked.Generation, checked.TargetDigest)
+	lifecycle := &retireSessionTestLifecycle{
+		checkResults:  map[string]amq.RetireWakeResult{"alpha": checked},
+		retireResults: map[string]amq.RetireWakeResult{"alpha": retired},
+	}
+	preview, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.Apply, opts.ConfirmPlan = true, preview.(*retireSessionPlan).PlanID
+	writes := 0
+	persistRetireSessionEntry = func(store *registry.Store, before, after registry.Entry) (registry.UpdateResult, error) {
+		writes++
+		if writes == 2 {
+			return registry.UpdateResult{}, errors.New("injected completion persistence failure")
+		}
+		return originalPersist(store, before, after)
+	}
+	if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{}); err == nil {
+		t.Fatal("missing-lock retirement unexpectedly persisted through failpoint")
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].ManualRetirementIntent.ReasonCode != amq.ManualAbsentEligibleReason || lifecycle.signalCount != 0 {
+		t.Fatalf("durable absent intent=%#v signals=%d err=%v", loaded.Entries, lifecycle.signalCount, err)
+	}
+	persistRetireSessionEntry = originalPersist
+	delete(lifecycle.tombstones, "alpha") // Missing-lock replay repeats the exact idempotent completion, not lock-backed tombstone semantics.
+	requestCount := len(lifecycle.requests)
+	replayed, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+	if err != nil || !replayed.(*retireSessionApplyResult).Applied || lifecycle.signalCount != 0 {
+		t.Fatalf("absent replay result=%#v signals=%d err=%v", replayed, lifecycle.signalCount, err)
+	}
+	if len(lifecycle.requests) != requestCount+1 || lifecycle.requests[requestCount].Check ||
+		lifecycle.requests[requestCount].ManualPreflightReason != amq.ManualAbsentEligibleReason {
+		t.Fatalf("absent replay lost phase binding: %#v", lifecycle.requests[requestCount:])
+	}
+	loaded, err = store.Load()
+	if err != nil || loaded.Entries[0].State != registry.StateRetired ||
+		loaded.Entries[0].ManualRetirementReceipt.PreflightReasonCode != amq.ManualAbsentEligibleReason ||
+		loaded.Entries[0].ManualRetirementReceipt.ReasonCode != amq.ManualAbsentRetiredReason {
+		t.Fatalf("absent replay did not converge: entries=%#v err=%v", loaded.Entries, err)
+	}
+}
+
+func TestRetireSessionMissingLockMixedPreflightAndMismatchesFailClosed(t *testing.T) {
+	t.Run("mixed root preflight", func(t *testing.T) {
+		dir := t.TempDir()
+		_, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")
+		alpha := amq.RetireWakeRequest{Root: opts.Root, Me: "alpha"}
+		beta := amq.RetireWakeRequest{Root: opts.Root, Me: "beta"}
+		lifecycle := &retireSessionTestLifecycle{checkResults: map[string]amq.RetireWakeResult{
+			"alpha": retireSessionTestResult(alpha, "eligible", amq.ManualAbsentEligibleReason, "generation-alpha", "sha256:alpha"),
+			"beta":  retireSessionTestResult(beta, "retired", amq.ManualAbsentRetiredReason, "generation-beta", "sha256:beta"),
+		}}
+		preview, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.Apply, opts.ConfirmPlan = true, preview.(*retireSessionPlan).PlanID
+		if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{}); err == nil || !strings.Contains(err.Error(), "no wake retirement signals") {
+			t.Fatalf("mixed preflight error=%v", err)
+		}
+		loaded, err := store.Load()
+		if err != nil || lifecycle.retirementCall != 0 || loaded.Entries[0].ManualRetirementIntent.Active() || loaded.Entries[1].ManualRetirementIntent.Active() {
+			t.Fatalf("mixed preflight mutated state: calls=%d entries=%#v err=%v", lifecycle.retirementCall, loaded.Entries, err)
+		}
+	})
+
+	root := t.TempDir()
+	checked := amq.RetireWakeResult{Schema: 1, Status: "eligible", ReasonCode: amq.ManualAbsentEligibleReason, Root: root, Agent: "worker", Generation: "generation-1", TargetDigest: "sha256:target-1"}
+	valid := amq.RetireWakeResult{Schema: 1, Status: "retired", ReasonCode: amq.ManualAbsentRetiredReason, Root: root, Agent: "worker", Generation: checked.Generation, TargetDigest: checked.TargetDigest}
+	for name, mutate := range map[string]func(*amq.RetireWakeResult){
+		"wrong phase code": func(result *amq.RetireWakeResult) { result.ReasonCode = amq.ManualRetiredReason },
+		"lock tombstone replay": func(result *amq.RetireWakeResult) {
+			result.Status, result.ReasonCode = "already_retired", "tombstone_match"
+		},
+		"generation mismatch": func(result *amq.RetireWakeResult) { result.Generation = "generation-2" },
+		"digest mismatch":     func(result *amq.RetireWakeResult) { result.TargetDigest = "sha256:target-2" },
+		"identity mismatch":   func(result *amq.RetireWakeResult) { result.Agent = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if err := validateManualRetireSessionMutation(root, "worker", checked, candidate); err == nil {
+				t.Fatalf("mismatch accepted: %#v", candidate)
+			}
+		})
+	}
+}
+
+func TestRetireSessionReprobesWholeRootAfterDurableEnrollment(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		barrierErr error
+	}{
+		{name: "target reappeared"},
+		{name: "target absence ambiguous", barrierErr: errors.New("synthetic adapter inspection failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, store, opts := setupLegacyRetireSession(t, dir, "alpha")
+			probes := 0
+			selected := retireSessionTestAdapter{probe: func(context.Context, string) error {
+				probes++
+				if probes >= 4 {
+					return test.barrierErr
+				}
+				return adapter.ErrTargetNotFound
+			}}
+			lifecycle := &retireSessionTestLifecycle{}
+			preview, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, selected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts.Apply, opts.ConfirmPlan = true, preview.(*retireSessionPlan).PlanID
+			if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, selected); err == nil || !strings.Contains(err.Error(), "root remains pending") {
+				t.Fatalf("target barrier error=%v", err)
+			}
+			if lifecycle.retirementCall != 0 || lifecycle.signalCount != 0 {
+				t.Fatalf("target barrier triggered mutation: calls=%d signals=%d", lifecycle.retirementCall, lifecycle.signalCount)
+			}
+			loaded, err := store.Load()
+			if err != nil || len(loaded.Entries) != 1 || !loaded.Entries[0].ManualRetirementIntent.Active() || loaded.Entries[0].ManualRetirementReceipt.Active() {
+				t.Fatalf("target barrier did not leave exact frozen intent: entries=%#v err=%v", loaded.Entries, err)
+			}
+		})
+	}
 }
 
 func retireSessionTestResult(request amq.RetireWakeRequest, status, reason, generation, digest string) amq.RetireWakeResult {

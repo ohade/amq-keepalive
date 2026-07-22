@@ -1559,6 +1559,10 @@ func TestUpdateEntriesAllowsOnlyExactPendingManualRetirementCompletion(t *testin
 			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
 			entry.ManualRetirementReceipt.ReasonCode = "tombstone_match"
 		}},
+		{name: "missing-lock phase crossover", mutate: func(entry *Entry) {
+			entry.ManualRetirementIntent.ReasonCode = "manual_absent_eligible"
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+		}},
 		{name: "unrelated field drift", mutate: func(entry *Entry) {
 			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
 			entry.Target += "-changed"
@@ -1600,6 +1604,54 @@ func TestUpdateEntriesAllowsOnlyExactPendingManualRetirementCompletion(t *testin
 			}
 		})
 	}
+
+	t.Run("manual_absent_retired", func(t *testing.T) {
+		before := pendingManualRetirementTestEntry(t)
+		before.ManualRetirementIntent.ReasonCode = "manual_absent_eligible"
+		after := completedManualRetirementTestEntry(before, "retired", "manual_absent_retired")
+		store := New(filepath.Join(t.TempDir(), "registry.json"))
+		if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+			t.Fatal(err)
+		}
+		result, err := store.UpdateEntries([]EntryUpdate{{Before: before, After: after}})
+		if err != nil || result.Updated != 1 || result.Skipped != 0 {
+			t.Fatalf("exact absent completion result=%#v err=%v", result, err)
+		}
+		loaded, err := store.Load()
+		if err != nil || loaded.Entries[0].ManualRetirementReceipt.PreflightReasonCode != "manual_absent_eligible" {
+			t.Fatalf("absent receipt lost durable preflight pair: %#v err=%v", loaded.Entries, err)
+		}
+		for name, mutate := range map[string]func(*Entry){
+			"preflight tamper": func(entry *Entry) { entry.ManualRetirementReceipt.PreflightReasonCode = "manual_eligible" },
+			"completion crossover": func(entry *Entry) {
+				entry.ManualRetirementReceipt.ReasonCode = "manual_retired"
+				entry.RetirementReason = "manual_retired"
+				entry.LastGCReason = "manual_retired"
+			},
+			"lock tombstone crossover": func(entry *Entry) {
+				entry.ManualRetirementReceipt.ReasonCode = "tombstone_match"
+				entry.RetirementOutcome = "already_retired"
+				entry.RetirementReason = "tombstone_match"
+				entry.LastGCReason = "tombstone_match"
+			},
+		} {
+			t.Run(name+" fails restart validation", func(t *testing.T) {
+				candidate := loaded.Entries[0]
+				mutate(&candidate)
+				invalid := New(filepath.Join(t.TempDir(), "registry.json"))
+				data, err := json.Marshal(File{SchemaVersion: SchemaVersion, Entries: []Entry{candidate}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(invalid.Path, append(data, '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := invalid.Load(); err == nil {
+					t.Fatalf("tampered receipt accepted after restart: %#v", candidate.ManualRetirementReceipt)
+				}
+			})
+		}
+	})
 }
 
 func TestPendingManualRetirementFreezesCanonicalRootMembershipSiblingsAndGCArtifacts(t *testing.T) {
@@ -1745,7 +1797,7 @@ func pendingManualRetirementTestEntry(t *testing.T) Entry {
 		Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
 		AMQExecutable: identity.Path, InjectVia: identity.Path, AMQIdentity: identity, InjectIdentity: identity,
 		TimeoutNanos: int64(time.Second),
-		Generation:   "generation", TargetDigest: "sha256:digest", StartedAt: now,
+		Generation:   "generation", TargetDigest: "sha256:digest", ReasonCode: "manual_eligible", StartedAt: now,
 	}
 	return entry
 }
@@ -1768,7 +1820,7 @@ func completedManualRetirementTestEntry(before Entry, outcome, reason string) En
 	after.ManualRetirementReceipt = ManualRetirementReceipt{
 		PlanID: before.ManualRetirementIntent.PlanID, RowDigest: before.ManualRetirementIntent.RowDigest,
 		Generation: before.ManualRetirementIntent.Generation, TargetDigest: before.ManualRetirementIntent.TargetDigest,
-		CompletedAt: completedAt, ReasonCode: reason,
+		CompletedAt: completedAt, PreflightReasonCode: before.ManualRetirementIntent.ReasonCode, ReasonCode: reason,
 	}
 	after.ManualRetirementIntent = ManualRetirementIntent{}
 	return after
