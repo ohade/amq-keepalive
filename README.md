@@ -188,6 +188,12 @@ malformed AMQ state, or any binding drift fails closed in AMQ. This explicit
 command does not weaken owner-bound automatic GC or make legacy retirement
 automatic.
 
+A legacy `.wake.lock` with a blank generation or target digest is not usable as
+an exact preflight binding. AMQ returns `manual_legacy_lock_unbound` and keeps
+the row unresolved. Only after `amq doctor --ops` proves that lock stale may an
+operator run `amq doctor --ops --fix-wake-locks`, then retry the explicit
+missing-lock retirement flow; keepalive never performs that cleanup itself.
+
 While any member remains pending, the complete canonical root is frozen:
 sibling registration/reconciliation, retention purges, and root GC artifacts
 remain byte-equivalent. Only enrollment in the same exact plan or an exact
