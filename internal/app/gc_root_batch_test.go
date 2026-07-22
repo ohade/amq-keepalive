@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -1282,6 +1283,56 @@ func gcBatchPolicy() supervisor.GCPolicy {
 	return supervisor.GCPolicy{
 		AutoGC: true, OwnerGrace: supervisor.MinOwnerGoneGrace,
 		RetiredRetention: supervisor.MinRetiredRetention, Timeout: time.Second,
+	}
+}
+
+func TestPendingManualRetirementBlocksWholeRootGCWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	rawRoot := filepath.Join(dir, "root")
+	if err := os.MkdirAll(rawRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := canonicalGCRoot(rawRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	pending := registry.Entry{
+		ID: "legacy", Root: root, Agent: "legacy", Adapter: "file", Target: filepath.Join(root, "legacy.target"),
+		State: registry.StateDetached, LegacyUnbound: true, NextHealthCheck: now.Add(24 * time.Hour),
+	}
+	pending.ManualRetirementIntent = registry.ManualRetirementIntent{
+		PlanID: strings.Repeat("a", 64), RowDigest: strings.Repeat("b", 64), Root: root,
+		Agent: pending.Agent, Adapter: pending.Adapter, Target: pending.Target,
+		AMQExecutable: "/bin/sh", InjectVia: "/bin/sh", TimeoutNanos: int64(time.Second),
+		Generation: "legacy-generation", TargetDigest: "sha256:legacy", StartedAt: now,
+	}
+	sibling := gcRootBatchEntry("owner-bound", root, now.Add(-10*time.Minute))
+	sibling.NextHealthCheck = now.Add(24 * time.Hour)
+	entries := []registry.Entry{pending, sibling}
+	plan, err := planGCRootBatch(entries, now, gcBatchPolicy())
+	if err != nil || plan.Canonical != "" || len(plan.Members) != 0 {
+		t.Fatalf("pending root plan=%#v err=%v", plan, err)
+	}
+	registryPath := filepath.Join(dir, "registry.json")
+	store := registry.New(registryPath)
+	if err := store.Save(registry.File{Entries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wake := &gcRootBatchWitnessWake{registryPath: registryPath}
+	pass, err := (App{Now: func() time.Time { return now }}).superviseOnceWithGCState(
+		context.Background(), registryPath, wake, "/bin/sh", time.Second, gcBatchPolicy(),
+	)
+	if err != nil || pass.BatchExecuted || pass.AttemptedRoot != "" || len(wake.checks) != 0 || wake.mutations != 0 || wake.starts != 0 {
+		t.Fatalf("pending root pass=%#v checks=%#v mutations=%d starts=%d err=%v", pass, wake.checks, wake.mutations, wake.starts, err)
+	}
+	after, err := store.Load()
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("pending root changed:\nbefore=%#v\nafter=%#v\nerr=%v", before, after, err)
 	}
 }
 

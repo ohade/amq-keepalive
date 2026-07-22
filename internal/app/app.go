@@ -623,7 +623,7 @@ func canonicalGCRoot(root string) (string, error) {
 }
 
 func gcEntryLocallyEligible(entry registry.Entry, now time.Time, policy supervisor.GCPolicy) bool {
-	if entry.State == registry.StateRetired || !entry.GCQuarantinedAt.IsZero() || entry.Transition.Active() || entry.LegacyUnbound ||
+	if entry.State == registry.StateRetired || entry.ManualRetirementIntent.Active() || !entry.GCQuarantinedAt.IsZero() || entry.Transition.Active() || entry.LegacyUnbound ||
 		!entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete() {
 		return false
 	}
@@ -644,7 +644,7 @@ func gcEntryLocallyEligible(entry registry.Entry, now time.Time, policy supervis
 // mean StartWake will run (the adapter probe can still defer it), only that the
 // local state does not prove that this pass cannot reach StartWake.
 func entryMayStartWake(entry registry.Entry, now time.Time) bool {
-	if entry.State == registry.StateRetired {
+	if entry.State == registry.StateRetired || entry.ManualRetirementIntent.Active() {
 		return false
 	}
 	if !entry.NextHealthCheck.IsZero() && now.Before(entry.NextHealthCheck) {
@@ -665,6 +665,17 @@ func planGCRootBatchForFile(file registry.File, now time.Time, policy supervisor
 }
 
 func planGCRootBatchWithAttempts(entries []registry.Entry, attempts []registry.GCRootAttempt, now time.Time, policy supervisor.GCPolicy) (gcRootBatchPlan, error) {
+	pendingRoots := make(map[string]struct{})
+	for _, entry := range entries {
+		if !entry.ManualRetirementIntent.Active() || entry.State == registry.StateRetired {
+			continue
+		}
+		root, err := canonicalGCRoot(entry.Root)
+		if err != nil {
+			return gcRootBatchPlan{}, err
+		}
+		pendingRoots[root] = struct{}{}
+	}
 	recentRoots := make(map[string]struct{})
 	windowStart := now.Add(-supervisor.GCRootWindow)
 	for _, attempt := range attempts {
@@ -685,6 +696,9 @@ func planGCRootBatchWithAttempts(entries []registry.Entry, attempts []registry.G
 		if err != nil {
 			return gcRootBatchPlan{}, err
 		}
+		if _, pending := pendingRoots[root]; pending {
+			continue
+		}
 		recentRoots[root] = struct{}{}
 	}
 	candidateSince := make(map[string]time.Time)
@@ -695,6 +709,9 @@ func planGCRootBatchWithAttempts(entries []registry.Entry, attempts []registry.G
 		root, err := canonicalGCRoot(entry.Root)
 		if err != nil {
 			return gcRootBatchPlan{}, err
+		}
+		if _, pending := pendingRoots[root]; pending {
+			continue
 		}
 		if _, recent := recentRoots[root]; recent {
 			continue
@@ -766,6 +783,8 @@ func persistGCRootBatchMarker(store *registry.Store, file *registry.File, plan g
 
 func gcRootMemberLocalBlock(entry registry.Entry) string {
 	switch {
+	case entry.ManualRetirementIntent.Active():
+		return "manual_retirement_pending"
 	case !entry.GCQuarantinedAt.IsZero():
 		return "gc_quarantined"
 	case entry.Transition.Active():
@@ -1011,6 +1030,10 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 			return err
 		}
 		now := a.now()
+		manualPendingEntries, err := manualRetirementPendingRootEntries(file.Entries)
+		if err != nil {
+			return err
+		}
 		batch, hasBatch, err := activeGCRootBatch(file)
 		if err != nil {
 			return err
@@ -1185,7 +1208,7 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 					continue
 				}
 			}
-			if gcPolicy.AutoGC {
+			if gcPolicy.AutoGC && !manualPendingEntries[entry.ID] {
 				collector := supervisor.GarbageCollector{
 					Wake: lifecycle, InjectVia: self, CapabilityAvailable: capability,
 					CapabilityError: capabilityErr, Policy: gcPolicy,
@@ -1249,6 +1272,26 @@ func (a App) superviseOnceWithGCState(ctx context.Context, registryPath string, 
 		return nil
 	})
 	return pass, err
+}
+
+func manualRetirementPendingRootEntries(entries []registry.Entry) (map[string]bool, error) {
+	pendingRoots := make(map[string]struct{})
+	entryRoots := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		root, err := canonicalGCRoot(entry.Root)
+		if err != nil {
+			return nil, err
+		}
+		entryRoots[entry.ID] = root
+		if entry.State != registry.StateRetired && entry.ManualRetirementIntent.Active() {
+			pendingRoots[root] = struct{}{}
+		}
+	}
+	blocked := make(map[string]bool)
+	for id, root := range entryRoots {
+		_, blocked[id] = pendingRoots[root]
+	}
+	return blocked, nil
 }
 
 func orderedBatchResults(entries []registry.Entry, selected map[string]supervisor.Result) []supervisor.Result {
@@ -2250,104 +2293,40 @@ func (a App) retireSession(ctx context.Context, args []string) error {
 	registryPath := fs.String("registry", mustDefaultRegistryPath(), "registry file path")
 	rootFlag := fs.String("root", "", "exact AMQ session root")
 	adapterName := fs.String("adapter", "cmux", "adapter name")
-	agentsFlag := fs.String("agents", "codex,claude", "comma-separated required agent handles")
-	fs.String("amq", "amq", "reserved until AMQ identity-safe retirement #235")
-	fs.String("self", executablePath(), "reserved until AMQ identity-safe retirement #235")
+	agentsFlag := fs.String("agents", "", "explicit comma-separated agent handles")
+	amqPath := fs.String("amq", "amq", "amq executable path")
+	self := fs.String("self", executablePath(), "amq-keepalive executable path for --inject-via")
+	apply := fs.Bool("apply", false, "apply the exact previewed retirement plan")
+	confirmPlan := fs.String("confirm-plan", "", "exact plan_id emitted by the read-only preview")
+	timeout := fs.Duration("timeout", 5*time.Second, "deadline for each AMQ retirement command")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*rootFlag) == "" {
-		return errors.New("--root is required")
+	if fs.NArg() != 0 {
+		return fmt.Errorf("retire-session accepts no positional arguments: %q", fs.Args())
 	}
-	root, err := canonicalExistingPath(*rootFlag)
-	if err != nil {
-		return fmt.Errorf("resolve --root: %w", err)
-	}
-	agents, err := parseRequiredAgents(*agentsFlag)
+	selected, err := adapter.DefaultRegistry().Get(*adapterName)
 	if err != nil {
 		return err
 	}
-
-	store := registry.New(*registryPath)
-	return store.WithRegistrationLockContext(ctx, func() error {
-		file, err := store.Load()
-		if err != nil {
-			return err
-		}
-		entries := make([]registry.Entry, 0, len(agents))
-		for _, agent := range agents {
-			matches := make([]registry.Entry, 0, 1)
-			for _, entry := range file.Entries {
-				entryRoot, pathErr := canonicalExistingPath(entry.Root)
-				if pathErr != nil {
-					continue
-				}
-				if entryRoot == root && entry.Adapter == *adapterName && entry.Agent == agent {
-					matches = append(matches, entry)
-				}
-			}
-			if len(matches) != 1 {
-				return fmt.Errorf("expected exactly one %s registry entry for agent %s at %s, found %d", *adapterName, agent, root, len(matches))
-			}
-			entries = append(entries, matches[0])
-		}
-
-		adapters := adapter.DefaultRegistry()
-		selected, err := adapters.Get(*adapterName)
-		if err != nil {
-			return err
-		}
-		for i := range entries {
-			entry := &entries[i]
-			if normalizer, ok := selected.(adapter.TargetNormalizer); ok {
-				normalized, normalizeErr := normalizer.NormalizeTarget(entry.Target)
-				if normalizeErr != nil {
-					return fmt.Errorf("normalize target for %s: %w", entry.Agent, normalizeErr)
-				}
-				entry.Target = normalized
-			}
-			probeErr := selected.Probe(ctx, entry.Target)
-			if probeErr == nil {
-				return fmt.Errorf("refusing to retire %s wake: adapter target %s still exists", entry.Agent, entry.Target)
-			}
-			if !errors.Is(probeErr, adapter.ErrTargetNotFound) {
-				return fmt.Errorf("refusing to retire %s wake because target absence is not proven: %w", entry.Agent, probeErr)
-			}
-		}
-		return errIdentitySafeWakeRetireUnavailable
-	})
-}
-
-func canonicalExistingPath(path string) (string, error) {
-	abs, err := filepath.Abs(filepath.Clean(path))
+	resolvedAMQ, err := canonicalRetireSessionCommand(*amqPath)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("resolve --amq: %w", err)
 	}
-	if real, err := filepath.EvalSymlinks(abs); err == nil {
-		return real, nil
+	resolvedSelf, err := canonicalRetireSessionCommand(*self)
+	if err != nil {
+		return fmt.Errorf("resolve --self: %w", err)
 	}
-	return abs, nil
-}
-
-func parseRequiredAgents(raw string) ([]string, error) {
-	parts := strings.Split(raw, ",")
-	agents := make([]string, 0, len(parts))
-	seen := map[string]bool{}
-	for _, part := range parts {
-		agent := strings.TrimSpace(part)
-		if agent == "" {
-			return nil, errors.New("--agents must contain non-empty handles")
+	result, runErr := a.retireSessionWithOptions(ctx, retireSessionOptions{
+		RegistryPath: *registryPath, Root: *rootFlag, AdapterName: *adapterName, Agents: *agentsFlag,
+		AMQPath: resolvedAMQ, Self: resolvedSelf, Apply: *apply, ConfirmPlan: *confirmPlan, Timeout: *timeout,
+	}, amq.NewCLI(resolvedAMQ), selected)
+	if result != nil {
+		if err := printJSON(a.Stdout, result); err != nil {
+			return errors.Join(runErr, err)
 		}
-		if seen[agent] {
-			return nil, fmt.Errorf("--agents contains duplicate handle %q", agent)
-		}
-		seen[agent] = true
-		agents = append(agents, agent)
 	}
-	if len(agents) == 0 {
-		return nil, errors.New("--agents is required")
-	}
-	return agents, nil
+	return runErr
 }
 
 func (a App) installLaunchd(ctx context.Context, args []string) error {

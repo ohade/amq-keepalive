@@ -412,6 +412,81 @@ exit 1
 	}
 }
 
+func TestRetireWakeManualUsesAtomicBindingFlagsAndStrictEcho(t *testing.T) {
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.log")
+	t.Setenv("AMQ_KEEPALIVE_MANUAL_ARGS", argsLog)
+	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf 'CALL' >> "$AMQ_KEEPALIVE_MANUAL_ARGS"
+for arg in "$@"; do printf '|%s' "$arg" >> "$AMQ_KEEPALIVE_MANUAL_ARGS"; done
+printf '\n' >> "$AMQ_KEEPALIVE_MANUAL_ARGS"
+check=false
+for arg in "$@"; do [ "$arg" = "--check" ] && check=true; done
+if [ "$check" = true ]; then
+  status=eligible
+  reason=manual_eligible
+else
+  case "${AMQ_KEEPALIVE_MANUAL_MODE-}" in
+    receipt) status=already_retired; reason=tombstone_match ;;
+    unexpected) status=superseded; reason=generation_superseded ;;
+    *) status=retired; reason=manual_retired ;;
+  esac
+fi
+generation=generation-1
+[ "${AMQ_KEEPALIVE_WRONG_ECHO-}" = 1 ] && generation=generation-2
+printf '{"schema":1,"status":"%s","reason_code":"%s","root":"%s","agent":"codex","lock":"%s/agents/codex/.wake.lock","target":"%s/agents/codex/.wake.target","generation":"%s","target_digest":"sha256:target-1","future_field":true}\n' "$status" "$reason" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$generation"
+`)
+	cli := NewCLI(fakeAMQ)
+	base := RetireWakeRequest{
+		Root: dir, Me: "codex", InjectVia: "/opt/amq-keepalive", Adapter: "synthetic", Target: "surface-alpha",
+		Manual: true, Check: true, Timeout: time.Second,
+	}
+	checked, err := cli.RetireWake(context.Background(), base)
+	if err != nil || checked.Status != "eligible" || checked.ReasonCode != "manual_eligible" || checked.Generation == "" || checked.TargetDigest == "" {
+		t.Fatalf("manual check result=%#v err=%v", checked, err)
+	}
+	mutation := base
+	mutation.Check = false
+	mutation.Generation = checked.Generation
+	mutation.TargetDigest = checked.TargetDigest
+	retired, err := cli.RetireWake(context.Background(), mutation)
+	if err != nil || retired.Status != "retired" || retired.ReasonCode != "manual_retired" {
+		t.Fatalf("manual mutation result=%#v err=%v", retired, err)
+	}
+	data, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "|--manual|--check") || strings.Contains(lines[0], "--if-generation") {
+		t.Fatalf("manual preflight argv=%q", lines)
+	}
+	if !strings.Contains(lines[1], "|--manual|--if-generation|generation-1|--if-target-digest|sha256:target-1") || strings.Contains(lines[1], "|--check") {
+		t.Fatalf("manual mutation argv=%q", lines[1])
+	}
+
+	t.Setenv("AMQ_KEEPALIVE_WRONG_ECHO", "1")
+	if _, err := cli.RetireWake(context.Background(), mutation); err == nil || !strings.Contains(err.Error(), "exact preflight generation/digest") {
+		t.Fatalf("wrong manual echo error=%v", err)
+	}
+	invalid := mutation
+	invalid.TargetDigest = ""
+	if _, err := cli.RetireWake(context.Background(), invalid); err == nil || !strings.Contains(err.Error(), "supplied together") {
+		t.Fatalf("half-bound manual request error=%v", err)
+	}
+	t.Setenv("AMQ_KEEPALIVE_WRONG_ECHO", "")
+	t.Setenv("AMQ_KEEPALIVE_MANUAL_MODE", "receipt")
+	receipt, err := cli.RetireWake(context.Background(), mutation)
+	if err != nil || receipt.Status != "already_retired" || receipt.ReasonCode != "tombstone_match" {
+		t.Fatalf("manual receipt result=%#v err=%v", receipt, err)
+	}
+	t.Setenv("AMQ_KEEPALIVE_MANUAL_MODE", "unexpected")
+	if _, err := cli.RetireWake(context.Background(), mutation); err == nil || !strings.Contains(err.Error(), "unexpected status/reason") {
+		t.Fatalf("unexpected manual completion error=%v", err)
+	}
+}
+
 func TestRetireWakeAcceptsOnlyIdentityConfirmedSupersededBinding(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)

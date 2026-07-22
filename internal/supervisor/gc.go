@@ -80,6 +80,11 @@ func (g GarbageCollector) ProcessWithBudget(ctx context.Context, entry registry.
 		BindingComplete: entry.WakeBinding.Complete(),
 	}
 	updated = entry
+	if entry.ManualRetirementIntent.Active() {
+		result.ReasonCode = "manual_retirement_pending"
+		result.Reason = "exact manual retirement intent must reconcile before automatic GC"
+		return entry, result
+	}
 	defer func() {
 		if !persist {
 			return

@@ -33,6 +33,16 @@ type probeAdapter struct {
 	err error
 }
 
+func TestReconcileDefersPendingManualRetirementByteEquivalent(t *testing.T) {
+	entry := testEntry()
+	entry.ManualRetirementIntent.PlanID = "pending"
+	wake := &fakeWake{}
+	updated, result := testReconciler(wake, probeAdapter{}, fixedNow()).Reconcile(context.Background(), entry)
+	if updated != entry || result.Action != ActionDeferred || result.AMQTouched || len(wake.starts) != 0 {
+		t.Fatalf("pending reconciliation updated=%#v result=%#v starts=%#v", updated, result, wake.starts)
+	}
+}
+
 func (p probeAdapter) Probe(ctx context.Context, target string) error {
 	return p.err
 }

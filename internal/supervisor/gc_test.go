@@ -21,6 +21,16 @@ type fakeLifecycle struct {
 	requests []amq.RetireWakeRequest
 }
 
+func TestGarbageCollectorDefersPendingManualRetirementByteEquivalent(t *testing.T) {
+	entry := gcTestEntry()
+	entry.ManualRetirementIntent.PlanID = "pending"
+	wake := &fakeLifecycle{}
+	updated, result := (GarbageCollector{Wake: wake, CapabilityAvailable: true}).ProcessWithBudget(context.Background(), entry, true, true)
+	if updated != entry || result.Status != GCStatusSkipped || result.ReasonCode != "manual_retirement_pending" || result.AMQTouched || len(wake.requests) != 0 {
+		t.Fatalf("pending GC updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
+	}
+}
+
 func (f *fakeLifecycle) RetireWake(_ context.Context, request amq.RetireWakeRequest) (amq.RetireWakeResult, error) {
 	f.requests = append(f.requests, request)
 	if len(f.replies) == 0 {
