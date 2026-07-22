@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -36,6 +37,17 @@ func TestHelpWritesUsageToStdoutAndExitsZero(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestGCAbandonRequiresExactDoubleConfirmation(t *testing.T) {
+	var stderr bytes.Buffer
+	code := (App{Stdout: io.Discard, Stderr: &stderr}).Run(context.Background(), []string{
+		"gc", "--registry", filepath.Join(t.TempDir(), "registry.json"),
+		"--abandon-batch", "batch-a", "--confirm-abandon-batch", "batch-b",
+	})
+	if code != 1 || !strings.Contains(stderr.String(), "same exact non-empty batch id") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
 }
 
@@ -1393,6 +1405,14 @@ func TestInstallHookCommandWritesRequestedConfig(t *testing.T) {
 
 type appFailingWake struct{}
 
+func (appFailingWake) Env(context.Context) (amq.Env, error) {
+	return amq.Env{Capabilities: []string{amq.CapabilityWakeGCV1}}, nil
+}
+
+func (appFailingWake) RetireWake(context.Context, amq.RetireWakeRequest) (amq.RetireWakeResult, error) {
+	return amq.RetireWakeResult{}, errors.New("unexpected retirement")
+}
+
 func (appFailingWake) RepairWake(context.Context, string, string) (amq.WakeRepairResult, error) {
 	return amq.WakeRepairResult{Status: "refused", Reason: "unverified wake lock; refusing repair"}, errors.New("exit status 1")
 }
@@ -1449,6 +1469,14 @@ type appCountingWake struct {
 	starts []amq.StartWakeRequest
 }
 
+func (*appCountingWake) Env(context.Context) (amq.Env, error) {
+	return amq.Env{Capabilities: []string{amq.CapabilityWakeGCV1}}, nil
+}
+
+func (*appCountingWake) RetireWake(context.Context, amq.RetireWakeRequest) (amq.RetireWakeResult, error) {
+	return amq.RetireWakeResult{}, errors.New("unexpected retirement")
+}
+
 func (w *appCountingWake) StartWake(_ context.Context, req amq.StartWakeRequest) (amq.WakeBinding, error) {
 	w.starts = append(w.starts, req)
 	return amq.WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"}, nil
@@ -1459,10 +1487,88 @@ type appCancelingWake struct {
 	starts int
 }
 
+func (*appCancelingWake) Env(context.Context) (amq.Env, error) {
+	return amq.Env{Capabilities: []string{amq.CapabilityWakeGCV1}}, nil
+}
+
+func (*appCancelingWake) RetireWake(context.Context, amq.RetireWakeRequest) (amq.RetireWakeResult, error) {
+	return amq.RetireWakeResult{}, errors.New("unexpected retirement")
+}
+
 func (w *appCancelingWake) StartWake(ctx context.Context, _ amq.StartWakeRequest) (amq.WakeBinding, error) {
 	w.starts++
 	w.cancel()
 	return amq.WakeBinding{}, ctx.Err()
+}
+
+type appCapabilityGateWake struct {
+	capability bool
+	envCalls   int
+	starts     int
+}
+
+func (w *appCapabilityGateWake) Env(context.Context) (amq.Env, error) {
+	w.envCalls++
+	var capabilities []string
+	if w.capability {
+		capabilities = []string{amq.CapabilityWakeGCV1}
+	}
+	return amq.Env{Capabilities: capabilities}, nil
+}
+
+func (w *appCapabilityGateWake) StartWake(context.Context, amq.StartWakeRequest) (amq.WakeBinding, error) {
+	w.starts++
+	return amq.WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"}, nil
+}
+
+func (*appCapabilityGateWake) RetireWake(context.Context, amq.RetireWakeRequest) (amq.RetireWakeResult, error) {
+	return amq.RetireWakeResult{}, errors.New("unexpected retirement")
+}
+
+func TestSupervisorAutoGCDisabledGatesStartWakeOnCapability(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	target := filepath.Join(dir, "inbox")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.New(registryPath).Upsert(registry.Entry{
+		Root: dir, Agent: "codex", Adapter: "file", Target: target,
+		WakeOwnerPresent: true, WakeOwner: appTestWakeOwner(), WakeBinding: appTestWakeBinding(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := &appCapabilityGateWake{}
+	if _, err := (App{Stdout: io.Discard, Stderr: io.Discard}).superviseOnceWithGCState(
+		context.Background(), registryPath, blocked, "/bin/amq-keepalive", time.Second, supervisor.GCPolicy{},
+	); err == nil || blocked.envCalls != 1 || blocked.starts != 0 {
+		t.Fatalf("blocked capability: env=%d starts=%d err=%v", blocked.envCalls, blocked.starts, err)
+	}
+
+	allowed := &appCapabilityGateWake{capability: true}
+	if _, err := (App{Stdout: io.Discard, Stderr: io.Discard}).superviseOnceWithGCState(
+		context.Background(), registryPath, allowed, "/bin/amq-keepalive", time.Second, supervisor.GCPolicy{},
+	); err != nil || allowed.envCalls != 1 || allowed.starts != 1 {
+		t.Fatalf("allowed capability: env=%d starts=%d err=%v", allowed.envCalls, allowed.starts, err)
+	}
+}
+
+func TestSuperviseLoopKeepsCatchUpDelayAfterPendingBatchError(t *testing.T) {
+	wantErr := errors.New("durable batch failed")
+	var waits []time.Duration
+	err := runSuperviseLoop(context.Background(), time.Hour, io.Discard,
+		func(bool) (supervisionPass, error) {
+			return supervisionPass{AttemptedRoot: "/tmp/root", PendingGCRoots: true}, wantErr
+		},
+		func(_ context.Context, delay time.Duration) error {
+			waits = append(waits, delay)
+			return context.Canceled
+		},
+	)
+	if err != nil || len(waits) != 1 || waits[0] != supervisor.GCCatchUpInterval {
+		t.Fatalf("waits=%v err=%v", waits, err)
+	}
 }
 
 func TestSuperviseCancellationStopsLaterStartsAndLeavesRegistryUnchanged(t *testing.T) {
@@ -1918,7 +2024,7 @@ reason=retired_exact
 for arg in "$@"; do
   if [ "$arg" = "--check" ]; then status=eligible; reason=owner_gone; fi
 done
-printf '{"schema":1,"status":"%s","reason_code":"%s","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$status" "$reason" "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"%s","reason_code":"%s","root":"%s","agent":"codex","lock":"%s/agents/codex/.wake.lock","target":"%s","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$status" "$reason" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT/terminal-still-open"
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}

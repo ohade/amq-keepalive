@@ -179,6 +179,57 @@ capacity remains. Roots with more than eight listener rows touch no AMQ and get
 a bounded diagnostic backoff. These limits are internal and have no CLI flags
 that can weaken them.
 
+If a durable coordinator is stuck, an operator can escape it only by repeating
+the exact batch id twice:
+
+```sh
+./amq-keepalive gc \
+  --abandon-batch '<exact-batch-id>' \
+  --confirm-abandon-batch '<exact-batch-id>'
+```
+
+The command verifies the frozen id, phase, membership, and every current row in
+one atomic registry save. A retiring batch first performs exact check-only AMQ
+reconciliation when `wake_gc_v1` is available; it never issues a retire
+mutation. Positively inactive generations become retired rows. All unresolved
+rows are quarantined from automatic GC and the coordinator is removed. If AMQ
+capability discovery is unavailable, the same double-confirmed command is a
+registry-only escape that prints `unresolved_amq_state: true`; it does not claim
+that any wake was retired. A fresh explicit attach/reattach replaces the live
+row and clears its quarantine.
+
+The supervisor currently keeps the cross-process registration lease while a
+root batch runs. That preserves frozen membership and excludes a racing
+reattach, but means an eight-listener batch can delay unrelated registrations
+for up to sixteen lifecycle calls at the five-second command ceiling (about 80
+seconds, plus local persistence). Releasing and safely reacquiring that global
+lease requires a separate coordinator protocol and is intentionally not
+claimed by this change.
+
+Before enabling automatic GC against an existing user registry:
+
+1. stop or disable the LaunchAgent and copy the private registry file as a
+   rollback backup;
+2. run `gc` without `--apply` and review every identity/binding decision;
+3. canary one disposable owner-bound session with a five-minute grace, verify
+   its queued mailbox remains intact, and confirm only its exact wake and row
+   retire;
+4. enable `supervise --auto-gc` only after that canary; rollback by restoring
+   `--auto-gc=false`, stopping the daemon, and restoring the saved registry if
+   local state must be reverted.
+
+Retired rows are diagnostic evidence for at least 24 hours, not permanent audit
+history. They are purged only after retention by an exact compare-and-swap.
+
+AMQ and keepalive also have an executable producer/consumer contract check:
+
+```sh
+AMQ_BIN=/path/to/amq sh ./verify-amq-contract.sh
+```
+
+It strict-decodes real `amq env --json` and `amq wake retire --json` output and
+fails on missing, unknown, or version-mismatched fields.
+
 Supported hook install:
 
 ```sh

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "status": "eligible",
+  "reason_code": "owner_gone",
+  "agent": "worker",
+  "root": "/tmp/amq-contract/session",
+  "lock": "/tmp/amq-contract/session/agents/worker/.wake.lock",
+  "target": "/tmp/amq-contract/session/agents/worker/.wake.target",
+  "pid": 4242,
+  "generation": "generation-1",
+  "target_digest": "sha256:target-1",
+  "reason": "exact owner-bound wake is eligible for retirement"
+}

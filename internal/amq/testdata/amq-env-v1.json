@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "amq_version": "contract-fixture",
+  "root": "/tmp/amq-contract/session",
+  "root_id": "fixture-root-id",
+  "base_root": "/tmp/amq-contract",
+  "base_root_id": "fixture-base-root-id",
+  "session_name": "session",
+  "in_session": true,
+  "me": "worker",
+  "project": "contract-fixture",
+  "root_source": "flag",
+  "peers": {},
+  "shell": "zsh",
+  "wake": true,
+  "capabilities": [
+    "wake_gc_v1"
+  ]
+}

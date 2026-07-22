@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "status": "failed",
+  "reason_code": "existing_wake_blocking",
+  "reason": "an exact owner-bound wake blocks a different target",
+  "root": "/tmp/amq-contract",
+  "agent": "worker",
+  "current_generation": "generation-1",
+  "current_target_digest": "sha256:target-1",
+  "current_wake_mode": "owner_bound"
+}

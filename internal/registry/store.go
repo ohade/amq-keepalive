@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -153,6 +154,8 @@ type Entry struct {
 	RetirementReason       string             `json:"retirement_reason,omitempty"`
 	GCFailureCount         int                `json:"gc_failure_count,omitempty"`
 	GCBackoffUntil         time.Time          `json:"gc_backoff_until,omitempty"`
+	GCQuarantinedAt        time.Time          `json:"gc_quarantined_at,omitempty"`
+	GCQuarantineReason     string             `json:"gc_quarantine_reason,omitempty"`
 	LastGCRootBatchAt      time.Time          `json:"last_gc_root_batch_at,omitempty"`
 	LastGCDecision         string             `json:"last_gc_decision,omitempty"`
 	LastGCReason           string             `json:"last_gc_reason,omitempty"`
@@ -185,8 +188,26 @@ type UpdateResult struct {
 	Skipped int
 }
 
+// GCRootBatchAbandonOutcome is one frozen member's exact disposition during
+// the explicit stuck-batch escape. Every non-retired member must be
+// quarantined; only a check-only lifecycle result may supply a retired After.
+type GCRootBatchAbandonOutcome struct {
+	Before     Entry
+	After      Entry
+	Quarantine bool
+}
+
+type GCRootBatchAbandonResult struct {
+	Quarantined []string
+	Retired     []string
+}
+
 var processLocks sync.Map
 var registrationLocks sync.Map
+
+var saveAbandonedGCRootBatch = func(store *Store, file File) error {
+	return store.saveUnlocked(file)
+}
 
 type registrationSemaphore struct {
 	token chan struct{}
@@ -954,6 +975,13 @@ func validateRegistryFile(file File) error {
 		if _, duplicate := byID[entry.ID]; duplicate {
 			return fmt.Errorf("registry contains duplicate entry id %q", entry.ID)
 		}
+		quarantineReasonPresent := strings.TrimSpace(entry.GCQuarantineReason) != ""
+		if entry.GCQuarantinedAt.IsZero() == quarantineReasonPresent {
+			return fmt.Errorf("registry entry %q has incomplete GC quarantine metadata", entry.ID)
+		}
+		if entry.State == StateRetired && !entry.GCQuarantinedAt.IsZero() {
+			return fmt.Errorf("registry entry %q is both retired and GC-quarantined", entry.ID)
+		}
 		byID[entry.ID] = entry
 	}
 
@@ -971,7 +999,7 @@ func validateRegistryFile(file File) error {
 			if !ok || !member.Matches(entry) {
 				return fmt.Errorf("GC root batch %q member %q does not match the current registry row", batch.ID, member.EntryID)
 			}
-			if entry.State != StateRetired && (entry.LegacyUnbound || entry.Transition.Active() || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete()) {
+			if entry.State != StateRetired && (!entry.GCQuarantinedAt.IsZero() || entry.LegacyUnbound || entry.Transition.Active() || !entry.WakeOwnerPresent || !entry.WakeOwner.Strong() || !entry.WakeBinding.Complete()) {
 				return fmt.Errorf("GC root batch %q current member %q is not transition-free and strongly owner-bound", batch.ID, member.EntryID)
 			}
 			members[member.EntryID] = member
@@ -1063,6 +1091,91 @@ func (s *Store) FinishGCRootBatch(id string) (bool, error) {
 		return nil
 	})
 	return finished, err
+}
+
+// AbandonGCRootBatch atomically verifies the exact frozen batch and current
+// member rows, applies their check-only outcomes, quarantines every unresolved
+// member, and removes the coordinator. A save failure leaves the on-disk batch
+// and all rows unchanged.
+func (s *Store) AbandonGCRootBatch(expected GCRootBatch, outcomes []GCRootBatchAbandonOutcome, now time.Time, reason string) (GCRootBatchAbandonResult, error) {
+	var result GCRootBatchAbandonResult
+	if err := validateGCRootBatch(expected); err != nil {
+		return result, err
+	}
+	if now.IsZero() || strings.TrimSpace(reason) == "" {
+		return result, errors.New("GC root batch abandon time and reason are required")
+	}
+	if len(outcomes) != len(expected.Members) {
+		return result, fmt.Errorf("GC root batch %q abandon has %d outcomes for %d members", expected.ID, len(outcomes), len(expected.Members))
+	}
+	outcomesByID := make(map[string]GCRootBatchAbandonOutcome, len(outcomes))
+	for _, outcome := range outcomes {
+		if outcome.Before.ID == "" || outcome.Before.ID != outcome.After.ID {
+			return result, errors.New("GC root batch abandon outcome requires one unchanged entry id")
+		}
+		if _, duplicate := outcomesByID[outcome.Before.ID]; duplicate {
+			return result, fmt.Errorf("GC root batch abandon contains duplicate outcome %q", outcome.Before.ID)
+		}
+		outcomesByID[outcome.Before.ID] = outcome
+	}
+
+	err := s.withLock(func() error {
+		file, err := s.loadUnlocked()
+		if err != nil {
+			return err
+		}
+		if len(file.GCRootBatches) != 1 || !sameGCRootBatch(file.GCRootBatches[0], expected) {
+			return fmt.Errorf("GC root batch %q changed before explicit abandonment", expected.ID)
+		}
+		byID := make(map[string]int, len(file.Entries))
+		for index := range file.Entries {
+			byID[file.Entries[index].ID] = index
+		}
+		for _, member := range expected.Members {
+			outcome, ok := outcomesByID[member.EntryID]
+			if !ok || !member.Matches(outcome.Before) || !member.Matches(outcome.After) {
+				return fmt.Errorf("GC root batch %q abandon outcome %q changed frozen identity", expected.ID, member.EntryID)
+			}
+			index, ok := byID[member.EntryID]
+			if !ok || file.Entries[index] != outcome.Before {
+				return fmt.Errorf("GC root batch %q member %q changed before explicit abandonment", expected.ID, member.EntryID)
+			}
+			updated := outcome.After
+			if updated.State != StateRetired {
+				if !outcome.Quarantine {
+					return fmt.Errorf("GC root batch %q unresolved member %q is not quarantined", expected.ID, member.EntryID)
+				}
+				updated.GCQuarantinedAt = now.UTC()
+				updated.GCQuarantineReason = reason
+				updated.LastGCDecision = "skipped"
+				updated.LastGCReason = "operator_abandoned_batch"
+				result.Quarantined = append(result.Quarantined, member.EntryID)
+			} else {
+				if outcome.Quarantine {
+					return fmt.Errorf("GC root batch %q retired member %q cannot also be quarantined", expected.ID, member.EntryID)
+				}
+				result.Retired = append(result.Retired, member.EntryID)
+			}
+			file.Entries[index] = updated
+		}
+		file.GCRootBatches = nil
+		if err := saveAbandonedGCRootBatch(s, file); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return GCRootBatchAbandonResult{}, err
+	}
+	sort.Strings(result.Quarantined)
+	sort.Strings(result.Retired)
+	return result, nil
+}
+
+func sameGCRootBatch(left, right GCRootBatch) bool {
+	return left.ID == right.ID && left.CanonicalRoot == right.CanonicalRoot &&
+		left.StartedAt.Equal(right.StartedAt) && left.Phase == right.Phase &&
+		slices.Equal(left.Members, right.Members)
 }
 
 func (s *Store) Forget(id string) (bool, error) {
