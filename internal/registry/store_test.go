@@ -912,6 +912,91 @@ func TestStoreGCRootBatchFreezesMembershipAndPreservesWindowMarkers(t *testing.T
 	}
 }
 
+func TestAbandonGCRootBatchIsAtomicAndQuarantinesUnresolvedMembers(t *testing.T) {
+	now := time.Date(2026, 7, 22, 14, 0, 0, 0, time.UTC)
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	entries := []Entry{
+		{ID: "retired", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "codex"), State: StateActive, WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "one", BootID: "boot"}, WakeBinding: WakeBinding{Generation: "g1", TargetDigest: "d1"}},
+		{ID: "unresolved", Root: root, Agent: "claude", Adapter: "file", Target: filepath.Join(root, "claude"), State: StateActive, WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 2, ProcessStart: "two", BootID: "boot"}, WakeBinding: WakeBinding{Generation: "g2", TargetDigest: "d2"}},
+	}
+	if err := store.Save(File{Entries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	batch := GCRootBatch{ID: "batch-abandon", CanonicalRoot: root, StartedAt: now, Phase: GCRootBatchPreflight}
+	for _, entry := range entries {
+		batch.Members = append(batch.Members, GCRootBatchMember{
+			EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+			WakeOwnerPresent: true, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+		})
+	}
+	if _, err := store.StartGCRootBatch(batch, entries); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceGCRootBatch(batch.ID, GCRootBatchPreflight, GCRootBatchRetiring); err != nil {
+		t.Fatal(err)
+	}
+	batch.Phase = GCRootBatchRetiring
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := loaded.Entries[0]
+	unresolved := loaded.Entries[1]
+	if retired.ID != "retired" {
+		retired, unresolved = unresolved, retired
+	}
+	retiredAfter := retired
+	retiredAfter.State = StateRetired
+	retiredAfter.RetiredAt = now
+	retiredAfter.RetirementOutcome = "already_retired"
+	retiredAfter.RetirementReason = "tombstone_match"
+	outcomes := []GCRootBatchAbandonOutcome{
+		{Before: retired, After: retiredAfter},
+		{Before: unresolved, After: unresolved, Quarantine: true},
+	}
+
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSave := saveAbandonedGCRootBatch
+	saveAbandonedGCRootBatch = func(*Store, File) error { return errors.New("injected save failure") }
+	_, abandonErr := store.AbandonGCRootBatch(batch, outcomes, now, "operator confirmed stuck batch")
+	saveAbandonedGCRootBatch = originalSave
+	if abandonErr == nil || !strings.Contains(abandonErr.Error(), "injected save failure") {
+		t.Fatalf("abandon error=%v", abandonErr)
+	}
+	afterFailure, err := os.ReadFile(store.Path)
+	if err != nil || !bytes.Equal(afterFailure, before) {
+		t.Fatalf("registry changed after failed atomic save: err=%v", err)
+	}
+
+	result, err := store.AbandonGCRootBatch(batch, outcomes, now, "operator confirmed stuck batch")
+	if err != nil || len(result.Retired) != 1 || len(result.Quarantined) != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	final, err := store.Load()
+	if err != nil || len(final.GCRootBatches) != 0 {
+		t.Fatalf("final batches=%#v err=%v", final.GCRootBatches, err)
+	}
+	for _, entry := range final.Entries {
+		switch entry.ID {
+		case "retired":
+			if entry.State != StateRetired || !entry.GCQuarantinedAt.IsZero() {
+				t.Fatalf("retired outcome=%#v", entry)
+			}
+		case "unresolved":
+			if entry.State == StateRetired || !entry.GCQuarantinedAt.Equal(now) || entry.GCQuarantineReason == "" {
+				t.Fatalf("quarantined outcome=%#v", entry)
+			}
+		}
+	}
+}
+
 func TestStoreGCRootBatchRejectsStaleOrOversizedMembership(t *testing.T) {
 	store := New(filepath.Join(t.TempDir(), "registry.json"))
 	entry := Entry{

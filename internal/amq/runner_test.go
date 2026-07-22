@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -385,7 +386,7 @@ done
 func TestRetireWakeParsesStructuredNonzeroAndRequiresExactEcho(t *testing.T) {
 	dir := t.TempDir()
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
-printf '{"schema":1,"status":"refused","reason_code":"owner_live","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"refused","reason_code":"owner_live","root":"%s","agent":"codex","lock":"%s/agents/codex/.wake.lock","target":"%s/agents/codex/.wake.target","generation":"generation-1","target_digest":"sha256:target-1"}\n' "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT"
 exit 1
 `)
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
@@ -407,7 +408,7 @@ func TestRetireWakeAcceptsOnlyIdentityConfirmedSupersededBinding(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
-printf '{"schema":1,"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_target_digest":"sha256:target-2","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","lock":"%s/agents/codex/.wake.lock","target":"%s/agents/codex/.wake.target","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_target_digest":"sha256:target-2","current_wake_mode":"owner_bound"}\n' "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT"
 `)
 	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
 		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
@@ -422,7 +423,7 @@ func TestRetireWakeAcceptsExplicitRawSupersededBinding(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AMQ_KEEPALIVE_TEST_ROOT", dir)
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
-printf '{"schema":1,"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_wake_mode":"raw"}\n' "$AMQ_KEEPALIVE_TEST_ROOT"
+printf '{"schema":1,"status":"superseded","reason_code":"generation_superseded","root":"%s","agent":"codex","lock":"%s/agents/codex/.wake.lock","target":"%s/agents/codex/.wake.target","generation":"generation-1","target_digest":"sha256:target-1","current_generation":"generation-2","current_wake_mode":"raw"}\n' "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT" "$AMQ_KEEPALIVE_TEST_ROOT"
 `)
 	result, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
 		Root: dir, Me: "codex", InjectVia: "/bin/sh", Adapter: "file", Target: filepath.Join(dir, "target"),
@@ -468,9 +469,9 @@ func TestReadWakeBindingRejectsTrailingJSON(t *testing.T) {
 
 func TestLifecycleJSONRejectsUnknownFieldsWrongSchemaAndTrailingData(t *testing.T) {
 	for name, body := range map[string]string{
-		"unknown":  `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","generation":"g","target_digest":"d","extra":true}`,
-		"schema":   `{"schema":2,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","generation":"g","target_digest":"d"}`,
-		"trailing": `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","generation":"g","target_digest":"d"} {}`,
+		"unknown":  `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","generation":"g","target_digest":"d","extra":true}`,
+		"schema":   `{"schema":2,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","generation":"g","target_digest":"d"}`,
+		"trailing": `{"schema":1,"status":"retired","reason_code":"retired_exact","root":"/tmp/root","agent":"codex","lock":"/tmp/root/agents/codex/.wake.lock","generation":"g","target_digest":"d"} {}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseRetireResult([]byte(body)); err == nil {
@@ -501,6 +502,167 @@ func TestEnvRequiresSchemaOneAndStrictJSON(t *testing.T) {
 				t.Fatalf("Env accepted %s", payload)
 			}
 		})
+	}
+}
+
+func TestAMQProducerGoldenFixtures(t *testing.T) {
+	envData, err := os.ReadFile(filepath.Join("testdata", "amq-env-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var environment Env
+	if err := decodeStrictJSON(envData, &environment); err != nil {
+		t.Fatalf("strict-decode env producer fixture: %v", err)
+	}
+	if environment.SchemaVersion != 1 || environment.RootID == "" || environment.BaseRootID == "" ||
+		!environment.Wake || !environment.HasCapability(CapabilityWakeGCV1) {
+		t.Fatalf("env fixture lost producer fields: %#v", environment)
+	}
+
+	retireData, err := os.ReadFile(filepath.Join("testdata", "wake-retire-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := parseRetireResult(retireData)
+	if err != nil {
+		t.Fatalf("strict-decode retire producer fixture: %v", err)
+	}
+	if retired.Schema != 1 || retired.Lock == "" || retired.Target == "" || retired.PID == 0 || retired.Status != "eligible" {
+		t.Fatalf("retire fixture lost producer fields: %#v", retired)
+	}
+
+	startFailureData, err := os.ReadFile(filepath.Join("testdata", "wake-start-failure-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startFailurePath := filepath.Join(t.TempDir(), "wake-start-result.json")
+	if err := os.WriteFile(startFailurePath, startFailureData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startFailure, err := readWakeCommandResult(startFailurePath)
+	if err != nil {
+		t.Fatalf("strict-decode wake start failure producer fixture: %v", err)
+	}
+	if err := ValidateExistingWakeBlocker("/tmp/amq-contract", "worker", WakeBinding{
+		Generation: "generation-1", TargetDigest: "sha256:target-1",
+	}, startFailure); err != nil {
+		t.Fatalf("wake start failure fixture lost blocker proof: %v", err)
+	}
+}
+
+func TestAMQBinaryProducerContracts(t *testing.T) {
+	bin := os.Getenv("AMQ_BIN")
+	if bin == "" {
+		t.Skip("set AMQ_BIN to run the cross-repository producer contract")
+	}
+	root := filepath.Join(t.TempDir(), "amq-root")
+	if err := os.MkdirAll(filepath.Join(root, "agents", "worker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(bin, "--no-update-check", "init", "--root", root, "--agents", "worker").CombinedOutput(); err != nil {
+		t.Fatalf("initialize AMQ contract root: %v\n%s", err, output)
+	}
+	envCommand := exec.Command(bin, "env", "--root", root, "--me", "worker", "--json")
+	envData, err := envCommand.Output()
+	if err != nil {
+		t.Fatalf("AMQ env producer failed: %v", err)
+	}
+	var environment Env
+	if err := decodeStrictJSON(envData, &environment); err != nil {
+		t.Fatalf("AMQ env producer drifted from keepalive consumer: %v\n%s", err, envData)
+	}
+	if environment.SchemaVersion != 1 {
+		t.Fatalf("AMQ env schema=%d", environment.SchemaVersion)
+	}
+	injector := filepath.Join(root, "injector")
+	if err := os.WriteFile(injector, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	retireCommand := exec.Command(bin, "wake", "retire",
+		"--root", root, "--me", "worker", "--inject-via", injector,
+		"--if-generation", "generation-1", "--if-target-digest", "sha256:target-1",
+		"--require-owner-gone", "--check", "--json",
+	)
+	retireData, retireErr := retireCommand.Output()
+	if retireErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(retireErr, &exitErr) {
+			t.Fatalf("AMQ retire producer did not execute: %v", retireErr)
+		}
+	}
+	if _, err := parseRetireResult(retireData); err != nil {
+		t.Fatalf("AMQ retire producer drifted from keepalive consumer: %v\n%s", err, retireData)
+	}
+
+	// Start one real producer and use its published, identity-complete lock to
+	// force a second real producer through the structured already-running path.
+	// This prevents a hand-written lock fixture from drifting away from AMQ's
+	// process-identity requirements.
+	canonicalRoot, err := canonicalPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractBin := filepath.Join(root, "amq")
+	binData, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contractBin, binData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstReadyPath := filepath.Join(root, "first-ready.json")
+	firstResultPath := filepath.Join(root, "first-result.json")
+	firstWake := exec.Command(contractBin, "--no-update-check", "wake",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
+		"--inject-arg", "contract-first", "--ready-file", firstReadyPath,
+		"--result-file", firstResultPath,
+	)
+	var firstOutput bytes.Buffer
+	firstWake.Stdout = &firstOutput
+	firstWake.Stderr = &firstOutput
+	if err := firstWake.Start(); err != nil {
+		t.Fatalf("start first AMQ wake producer: %v", err)
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- firstWake.Wait() }()
+	t.Cleanup(func() {
+		if firstWake.Process != nil {
+			_ = firstWake.Process.Signal(os.Interrupt)
+		}
+		select {
+		case <-firstDone:
+		case <-time.After(2 * time.Second):
+			if firstWake.Process != nil {
+				_ = firstWake.Process.Kill()
+			}
+			<-firstDone
+		}
+	})
+	waitForFile(t, firstReadyPath, 5*time.Second)
+	binding, err := readWakeBinding(firstReadyPath)
+	if err != nil {
+		t.Fatalf("read first AMQ wake binding: %v; output=%s", err, firstOutput.String())
+	}
+	secondResultPath := filepath.Join(root, "second-result.json")
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSecond()
+	secondWake := exec.CommandContext(secondCtx, contractBin, "--no-update-check", "wake",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
+		"--inject-arg", "contract-second", "--accept-existing-wake",
+		"--ready-file", filepath.Join(root, "second-ready.json"),
+		"--result-file", secondResultPath,
+	)
+	secondOutput, secondErr := secondWake.CombinedOutput()
+	if secondErr == nil {
+		t.Fatal("second AMQ wake unexpectedly accepted a different target")
+	}
+	startFailure, err := readWakeCommandResult(secondResultPath)
+	if err != nil {
+		t.Fatalf("AMQ wake start failure producer drifted from keepalive consumer: %v; command=%v output=%s", err, secondErr, secondOutput)
+	}
+	if err := ValidateExistingWakeBlocker(root, "worker", binding, startFailure); err != nil {
+		t.Fatalf("AMQ wake start blocker omitted exact retirement proof: %v; result=%#v", err, startFailure)
 	}
 }
 
@@ -542,7 +704,7 @@ func TestParseRetireResultStatusContract(t *testing.T) {
 	}
 	for status, reason := range valid {
 		t.Run("valid "+status, func(t *testing.T) {
-			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q}`, status, reason)
+			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox"}`, status, reason)
 			result, err := parseRetireResult([]byte(body))
 			if err != nil || result.Status != status || result.ReasonCode != reason {
 				t.Fatalf("result=%#v err=%v", result, err)
@@ -559,7 +721,7 @@ func TestParseRetireResultStatusContract(t *testing.T) {
 	}
 	for status, reason := range invalid {
 		t.Run("invalid "+status, func(t *testing.T) {
-			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q}`, status, reason)
+			body := fmt.Sprintf(`{"schema":1,"status":%q,"reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox"}`, status, reason)
 			if _, err := parseRetireResult([]byte(body)); err == nil {
 				t.Fatalf("parseRetireResult(%s) succeeded", body)
 			}
@@ -786,6 +948,27 @@ func TestNewWakeReadyPathScavengesOnlyStaleMarkers(t *testing.T) {
 	}
 	if _, err := os.Stat(recentMarker); err != nil {
 		t.Fatalf("recent marker was scavenged: %v", err)
+	}
+}
+
+func TestRetireWakeJoinsProcessParseAndSanitizedStderrErrors(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), "#!/bin/sh\nprintf '{'\nprintf '\\033[31moperator detail\\007\\n' >&2\nexit 7\n")
+	_, err := NewCLI(fakeAMQ).RetireWake(context.Background(), RetireWakeRequest{
+		Root: dir, Me: "worker", InjectVia: fakeAMQ, Adapter: "file", Target: filepath.Join(dir, "target"),
+		Generation: "generation-1", TargetDigest: "sha256:target-1", RequireOwnerGone: true, Check: true,
+	})
+	if err == nil {
+		t.Fatal("malformed failed retire unexpectedly succeeded")
+	}
+	text := err.Error()
+	for _, want := range []string{"process failed", "parse amq wake retire JSON", "amq stderr:", "operator detail"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("joined error %q lacks %q", text, want)
+		}
+	}
+	if strings.ContainsAny(text, "\x1b\a") {
+		t.Fatalf("stderr control characters were not sanitized: %q", text)
 	}
 }
 

@@ -935,6 +935,73 @@ func TestAutoGCDisabledRetiringRetainsBatchOnUnprovenRefusal(t *testing.T) {
 	}
 }
 
+func TestExplicitAbandonPreflightQuarantinesWithoutLifecycleIO(t *testing.T) {
+	now := time.Date(2026, 7, 22, 17, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	entry := gcRootBatchEntry("codex", dir, now.Add(-10*time.Minute))
+	batch := seedGCRootBatch(t, registryPath, []registry.Entry{entry}, now, registry.GCRootBatchPreflight)
+	wake := &gcBatchScriptWake{tombstones: map[string]bool{}}
+	var stdout bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: io.Discard, Now: func() time.Time { return now }}).abandonGCRootBatch(
+		context.Background(), registryPath, wake, "/bin/amq-keepalive", time.Second, batch.ID,
+	)
+	if err != nil || wake.envCalls != 0 || len(wake.checks) != 0 || len(wake.mutations) != 0 {
+		t.Fatalf("env=%d checks=%d mutations=%d err=%v", wake.envCalls, len(wake.checks), len(wake.mutations), err)
+	}
+	loaded, err := registry.New(registryPath).Load()
+	if err != nil || len(loaded.GCRootBatches) != 0 || len(loaded.Entries) != 1 || loaded.Entries[0].GCQuarantinedAt.IsZero() {
+		t.Fatalf("loaded=%#v err=%v", loaded, err)
+	}
+	if !strings.Contains(stdout.String(), `"unresolved_amq_state": false`) {
+		t.Fatalf("output=%s", stdout.String())
+	}
+}
+
+func TestExplicitAbandonRetiringWithoutCapabilityIsLoudRegistryOnlyEscape(t *testing.T) {
+	now := time.Date(2026, 7, 22, 17, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	entry := gcRootBatchEntry("codex", dir, now.Add(-10*time.Minute))
+	batch := seedGCRootBatch(t, registryPath, []registry.Entry{entry}, now, registry.GCRootBatchRetiring)
+	wake := &gcBatchScriptWake{envErr: errors.New("capability unavailable"), tombstones: map[string]bool{}}
+	var stdout bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: io.Discard, Now: func() time.Time { return now }}).abandonGCRootBatch(
+		context.Background(), registryPath, wake, "/bin/amq-keepalive", time.Second, batch.ID,
+	)
+	if err != nil || wake.envCalls != 1 || len(wake.checks) != 0 || len(wake.mutations) != 0 {
+		t.Fatalf("env=%d checks=%d mutations=%d err=%v", wake.envCalls, len(wake.checks), len(wake.mutations), err)
+	}
+	loaded, err := registry.New(registryPath).Load()
+	if err != nil || len(loaded.GCRootBatches) != 0 || loaded.Entries[0].State == registry.StateRetired || loaded.Entries[0].GCQuarantinedAt.IsZero() {
+		t.Fatalf("loaded=%#v err=%v", loaded, err)
+	}
+	if !strings.Contains(stdout.String(), `"unresolved_amq_state": true`) || !strings.Contains(stdout.String(), "remains unresolved") {
+		t.Fatalf("output=%s", stdout.String())
+	}
+}
+
+func TestExplicitAbandonRetiringReconcilesCheckOnlyTombstone(t *testing.T) {
+	now := time.Date(2026, 7, 22, 17, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	entry := gcRootBatchEntry("codex", dir, now.Add(-10*time.Minute))
+	batch := seedGCRootBatch(t, registryPath, []registry.Entry{entry}, now, registry.GCRootBatchRetiring)
+	key := gcBatchEntryKey(entry)
+	wake := &gcBatchScriptWake{tombstones: map[string]bool{key: true}}
+	var stdout bytes.Buffer
+	err := (App{Stdout: &stdout, Stderr: io.Discard, Now: func() time.Time { return now }}).abandonGCRootBatch(
+		context.Background(), registryPath, wake, "/bin/amq-keepalive", time.Second, batch.ID,
+	)
+	if err != nil || len(wake.checks) != 1 || len(wake.mutations) != 0 {
+		t.Fatalf("checks=%d mutations=%d err=%v", len(wake.checks), len(wake.mutations), err)
+	}
+	loaded, err := registry.New(registryPath).Load()
+	if err != nil || len(loaded.GCRootBatches) != 0 || loaded.Entries[0].State != registry.StateRetired || !loaded.Entries[0].GCQuarantinedAt.IsZero() {
+		t.Fatalf("loaded=%#v err=%v", loaded, err)
+	}
+}
+
 func TestGCRootAttemptLedgerSurvivesReattachAndStillBlocksSixthRoot(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	dir := t.TempDir()

@@ -99,6 +99,11 @@ func (g GarbageCollector) ProcessWithBudget(ctx context.Context, entry registry.
 		result.Reason = "retired registry row is inside diagnostic retention"
 		return entry, result
 	}
+	if !entry.GCQuarantinedAt.IsZero() {
+		result.ReasonCode = "gc_quarantined"
+		result.Reason = "registry row is quarantined from automatic GC after an explicit stuck-batch escape"
+		return entry, result
+	}
 	if entry.Transition.Active() {
 		result.ReasonCode = "transition_active"
 		result.Reason = "reattach transition must recover before garbage collection"

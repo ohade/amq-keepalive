@@ -33,14 +33,17 @@ type Env struct {
 	SchemaVersion int               `json:"schema_version"`
 	AMQVersion    string            `json:"amq_version"`
 	Root          string            `json:"root"`
+	RootID        string            `json:"root_id,omitempty"`
 	BaseRoot      string            `json:"base_root"`
+	BaseRootID    string            `json:"base_root_id,omitempty"`
 	SessionName   string            `json:"session_name"`
 	InSession     bool              `json:"in_session"`
 	Me            string            `json:"me"`
 	Project       string            `json:"project"`
 	RootSource    string            `json:"root_source"`
 	Peers         map[string]string `json:"peers"`
-	Shell         string            `json:"shell"`
+	Shell         string            `json:"shell,omitempty"`
+	Wake          bool              `json:"wake,omitempty"`
 	Capabilities  []string          `json:"capabilities,omitempty"`
 }
 
@@ -138,6 +141,36 @@ type WakeCommandResult struct {
 	TargetDigest        string `json:"target_digest,omitempty"`
 }
 
+// RetireWakeResult mirrors AMQ's wakeRetireResult producer contract. It is
+// deliberately separate from WakeCommandResult because the two protocols have
+// different required identity fields. Keeping the types separate lets strict
+// decoding reject drift rather than accidentally accepting their union.
+type RetireWakeResult struct {
+	Schema              int    `json:"schema"`
+	Status              string `json:"status"`
+	ReasonCode          string `json:"reason_code"`
+	Agent               string `json:"agent"`
+	Root                string `json:"root"`
+	Lock                string `json:"lock"`
+	Target              string `json:"target,omitempty"`
+	PID                 int    `json:"pid,omitempty"`
+	Generation          string `json:"generation,omitempty"`
+	TargetDigest        string `json:"target_digest,omitempty"`
+	CurrentGeneration   string `json:"current_generation,omitempty"`
+	CurrentTargetDigest string `json:"current_target_digest,omitempty"`
+	CurrentWakeMode     string `json:"current_wake_mode,omitempty"`
+	Reason              string `json:"reason,omitempty"`
+}
+
+func retireAsWakeCommandResult(result RetireWakeResult) WakeCommandResult {
+	return WakeCommandResult{
+		Schema: result.Schema, Status: result.Status, ReasonCode: result.ReasonCode, Reason: result.Reason,
+		Root: result.Root, Agent: result.Agent,
+		CurrentGeneration: result.CurrentGeneration, CurrentTargetDigest: result.CurrentTargetDigest,
+		CurrentWakeMode: result.CurrentWakeMode, Generation: result.Generation, TargetDigest: result.TargetDigest,
+	}
+}
+
 type WakeStartError struct {
 	Result WakeCommandResult
 	Cause  error
@@ -164,8 +197,6 @@ type RetireWakeRequest struct {
 	Check            bool
 	Timeout          time.Duration
 }
-
-type RetireWakeResult = WakeCommandResult
 
 type CLI struct {
 	Path string
@@ -374,9 +405,13 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeR
 	result, parseErr := parseRetireResult(stdout)
 	if parseErr != nil {
 		if runErr != nil {
-			return RetireWakeResult{}, fmt.Errorf("amq wake retire failed without valid JSON: %w", runErr)
+			return RetireWakeResult{}, errors.Join(
+				fmt.Errorf("amq wake retire process failed: %w", runErr),
+				parseErr,
+				commandStderrError(stderr),
+			)
 		}
-		return RetireWakeResult{}, parseErr
+		return RetireWakeResult{}, errors.Join(parseErr, commandStderrError(stderr))
 	}
 	if err := validateRetireEcho(req, result); err != nil {
 		return result, err
@@ -385,10 +420,10 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (RetireWakeR
 		return result, commandCtx.Err()
 	}
 	if runErr != nil {
-		return result, &WakeStartError{Result: result, Cause: fmt.Errorf("amq wake retire: %w: %s", runErr, strings.TrimSpace(stderr))}
+		return result, &WakeStartError{Result: retireAsWakeCommandResult(result), Cause: errors.Join(fmt.Errorf("amq wake retire process failed: %w", runErr), commandStderrError(stderr))}
 	}
 	if result.Status == "refused" || result.Status == "error" {
-		return result, &WakeStartError{Result: result, Cause: errors.New("amq wake retire returned a failure status with a zero exit code")}
+		return result, &WakeStartError{Result: retireAsWakeCommandResult(result), Cause: errors.New("amq wake retire returned a failure status with a zero exit code")}
 	}
 	return result, nil
 }
@@ -706,8 +741,8 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 	if result.Schema != 1 {
 		return RetireWakeResult{}, fmt.Errorf("amq wake retire response has unsupported schema %d", result.Schema)
 	}
-	if result.Status == "" || result.ReasonCode == "" {
-		return RetireWakeResult{}, errors.New("amq wake retire response lacks status or reason_code")
+	if result.Status == "" || result.ReasonCode == "" || result.Agent == "" || result.Root == "" || result.Lock == "" || result.Target == "" {
+		return RetireWakeResult{}, errors.New("amq wake retire response lacks status, reason_code, agent, root, lock, or target")
 	}
 	switch result.Status {
 	case "eligible":
@@ -735,6 +770,33 @@ func parseRetireResult(data []byte) (RetireWakeResult, error) {
 		return RetireWakeResult{}, fmt.Errorf("amq wake retire response has unknown status %q", result.Status)
 	}
 	return result, nil
+}
+
+func commandStderrError(stderr string) error {
+	text := sanitizeCommandStderr(stderr)
+	if text == "" {
+		return nil
+	}
+	return fmt.Errorf("amq stderr: %s", text)
+}
+
+func sanitizeCommandStderr(stderr string) string {
+	const maxDiagnosticBytes = 4096
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, stderr)
+	clean = strings.Join(strings.Fields(clean), " ")
+	if len(clean) > maxDiagnosticBytes {
+		clean = clean[:maxDiagnosticBytes] + "..."
+	}
+	return clean
 }
 
 func decodeStrictJSON(data []byte, destination any) error {
