@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/executable"
 )
 
 var _ = func(first, second Entry) bool { return first == second }
@@ -599,6 +602,50 @@ func TestStoreLoadPreviewOfMissingRegistryDoesNotCreateParent(t *testing.T) {
 	}
 	if _, err := os.Lstat(parent); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("LoadPreview created parent %q: err=%v", parent, err)
+	}
+}
+
+func TestStoreLoadPreviewSchemaV2IsStrictAndBytePure(t *testing.T) {
+	validEntry := `{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active"}`
+	for name, raw := range map[string]string{
+		"nested duplicate key": `{"schema_version":2,"entries":[` + validEntry + `],"future":{"nested":{"key":1,"key":2}}}`,
+		"trailing document":    `{"schema_version":2,"entries":[` + validEntry + `]} {}`,
+		"future schema":        `{"schema_version":3,"entries":[` + validEntry + `]}`,
+		"missing required":     `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","state":"active"}]}`,
+		"unknown state":        `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"future"}]}`,
+		"unknown transition":   `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active","reattach_transition":{"phase":"future"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "registry.json")
+			before := []byte(raw + "\n")
+			if err := os.WriteFile(path, before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(path).LoadPreview(); err == nil {
+				t.Fatal("corrupt schema-v2 registry was accepted")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("LoadPreview changed corrupt registry: before=%q after=%q err=%v", before, after, err)
+			}
+			if _, err := os.Stat(path + ".v1.bak"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("LoadPreview created backup for corrupt schema v2: %v", err)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "registry.json")
+	raw := []byte(`{"schema_version":2,"entries":[` + validEntry + `],"future":{"nested":true}}` + "\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := New(path).LoadPreview()
+	if err != nil || len(loaded.Entries) != 1 {
+		t.Fatalf("additive unknown fields rejected: file=%#v err=%v", loaded, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(raw, after) {
+		t.Fatalf("additive LoadPreview changed bytes: before=%q after=%q err=%v", raw, after, err)
 	}
 }
 
@@ -1555,6 +1602,126 @@ func TestUpdateEntriesAllowsOnlyExactPendingManualRetirementCompletion(t *testin
 	}
 }
 
+func TestPendingManualRetirementFreezesCanonicalRootMembershipSiblingsAndGCArtifacts(t *testing.T) {
+	pending := pendingManualRetirementTestEntry(t)
+	sibling := pending
+	sibling.ID, sibling.Agent, sibling.Target = "sibling", "claude", filepath.Join(pending.Root, "sibling")
+	sibling.ManualRetirementIntent = ManualRetirementIntent{}
+	retired := sibling
+	retired.ID, retired.Agent, retired.Target, retired.State = "retired", "gemini", filepath.Join(pending.Root, "retired"), StateRetired
+	retired.RetiredAt = pending.ManualRetirementIntent.StartedAt.Add(-48 * time.Hour)
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{pending, sibling, retired}}); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := map[string]func(*File){
+		"sibling update":           func(file *File) { file.Entries[1].LastError = "changed" },
+		"retired evidence removal": func(file *File) { file.Entries = file.Entries[:2] },
+		"same-root addition": func(file *File) {
+			added := sibling
+			added.ID, added.Agent, added.Target = "added", "other", filepath.Join(pending.Root, "added")
+			file.Entries = append(file.Entries, added)
+		},
+		"root attempt": func(file *File) {
+			file.GCRootAttempts = append(file.GCRootAttempts, GCRootAttempt{CanonicalRoot: pending.Root, StartedAt: time.Now().UTC()})
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			candidate := baseline
+			candidate.Entries = append([]Entry(nil), baseline.Entries...)
+			candidate.GCRootAttempts = append([]GCRootAttempt(nil), baseline.GCRootAttempts...)
+			mutate(&candidate)
+			if err := store.Save(candidate); err == nil {
+				t.Fatal("frozen canonical root mutation succeeded")
+			}
+			loaded, err := store.Load()
+			if err != nil || !reflect.DeepEqual(loaded, baseline) {
+				t.Fatalf("frozen root changed: file=%#v err=%v", loaded, err)
+			}
+		})
+	}
+}
+
+func TestManualRetirementSamePlanEnrollmentAndSequentialReceipts(t *testing.T) {
+	first := pendingManualRetirementTestEntry(t)
+	second := first
+	second.ID, second.Agent, second.Target = "second", "claude", filepath.Join(first.Root, "second")
+	second.ManualRetirementIntent = ManualRetirementIntent{}
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{first, second}}); err != nil {
+		t.Fatal(err)
+	}
+	secondPending := second
+	secondPending.ManualRetirementIntent = first.ManualRetirementIntent
+	secondPending.ManualRetirementIntent.RowDigest = strings.Repeat("c", 64)
+	secondPending.ManualRetirementIntent.Agent = second.Agent
+	secondPending.ManualRetirementIntent.Target = second.Target
+	secondPending.ManualRetirementIntent.Generation = "generation-second"
+	secondPending.ManualRetirementIntent.TargetDigest = "sha256:digest-second"
+	result, err := store.UpdateEntries([]EntryUpdate{{Before: second, After: secondPending}})
+	if err != nil || result.Updated != 1 {
+		t.Fatalf("same-plan sibling enrollment result=%#v err=%v", result, err)
+	}
+	firstDone := completedManualRetirementTestEntry(first, "retired", "manual_retired")
+	if result, err = store.UpdateEntries([]EntryUpdate{{Before: first, After: firstDone}}); err != nil || result.Updated != 1 {
+		t.Fatalf("first exact completion result=%#v err=%v", result, err)
+	}
+	mutatedFirst := firstDone
+	mutatedFirst.LastError = "must remain frozen"
+	if err := store.UpdateEntry(mutatedFirst); err == nil {
+		t.Fatal("completed sibling changed while another plan member remained pending")
+	}
+	secondDone := completedManualRetirementTestEntry(secondPending, "already_retired", "tombstone_match")
+	if result, err = store.UpdateEntries([]EntryUpdate{{Before: secondPending, After: secondDone}}); err != nil || result.Updated != 1 {
+		t.Fatalf("second exact completion result=%#v err=%v", result, err)
+	}
+	if err := store.UpdateEntry(mutatedFirst); err != nil {
+		t.Fatalf("root remained frozen after final exact receipt: %v", err)
+	}
+}
+
+func TestExactManualRetirementCompletionWorksThroughSingleRowMutators(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Store, File, Entry) error
+	}{
+		{name: "Save", run: func(store *Store, file File, after Entry) error {
+			file.Entries[0] = after
+			return store.Save(file)
+		}},
+		{name: "UpdateEntry", run: func(store *Store, _ File, after Entry) error { return store.UpdateEntry(after) }},
+		{name: "Upsert", run: func(store *Store, _ File, after Entry) error {
+			_, err := store.Upsert(after)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := pendingManualRetirementTestEntry(t)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+				t.Fatal(err)
+			}
+			file, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			after := completedManualRetirementTestEntry(before, "retired", "manual_retired")
+			if err := test.run(store, file, after); err != nil {
+				t.Fatalf("exact completion failed: %v", err)
+			}
+			loaded, err := store.Load()
+			if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != after {
+				t.Fatalf("exact completion file=%#v err=%v", loaded, err)
+			}
+		})
+	}
+}
+
 func pendingManualRetirementTestEntry(t *testing.T) Entry {
 	t.Helper()
 	root, err := canonicalRegistryRoot(t.TempDir())
@@ -1569,11 +1736,16 @@ func pendingManualRetirementTestEntry(t *testing.T) Entry {
 		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "sha256:digest"},
 	}
 	entry.ID = EntryID(entry.Root, entry.Agent, entry.Adapter, entry.Target)
+	identity, err := executable.Capture("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
 	entry.ManualRetirementIntent = ManualRetirementIntent{
 		PlanID: strings.Repeat("a", 64), RowDigest: strings.Repeat("b", 64),
 		Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
-		AMQExecutable: "/bin/sh", InjectVia: "/bin/sh", TimeoutNanos: int64(time.Second),
-		Generation: "generation", TargetDigest: "sha256:digest", StartedAt: now,
+		AMQExecutable: identity.Path, InjectVia: identity.Path, AMQIdentity: identity, InjectIdentity: identity,
+		TimeoutNanos: int64(time.Second),
+		Generation:   "generation", TargetDigest: "sha256:digest", StartedAt: now,
 	}
 	return entry
 }

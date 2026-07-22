@@ -212,6 +212,138 @@ func TestRetireSessionTokenMismatchAndLiveTargetSignalNothing(t *testing.T) {
 	}
 }
 
+func TestRetireSessionPlanBindsSamePathExecutableContent(t *testing.T) {
+	dir := t.TempDir()
+	_, _, opts := setupLegacyRetireSession(t, dir, "alpha")
+	lifecycle := &retireSessionTestLifecycle{}
+	value, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := value.(*retireSessionPlan)
+	if err := os.WriteFile(opts.AMQPath, []byte("#!/bin/sh\nprintf changed\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	value, err = (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := value.(*retireSessionPlan)
+	if before.PlanID == after.PlanID || before.AMQIdentity.SHA256 == after.AMQIdentity.SHA256 {
+		t.Fatalf("same-path executable replacement did not change plan identity: before=%#v after=%#v", before.AMQIdentity, after.AMQIdentity)
+	}
+	opts.Apply, opts.ConfirmPlan = true, before.PlanID
+	if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{}); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("stale same-path confirmation error=%v", err)
+	}
+	if len(lifecycle.requests) != 0 {
+		t.Fatalf("same-path replacement invoked lifecycle: %#v", lifecycle.requests)
+	}
+}
+
+func TestRetireSessionPlanBindsSamePathInjectViaContent(t *testing.T) {
+	dir := t.TempDir()
+	_, _, opts := setupLegacyRetireSession(t, dir, "alpha")
+	value, err := (App{}).retireSessionWithOptions(context.Background(), opts, &retireSessionTestLifecycle{}, retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := value.(*retireSessionPlan)
+	if err := os.WriteFile(opts.Self, []byte("#!/bin/sh\nprintf changed\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	value, err = (App{}).retireSessionWithOptions(context.Background(), opts, &retireSessionTestLifecycle{}, retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := value.(*retireSessionPlan)
+	if before.PlanID == after.PlanID || before.InjectIdentity.SHA256 == after.InjectIdentity.SHA256 {
+		t.Fatalf("same-path inject-via replacement did not change plan identity: before=%#v after=%#v", before.InjectIdentity, after.InjectIdentity)
+	}
+}
+
+func TestRetireSessionRevalidatesExecutableAfterCurrentPlanCheck(t *testing.T) {
+	dir := t.TempDir()
+	_, store, opts := setupLegacyRetireSession(t, dir, "alpha")
+	value, err := (App{}).retireSessionWithOptions(context.Background(), opts, &retireSessionTestLifecycle{}, retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := value.(*retireSessionPlan)
+	probeCalls := 0
+	adapterWithSwap := retireSessionTestAdapter{probe: func(context.Context, string) error {
+		probeCalls++
+		if probeCalls == 2 {
+			replacement := filepath.Join(dir, "replacement-amq")
+			if err := os.WriteFile(replacement, []byte("#!/bin/sh\nexit 99\n"), 0o700); err != nil {
+				return err
+			}
+			if err := os.Rename(replacement, opts.AMQPath); err != nil {
+				return err
+			}
+		}
+		return adapter.ErrTargetNotFound
+	}}
+	opts.Apply, opts.ConfirmPlan = true, plan.PlanID
+	if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, amq.NewCLI(opts.AMQPath), adapterWithSwap); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("post-plan executable replacement error=%v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil || loaded.Entries[0].ManualRetirementIntent.Active() || loaded.Entries[0].State == registry.StateRetired {
+		t.Fatalf("post-plan replacement changed registry: file=%#v err=%v", loaded, err)
+	}
+}
+
+func TestRetireSessionRevalidatesExecutableBetweenMembers(t *testing.T) {
+	dir := t.TempDir()
+	root, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")
+	marker := filepath.Join(dir, "first-preflight")
+	replacement := filepath.Join(dir, "replacement-amq")
+	if err := os.WriteFile(replacement, []byte("#!/bin/sh\nexit 98\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+set -eu
+root=""; agent=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root) root="$2"; shift 2 ;;
+    --me) agent="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ ! -e "$RETIRE_SWAP_MARKER" ]; then
+  mv "$RETIRE_SWAP_REPLACEMENT" "$RETIRE_SWAP_ORIGINAL"
+  : > "$RETIRE_SWAP_MARKER"
+fi
+printf '{"schema":1,"status":"eligible","reason_code":"manual_eligible","root":"%s","agent":"%s","lock":"%s/agents/%s/.wake.lock","target":"%s/agents/%s/.wake.target","generation":"generation-%s","target_digest":"sha256:digest-%s"}\n' "$root" "$agent" "$root" "$agent" "$root" "$agent" "$agent" "$agent"
+`
+	if err := os.WriteFile(opts.AMQPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RETIRE_SWAP_MARKER", marker)
+	t.Setenv("RETIRE_SWAP_REPLACEMENT", replacement)
+	t.Setenv("RETIRE_SWAP_ORIGINAL", opts.AMQPath)
+	value, err := (App{}).retireSessionWithOptions(context.Background(), opts, amq.NewCLI(opts.AMQPath), retireSessionTestAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := value.(*retireSessionPlan)
+	opts.Apply, opts.ConfirmPlan = true, plan.PlanID
+	if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, amq.NewCLI(opts.AMQPath), retireSessionTestAdapter{}); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("between-member executable replacement error=%v root=%s", err, root)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range loaded.Entries {
+		if entry.ManualRetirementIntent.Active() || entry.State == registry.StateRetired {
+			t.Fatalf("between-member replacement persisted or retired row: %#v", entry)
+		}
+	}
+}
+
 func TestRetireSessionApplyUsesExactManualTransportAndPreservesMailboxTree(t *testing.T) {
 	dir := t.TempDir()
 	root, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")

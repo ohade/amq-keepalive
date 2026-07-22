@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/executable"
 )
 
 const (
@@ -69,18 +72,20 @@ func (b WakeBinding) Complete() bool {
 // can ask AMQ for the matching idempotent receipt instead of guessing whether
 // another signal is safe.
 type ManualRetirementIntent struct {
-	PlanID        string    `json:"plan_id"`
-	RowDigest     string    `json:"row_digest"`
-	Root          string    `json:"root"`
-	Agent         string    `json:"agent"`
-	Adapter       string    `json:"adapter"`
-	Target        string    `json:"target"`
-	AMQExecutable string    `json:"amq_executable"`
-	InjectVia     string    `json:"inject_via"`
-	TimeoutNanos  int64     `json:"timeout_nanos"`
-	Generation    string    `json:"generation"`
-	TargetDigest  string    `json:"target_digest"`
-	StartedAt     time.Time `json:"started_at"`
+	PlanID         string              `json:"plan_id"`
+	RowDigest      string              `json:"row_digest"`
+	Root           string              `json:"root"`
+	Agent          string              `json:"agent"`
+	Adapter        string              `json:"adapter"`
+	Target         string              `json:"target"`
+	AMQExecutable  string              `json:"amq_executable"`
+	InjectVia      string              `json:"inject_via"`
+	AMQIdentity    executable.Identity `json:"amq_identity"`
+	InjectIdentity executable.Identity `json:"inject_via_identity"`
+	TimeoutNanos   int64               `json:"timeout_nanos"`
+	Generation     string              `json:"generation"`
+	TargetDigest   string              `json:"target_digest"`
+	StartedAt      time.Time           `json:"started_at"`
 }
 
 func (i ManualRetirementIntent) Active() bool { return i.PlanID != "" }
@@ -448,8 +453,15 @@ func (s *Store) readRegistryUnlocked() (File, []byte, bool, error) {
 	if err != nil {
 		return File{}, nil, false, err
 	}
+	if err := validateNoDuplicateJSONKeys(data); err != nil {
+		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
+	}
 	var file File
-	if err := json.Unmarshal(data, &file); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&file); err != nil {
+		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
 		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
 	if file.SchemaVersion == 0 {
@@ -473,6 +485,79 @@ func (s *Store) readRegistryUnlocked() (File, []byte, bool, error) {
 		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
 	return file, data, migrateV1, nil
+}
+
+func validateNoDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := walkUniqueJSONValue(decoder); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func walkUniqueJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("JSON object key is not a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("JSON object contains duplicate key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := walkUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return errors.New("JSON object lacks closing delimiter")
+		}
+	case '[':
+		for decoder.More() {
+			if err := walkUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return errors.New("JSON array lacks closing delimiter")
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	return nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("registry contains trailing JSON data")
+		}
+		return fmt.Errorf("registry contains trailing data: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) backupV1Registry(data []byte) error {
@@ -554,22 +639,6 @@ func (s *Store) Save(file File) error {
 		return errors.New("registry path is required")
 	}
 	return s.withLock(func() error {
-		current, _, _, err := s.readRegistryUnlocked()
-		if err != nil {
-			return err
-		}
-		nextByID := make(map[string]Entry, len(file.Entries))
-		for _, entry := range file.Entries {
-			nextByID[entry.ID] = entry
-		}
-		for _, entry := range current.Entries {
-			if !entry.ManualRetirementIntent.Active() {
-				continue
-			}
-			if next, ok := nextByID[entry.ID]; !ok || next != entry {
-				return fmt.Errorf("registry entry %q has a pending exact manual retirement and must remain byte-equivalent through Save", entry.ID)
-			}
-		}
 		return s.saveUnlocked(file)
 	})
 }
@@ -578,6 +647,13 @@ func (s *Store) saveUnlocked(file File) error {
 	file.SchemaVersion = SchemaVersion
 	if err := validateRegistryFile(file); err != nil {
 		return fmt.Errorf("refusing invalid registry state: %w", err)
+	}
+	current, _, _, err := s.readRegistryUnlocked()
+	if err != nil {
+		return err
+	}
+	if err := validateManualRetirementRootFreeze(current, file); err != nil {
+		return err
 	}
 	sortEntries(file.Entries)
 
@@ -636,7 +712,9 @@ func (s *Store) Upsert(entry Entry) (Entry, error) {
 				continue
 			}
 			if file.Entries[i].ManualRetirementIntent.Active() {
-				return fmt.Errorf("registry entry %q has a pending exact manual retirement; registration is blocked until receipt reconciliation", prepared.ID)
+				if err := validateManualRetirementCompletion(file.Entries[i], prepared); err != nil {
+					return fmt.Errorf("registry entry %q has a pending exact manual retirement; registration is blocked until receipt reconciliation: %w", prepared.ID, err)
+				}
 			}
 			if file.Entries[i].State == StateRetired && prepared.State != StateRetired {
 				file.Entries[i].ID = nextRetiredArchiveID(file.Entries[i], occupied)
@@ -810,7 +888,7 @@ func (s *Store) prepareEntry(entry Entry) (Entry, error) {
 	if entry.State == "" {
 		entry.State = StateAttached
 	}
-	if entry.LastAttach.IsZero() {
+	if entry.LastAttach.IsZero() && entry.State != StateRetired {
 		entry.LastAttach = now
 	}
 	return entry, nil
@@ -825,7 +903,9 @@ func (s *Store) UpdateEntry(entry Entry) error {
 		for i := range file.Entries {
 			if file.Entries[i].ID == entry.ID {
 				if file.Entries[i].ManualRetirementIntent.Active() && file.Entries[i] != entry {
-					return fmt.Errorf("registry entry %q has a pending exact manual retirement and cannot be changed through UpdateEntry", entry.ID)
+					if err := validateManualRetirementCompletion(file.Entries[i], entry); err != nil {
+						return fmt.Errorf("registry entry %q pending manual retirement update: %w", entry.ID, err)
+					}
 				}
 				file.Entries[i] = entry
 				return s.saveUnlocked(file)
@@ -1129,6 +1209,25 @@ func validateRegistryFile(file File) error {
 
 	byID := make(map[string]Entry, len(file.Entries))
 	for _, entry := range file.Entries {
+		if strings.TrimSpace(entry.ID) == "" {
+			return errors.New("registry entry id is empty")
+		}
+		if strings.TrimSpace(entry.Root) == "" {
+			return fmt.Errorf("registry entry %q root is empty", entry.ID)
+		}
+		if strings.TrimSpace(entry.Agent) == "" || strings.TrimSpace(entry.Adapter) == "" || strings.TrimSpace(entry.Target) == "" {
+			return fmt.Errorf("registry entry %q lacks required agent, adapter, or target", entry.ID)
+		}
+		switch entry.State {
+		case StateAttached, StateActive, StateDetached, StateStale, StateRetired:
+		default:
+			return fmt.Errorf("registry entry %q has unknown state %q", entry.ID, entry.State)
+		}
+		switch entry.Transition.Phase {
+		case TransitionNone, TransitionReserved, TransitionRetirePending, TransitionOldRetired:
+		default:
+			return fmt.Errorf("registry entry %q has unknown reattach transition phase %q", entry.ID, entry.Transition.Phase)
+		}
 		if _, duplicate := byID[entry.ID]; duplicate {
 			return fmt.Errorf("registry contains duplicate entry id %q", entry.ID)
 		}
@@ -1146,7 +1245,9 @@ func validateRegistryFile(file File) error {
 			entryRoot, rootErr := canonicalRegistryRoot(entry.Root)
 			if entry.State == StateRetired || !validSHA256Hex(intent.PlanID) || !validSHA256Hex(intent.RowDigest) ||
 				rootErr != nil || intent.Root != entryRoot || intent.Agent != entry.Agent || intent.Adapter != entry.Adapter ||
-				intent.Target != entry.Target || intent.AMQExecutable == "" || intent.InjectVia == "" || intent.TimeoutNanos <= 0 ||
+				intent.Target != entry.Target || intent.AMQExecutable == "" || intent.InjectVia == "" ||
+				!intent.AMQIdentity.Complete() || !intent.InjectIdentity.Complete() ||
+				intent.AMQExecutable != intent.AMQIdentity.Path || intent.InjectVia != intent.InjectIdentity.Path || intent.TimeoutNanos <= 0 ||
 				intent.Generation == "" || intent.TargetDigest == "" || intent.StartedAt.IsZero() {
 				return fmt.Errorf("registry entry %q has an invalid pending manual retirement intent", entry.ID)
 			}
@@ -1247,6 +1348,197 @@ func validateManualRetirementCompletion(before, after Entry) error {
 		return errors.New("completion changed fields outside the exact retirement disposition")
 	}
 	return nil
+}
+
+// validateManualRetirementRootFreeze is the final persistence boundary for a
+// root with an in-flight exact manual retirement. While any row in a canonical
+// root has a pending intent, every sibling row and root-scoped GC artifact is
+// immutable. The only permitted deltas are enrollment of otherwise-identical
+// rows in the same exact plan and exact pending-to-receipt transitions. Keeping
+// this invariant in saveUnlocked covers every current and future locked
+// mutator, including direct Save callers.
+func validateManualRetirementRootFreeze(before, after File) error {
+	frozenRoots := make(map[string]struct{})
+	for _, entries := range [][]Entry{before.Entries, after.Entries} {
+		for _, entry := range entries {
+			if !entry.ManualRetirementIntent.Active() {
+				continue
+			}
+			root, err := canonicalRegistryRoot(entry.Root)
+			if err != nil {
+				return fmt.Errorf("canonicalize pending manual retirement root for entry %q: %w", entry.ID, err)
+			}
+			frozenRoots[root] = struct{}{}
+		}
+	}
+	if len(frozenRoots) == 0 {
+		return nil
+	}
+
+	beforeByID := make(map[string]Entry, len(before.Entries))
+	afterByID := make(map[string]Entry, len(after.Entries))
+	for _, entry := range before.Entries {
+		beforeByID[entry.ID] = entry
+	}
+	for _, entry := range after.Entries {
+		afterByID[entry.ID] = entry
+	}
+	for root := range frozenRoots {
+		plan, err := coherentManualRetirementRootPlan(root, before.Entries, after.Entries)
+		if err != nil {
+			return err
+		}
+		beforeIDs, err := entryIDsAtCanonicalRoot(before.Entries, root)
+		if err != nil {
+			return err
+		}
+		afterIDs, err := entryIDsAtCanonicalRoot(after.Entries, root)
+		if err != nil {
+			return err
+		}
+		// A brand-new registry has no prior root state to protect. Allow its
+		// complete initial snapshot, then freeze it on every subsequent save.
+		if len(before.Entries) == 0 && len(beforeIDs) == 0 {
+			beforeIDs = append([]string(nil), afterIDs...)
+			for _, id := range beforeIDs {
+				beforeByID[id] = afterByID[id]
+			}
+		}
+		if !slices.Equal(beforeIDs, afterIDs) {
+			return fmt.Errorf("canonical root %q has a pending exact manual retirement and its membership is frozen", root)
+		}
+		for _, id := range beforeIDs {
+			oldEntry := beforeByID[id]
+			newEntry := afterByID[id]
+			if oldEntry == newEntry {
+				continue
+			}
+			if oldEntry.ManualRetirementIntent.Active() {
+				if err := validateManualRetirementCompletion(oldEntry, newEntry); err != nil {
+					return fmt.Errorf("canonical root %q pending entry %q update: %w", root, id, err)
+				}
+				continue
+			}
+			if validManualRetirementEnrollment(oldEntry, newEntry, plan) {
+				continue
+			}
+			return fmt.Errorf("canonical root %q has a pending exact manual retirement and sibling entry %q must remain byte-equivalent", root, id)
+		}
+		if !slices.Equal(gcRootAttemptsAtRoot(before.GCRootAttempts, root), gcRootAttemptsAtRoot(after.GCRootAttempts, root)) {
+			return fmt.Errorf("canonical root %q has a pending exact manual retirement and its GC attempts are frozen", root)
+		}
+		if !sameGCRootBatches(gcRootBatchesAtRoot(before.GCRootBatches, root), gcRootBatchesAtRoot(after.GCRootBatches, root)) {
+			return fmt.Errorf("canonical root %q has a pending exact manual retirement and its GC batch is frozen", root)
+		}
+	}
+	return nil
+}
+
+type manualRetirementRootPlan struct {
+	PlanID         string
+	Root           string
+	AMQExecutable  string
+	InjectVia      string
+	AMQIdentity    executable.Identity
+	InjectIdentity executable.Identity
+	TimeoutNanos   int64
+}
+
+func coherentManualRetirementRootPlan(root string, files ...[]Entry) (manualRetirementRootPlan, error) {
+	var plan manualRetirementRootPlan
+	for _, entries := range files {
+		for _, entry := range entries {
+			intent := entry.ManualRetirementIntent
+			if !intent.Active() {
+				continue
+			}
+			entryRoot, err := canonicalRegistryRoot(entry.Root)
+			if err != nil {
+				return manualRetirementRootPlan{}, err
+			}
+			if entryRoot != root {
+				continue
+			}
+			candidate := manualRetirementRootPlan{
+				PlanID: intent.PlanID, Root: intent.Root, AMQExecutable: intent.AMQExecutable,
+				InjectVia: intent.InjectVia, AMQIdentity: intent.AMQIdentity, InjectIdentity: intent.InjectIdentity,
+				TimeoutNanos: intent.TimeoutNanos,
+			}
+			if plan.PlanID == "" {
+				plan = candidate
+				continue
+			}
+			if plan != candidate {
+				return manualRetirementRootPlan{}, fmt.Errorf("canonical root %q has incoherent pending manual retirement plans", root)
+			}
+		}
+	}
+	if plan.PlanID == "" {
+		return manualRetirementRootPlan{}, fmt.Errorf("canonical root %q has no pending manual retirement plan", root)
+	}
+	return plan, nil
+}
+
+func validManualRetirementEnrollment(before, after Entry, plan manualRetirementRootPlan) bool {
+	if before.ManualRetirementIntent.Active() || before.ManualRetirementReceipt.Active() || !after.ManualRetirementIntent.Active() {
+		return false
+	}
+	intent := after.ManualRetirementIntent
+	if intent.PlanID != plan.PlanID || intent.Root != plan.Root || intent.AMQExecutable != plan.AMQExecutable ||
+		intent.InjectVia != plan.InjectVia || intent.AMQIdentity != plan.AMQIdentity || intent.InjectIdentity != plan.InjectIdentity ||
+		intent.TimeoutNanos != plan.TimeoutNanos {
+		return false
+	}
+	expected := before
+	expected.ManualRetirementIntent = intent
+	return expected == after
+}
+
+func entryIDsAtCanonicalRoot(entries []Entry, canonicalRoot string) ([]string, error) {
+	ids := make([]string, 0)
+	for _, entry := range entries {
+		root, err := canonicalRegistryRoot(entry.Root)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize registry root for entry %q: %w", entry.ID, err)
+		}
+		if root == canonicalRoot {
+			ids = append(ids, entry.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+func gcRootAttemptsAtRoot(attempts []GCRootAttempt, canonicalRoot string) []GCRootAttempt {
+	result := make([]GCRootAttempt, 0)
+	for _, attempt := range attempts {
+		if attempt.CanonicalRoot == canonicalRoot {
+			result = append(result, attempt)
+		}
+	}
+	return result
+}
+
+func gcRootBatchesAtRoot(batches []GCRootBatch, canonicalRoot string) []GCRootBatch {
+	result := make([]GCRootBatch, 0, 1)
+	for _, batch := range batches {
+		if batch.CanonicalRoot == canonicalRoot {
+			result = append(result, batch)
+		}
+	}
+	return result
+}
+
+func sameGCRootBatches(left, right []GCRootBatch) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !sameGCRootBatch(left[i], right[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func canonicalRegistryRoot(root string) (string, error) {
