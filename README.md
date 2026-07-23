@@ -162,14 +162,16 @@ Supported hook install:
 `~/.amq-keepalive/hooks/amq-keepalive-session-start.sh`, backs up existing
 config files before changing them, and appends a SessionStart registration to
 Claude Code's `~/.claude/settings.json` and/or Codex's `~/.codex/hooks.json`.
-It is idempotent: running it again does not duplicate the hook. Use
+It is idempotent: running it again does not duplicate the hook, and it refreshes
+the managed timeout settings in an existing wrapped command without discarding
+the wrapper's other environment setup. Use
 `--agent claude` or `--agent codex` to target only one agent, and `--dry-run` to
 print the exact snippets without writing files.
 
 The wrapper auto-selects `cmux` when `CMUX_SURFACE_ID` is present and otherwise
 falls back to `ghostty`; `AMQ_KEEPALIVE_ADAPTER` remains an explicit override.
 It gives stdin parsing plus inner reattach/readiness work one deterministic
-`AMQ_KEEPALIVE_TIMEOUT_SECONDS` budget (default: 10), then allows the combined
+`AMQ_KEEPALIVE_TIMEOUT_SECONDS` budget (default: 30), then allows the combined
 process wrapper a fixed one-second scheduler/startup grace. This remains below
 the installed host hook's additional five-second hard-timeout margin. The hook
 reserves time for verification to observe the exact `notifier_live`
@@ -190,8 +192,8 @@ Manual Claude Code SessionStart hook snippet:
   "hooks": [
     {
       "type": "command",
-      "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' '/absolute/path/to/amq-keepalive-session-start.sh'",
-      "timeout": 15,
+      "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='30' '/absolute/path/to/amq-keepalive-session-start.sh'",
+      "timeout": 35,
       "statusMessage": "Reattaching AMQ wake..."
     }
   ]
@@ -204,8 +206,8 @@ Manual Codex SessionStart hook snippet:
 {
   "hooks": [
     {
-      "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' '/absolute/path/to/amq-keepalive-session-start.sh'",
-      "timeout": 15,
+      "command": "AMQ_KEEPALIVE_BIN='/absolute/path/to/amq-keepalive' AMQ_KEEPALIVE_TIMEOUT_SECONDS='30' '/absolute/path/to/amq-keepalive-session-start.sh'",
+      "timeout": 35,
       "type": "command"
     }
   ]

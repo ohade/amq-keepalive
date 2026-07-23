@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -17,8 +18,10 @@ const (
 	AgentClaude = "claude"
 	AgentCodex  = "codex"
 
-	DefaultTimeout = 10 * time.Second
+	DefaultTimeout = 30 * time.Second
 )
+
+var managedTimeoutAssignment = regexp.MustCompile(`(^|[[:space:]])AMQ_KEEPALIVE_TIMEOUT_SECONDS=(?:'[^']*'|"[^"]*"|[^[:space:]]+)`)
 
 const SessionStartScript = `#!/usr/bin/env bash
 # SessionStart hook wrapper for amq-keepalive.
@@ -43,7 +46,7 @@ ME="${AMQ_KEEPALIVE_ME:-${AM_ME:-}}"
 BASELINE_FILE="${AMQ_WAKE_BASELINE_FILE:-}"
 BASELINE_ERROR="${AMQ_WAKE_BASELINE_ERROR:-}"
 LOG_PATH="${AMQ_KEEPALIVE_LOG:-$HOME/.amq-keepalive/session-start.log}"
-DEFAULT_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_DEFAULT_TIMEOUT_SECONDS:-10}"
+DEFAULT_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_DEFAULT_TIMEOUT_SECONDS:-30}"
 TIMEOUT_SECONDS="${AMQ_KEEPALIVE_TIMEOUT_SECONDS:-$DEFAULT_TIMEOUT_SECONDS}"
 STDIN_TIMEOUT_SECONDS="${AMQ_KEEPALIVE_STDIN_TIMEOUT_SECONDS:-1}"
 WAKE_TIMEOUT_MILLISECONDS="${AMQ_KEEPALIVE_WAKE_TIMEOUT_MILLISECONDS:-}"
@@ -75,7 +78,7 @@ log() {
 }
 
 if ! [[ "$DEFAULT_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$DEFAULT_TIMEOUT_SECONDS" -gt 0 ]]; then
-    DEFAULT_TIMEOUT_SECONDS=10
+    DEFAULT_TIMEOUT_SECONDS=30
 fi
 if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$TIMEOUT_SECONDS" -gt 0 ]]; then
     log "invalid timeout ${TIMEOUT_SECONDS}; using ${DEFAULT_TIMEOUT_SECONDS}s"
@@ -498,8 +501,8 @@ func installClaudeHook(path, command, scriptPath string, hookTimeoutSeconds int)
 	if err != nil {
 		return FileResult{}, err
 	}
-	changed := false
-	if !hasHookCommand(sessionStart, command, scriptPath) {
+	found, changed := reconcileHookCommand(sessionStart, command, scriptPath, hookTimeoutSeconds, true)
+	if !found {
 		sessionStart = append(sessionStart, claudeSessionStartEntry(command, hookTimeoutSeconds))
 		hooks["SessionStart"] = sessionStart
 		doc["hooks"] = hooks
@@ -521,8 +524,8 @@ func installCodexHook(path, command, scriptPath string, hookTimeoutSeconds int) 
 	if err != nil {
 		return FileResult{}, err
 	}
-	changed := false
-	if !hasHookCommand(sessionStart, command, scriptPath) {
+	found, changed := reconcileHookCommand(sessionStart, command, scriptPath, hookTimeoutSeconds, false)
+	if !found {
 		hook := codexHook(command, hookTimeoutSeconds)
 		if len(sessionStart) == 0 {
 			sessionStart = append(sessionStart, map[string]interface{}{"hooks": []interface{}{hook}})
@@ -543,6 +546,78 @@ func installCodexHook(path, command, scriptPath string, hookTimeoutSeconds int) 
 		changed = true
 	}
 	return saveJSONIfChanged(path, doc, changed)
+}
+
+func reconcileHookCommand(
+	entries []interface{},
+	command string,
+	scriptPath string,
+	hookTimeoutSeconds int,
+	claude bool,
+) (bool, bool) {
+	found := false
+	changed := false
+	for _, entry := range entries {
+		obj, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, hook := range interfaceArray(obj["hooks"]) {
+			hookObj, ok := hook.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			existing := strings.TrimSpace(fmt.Sprint(hookObj["command"]))
+			if existing != command && !commandReferencesScript(existing, scriptPath) {
+				continue
+			}
+			found = true
+			reconciled := reconcileManagedCommand(existing, command)
+			if reconciled != existing {
+				hookObj["command"] = reconciled
+				changed = true
+			}
+			if !numericFieldEquals(hookObj["timeout"], hookTimeoutSeconds) {
+				hookObj["timeout"] = hookTimeoutSeconds
+				changed = true
+			}
+			if claude && fmt.Sprint(hookObj["statusMessage"]) != "Reattaching AMQ wake..." {
+				hookObj["statusMessage"] = "Reattaching AMQ wake..."
+				changed = true
+			}
+		}
+	}
+	return found, changed
+}
+
+func reconcileManagedCommand(existing, desired string) string {
+	if existing == desired {
+		return existing
+	}
+	assignment := strings.TrimSpace(managedTimeoutAssignment.FindString(desired))
+	if assignment == "" {
+		return existing
+	}
+	if managedTimeoutAssignment.MatchString(existing) {
+		return managedTimeoutAssignment.ReplaceAllString(existing, "${1}"+assignment)
+	}
+	return assignment + " " + existing
+}
+
+func numericFieldEquals(value interface{}, want int) bool {
+	switch typed := value.(type) {
+	case json.Number:
+		got, err := typed.Int64()
+		return err == nil && got == int64(want)
+	case int:
+		return typed == want
+	case int64:
+		return typed == int64(want)
+	case float64:
+		return typed == float64(want)
+	default:
+		return false
+	}
 }
 
 func claudeSessionStartEntry(command string, hookTimeoutSeconds int) map[string]interface{} {
