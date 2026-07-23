@@ -132,6 +132,61 @@ func TestStoreRejectsMalformedNonblankWakeOwnerOnWritePaths(t *testing.T) {
 	}
 }
 
+func TestStoreUpsertRejectsOwnerChangeForExistingSameID(t *testing.T) {
+	alternateOwner := `{"pid":5252,"process_start":"other-start","boot_id":"boot-2"}`
+	for _, test := range []struct {
+		name  string
+		owner string
+	}{
+		{name: "valid", owner: testRegistryWakeOwner},
+		{name: "legacy ownerless", owner: ""},
+		{name: "legacy malformed", owner: `{"pid":4242}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			existing := Entry{
+				ID:   EntryID("/tmp/root", "codex", "file", "/tmp/inbox"),
+				Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox",
+				WakeOwner: test.owner, State: StateActive, LastError: "preserve me",
+			}
+			writeRawRegistryFixture(t, store.Path, File{SchemaVersion: SchemaVersion, Entries: []Entry{existing}})
+			_, err := store.Upsert(Entry{
+				Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", WakeOwner: alternateOwner,
+			})
+			if !errors.Is(err, ErrWakeOwnerChangeRequiresReattach) || !strings.Contains(err.Error(), "transactional reattach") {
+				t.Fatalf("Upsert(different owner) error = %v, want reattach requirement", err)
+			}
+			loaded, loadErr := store.Load()
+			if loadErr != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != existing {
+				t.Fatalf("different-owner Upsert changed row: entries=%#v err=%v", loaded.Entries, loadErr)
+			}
+		})
+	}
+}
+
+func TestStoreUpsertSameOwnerIsIdempotentAndReplaceMayChangeOwner(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	first, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", WakeOwner: testRegistryWakeOwner,
+	})
+	if err != nil {
+		t.Fatalf("Upsert(first): %v", err)
+	}
+	same, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", WakeOwner: testRegistryWakeOwner,
+	})
+	if err != nil || same.ID != first.ID {
+		t.Fatalf("Upsert(same owner) entry=%#v err=%v", same, err)
+	}
+	alternateOwner := `{"pid":5252,"process_start":"other-start","boot_id":"boot-2"}`
+	replaced, removed, err := store.ReplaceSessionAdapter(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", WakeOwner: alternateOwner,
+	})
+	if err != nil || replaced.WakeOwner != alternateOwner || len(removed) != 1 || removed[0].WakeOwner != testRegistryWakeOwner {
+		t.Fatalf("ReplaceSessionAdapter(owner change) entry=%#v removed=%#v err=%v", replaced, removed, err)
+	}
+}
+
 func TestStoreAllowsMetadataUpdatesWithExactUnchangedLegacyOwner(t *testing.T) {
 	store := New(filepath.Join(t.TempDir(), "registry.json"))
 	legacy := Entry{
