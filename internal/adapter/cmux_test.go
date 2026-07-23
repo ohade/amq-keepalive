@@ -123,6 +123,10 @@ func TestCmuxInventoryRejectsMultipleLiveAliasesForPhysicalTTY(t *testing.T) {
 		if _, err := inventory.OwnershipKey(target); err == nil || !strings.Contains(err.Error(), "2 live surface aliases") {
 			t.Fatalf("OwnershipKey(%q) error = %v, want alias ambiguity", target, err)
 		}
+		key, err := inventory.(PhysicalIdentityInventory).PhysicalIdentityKey(target)
+		if err != nil || key != "tty:/dev/ttys011" {
+			t.Fatalf("PhysicalIdentityKey(%q) = %q, %v, want stable tty identity", target, key, err)
+		}
 	}
 }
 
