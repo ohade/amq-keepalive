@@ -30,6 +30,15 @@ type TargetInventory interface {
 	OwnershipKey(target string) (string, error)
 }
 
+// PhysicalIdentityInventory can resolve a target's stable physical identity
+// even when the adapter cannot prove that the target is its sole live alias.
+// The returned key must use the same namespace as OwnershipKey. Callers may use
+// it only to prove that two targets are physically distinct; a matching key or
+// an error remains ambiguous and must fail closed.
+type PhysicalIdentityInventory interface {
+	PhysicalIdentityKey(target string) (string, error)
+}
+
 // InventoryProvider lets the supervisor inventory an adapter once per pass
 // instead of spawning one probe process for every registry entry.
 type InventoryProvider interface {

@@ -32,6 +32,29 @@ func TestHelpWritesUsageToStdoutAndExitsZero(t *testing.T) {
 	}
 }
 
+func TestAttachRejectsOptionShapedSessionBeforeRegistryMutation(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	var stderr bytes.Buffer
+	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
+		"attach",
+		"--registry", registryPath,
+		"--adapter", "file",
+		"--target", filepath.Join(dir, "inbox.txt"),
+		"--root", filepath.Join(dir, "mail", "--help"),
+		"--base-root", filepath.Join(dir, "mail"),
+		"--session", "--help",
+		"--me", "codex",
+		"--no-start",
+	})
+	if code != 1 || !strings.Contains(stderr.String(), "cannot start with '-'") {
+		t.Fatalf("code=%d stderr=%q, want option-shaped session rejection", code, stderr.String())
+	}
+	if _, err := os.Stat(registryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("registry stat error = %v, want no registry mutation", err)
+	}
+}
+
 func TestReattachReplacesCurrentSessionAdapterEntry(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
@@ -173,6 +196,45 @@ func TestReattachRejectsDifferentSurfaceAliasOnOwnedPhysicalTTY(t *testing.T) {
 	loaded, err := store.Load()
 	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].Target != firstTarget {
 		t.Fatalf("physical collision changed registry: entries=%#v err=%v", loaded.Entries, err)
+	}
+}
+
+func TestReattachIgnoresAmbiguousAliasOnDifferentPhysicalTTY(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("cmux adapter requires macOS")
+	}
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	staleTarget := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
+	candidateTarget := "cmux:surface:4191112A-7B5F-4D79-93A8-5D02BCA2E25A"
+	store := registry.New(registryPath)
+	if _, err := store.Upsert(registry.Entry{
+		Root: "/tmp/stale", Agent: "codex", Adapter: "cmux", Target: staleTarget,
+	}); err != nil {
+		t.Fatalf("Upsert stale owner: %v", err)
+	}
+	fakeCmux := filepath.Join(dir, "cmux")
+	tree := `{"windows":[{"workspaces":[{"panes":[{"surfaces":[` +
+		`{"id":"F901D722-6789-4BBB-9818-C4E97F20BEB3","tty":"ttys101"},` +
+		`{"id":"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2","tty":"/dev/ttys101"},` +
+		`{"id":"4191112A-7B5F-4D79-93A8-5D02BCA2E25A","tty":"ttys102"}` +
+		`]}]}]}]}`
+	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+tree+"'\n"), 0o700); err != nil {
+		t.Fatalf("write fake cmux: %v", err)
+	}
+	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := (App{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
+		"reattach", "--registry", registryPath, "--adapter", "cmux", "--target", candidateTarget,
+		"--root", "/tmp/fresh", "--base-root", "/tmp", "--session", "fresh", "--me", "claude", "--no-start",
+	})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s, want unrelated stale ambiguity ignored", code, stderr.String())
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 2 {
+		t.Fatalf("entries=%#v err=%v, want stale and fresh registrations", loaded.Entries, err)
 	}
 }
 

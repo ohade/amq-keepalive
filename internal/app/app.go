@@ -171,6 +171,9 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 			opts.Me = env.Me
 		}
 	}
+	if strings.HasPrefix(strings.TrimSpace(opts.SessionName), "-") {
+		return fmt.Errorf("AMQ session name %q cannot start with '-'", opts.SessionName)
+	}
 	opts.Root, opts.BaseRoot = normalizeAMQPaths(opts.Root, opts.BaseRoot, opts.SessionName)
 	if opts.BaselineFile != "" {
 		opts.BaselineFile = filepath.Clean(strings.TrimSpace(opts.BaselineFile))
@@ -390,6 +393,17 @@ func checkPhysicalTargetAvailable(
 			continue
 		}
 		if err != nil {
+			// An old target may have gained duplicate aliases while remaining on
+			// a physical terminal unrelated to this registration. That ambiguity
+			// must not poison every future registration on the machine. Skip it
+			// only when the adapter can positively prove a different physical
+			// identity; matching or unresolved identities still fail closed.
+			if physicalInventory, ok := inventory.(adapter.PhysicalIdentityInventory); ok {
+				existingPhysicalKey, physicalErr := physicalInventory.PhysicalIdentityKey(target)
+				if physicalErr == nil && existingPhysicalKey != candidateKey {
+					continue
+				}
+			}
 			return fmt.Errorf("resolve registered physical target ownership for %s@%s: %w", existing.Agent, existing.Root, err)
 		}
 		if existingKey == candidateKey {

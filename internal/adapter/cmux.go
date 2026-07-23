@@ -159,7 +159,7 @@ func (i cmuxTargetInventory) Probe(target string) error {
 	return err
 }
 
-func (i cmuxTargetInventory) OwnershipKey(target string) (string, error) {
+func (i cmuxTargetInventory) physicalTTY(target string) (string, error) {
 	_, surface, err := i.lookup(target)
 	if err != nil {
 		return "", err
@@ -167,6 +167,22 @@ func (i cmuxTargetInventory) OwnershipKey(target string) (string, error) {
 	tty, err := canonicalCmuxTTY(surface.TTY)
 	if err != nil {
 		return "", fmt.Errorf("cmux target %q physical identity is ambiguous: %w", target, err)
+	}
+	return tty, nil
+}
+
+func (i cmuxTargetInventory) PhysicalIdentityKey(target string) (string, error) {
+	tty, err := i.physicalTTY(target)
+	if err != nil {
+		return "", err
+	}
+	return "tty:" + tty, nil
+}
+
+func (i cmuxTargetInventory) OwnershipKey(target string) (string, error) {
+	tty, err := i.physicalTTY(target)
+	if err != nil {
+		return "", err
 	}
 	owners := i.ttyOwners[tty]
 	if len(owners) != 1 {
