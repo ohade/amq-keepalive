@@ -169,6 +169,57 @@ func TestAttachNoStartRefusesMissingWakeOwner(t *testing.T) {
 	}
 }
 
+func TestAttachDifferentOwnerRequiresReattachAndPreservesExistingRow(t *testing.T) {
+	alternateOwner := `{"pid":5252,"process_start":"other-start","boot_id":"boot-2"}`
+	for _, noStart := range []bool{false, true} {
+		name := "normal"
+		if noStart {
+			name = "no-start"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			registryPath := filepath.Join(dir, "registry.json")
+			target := filepath.Join(dir, "inbox.txt")
+			store := registry.New(registryPath)
+			existing, err := store.Upsert(registry.Entry{
+				Root: "/tmp/amq-root", BaseRoot: "/tmp", SessionName: "amq-root",
+				Agent: "codex", Adapter: "file", Target: target, WakeOwner: testWakeOwner,
+				State: registry.StateActive,
+			})
+			if err != nil {
+				t.Fatalf("Upsert(existing): %v", err)
+			}
+			called := filepath.Join(dir, "amq-called")
+			t.Setenv("AMQ_KEEPALIVE_CALLED", called)
+			t.Setenv(amq.WakeOwnerEnvironment, alternateOwner)
+			fakeAMQ := filepath.Join(dir, "amq")
+			if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\n: > \"$AMQ_KEEPALIVE_CALLED\"\nexit 7\n"), 0o700); err != nil {
+				t.Fatalf("write fake AMQ: %v", err)
+			}
+			args := []string{
+				"attach", "--registry", registryPath, "--adapter", "file", "--target", target,
+				"--root", "/tmp/amq-root", "--base-root", "/tmp", "--session", "amq-root",
+				"--me", "codex", "--amq", fakeAMQ,
+			}
+			if noStart {
+				args = append(args, "--no-start")
+			}
+			var stderr bytes.Buffer
+			code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), args)
+			if code != 1 || !strings.Contains(stderr.String(), "transactional reattach") {
+				t.Fatalf("attach code=%d stderr=%q, want visible reattach requirement", code, stderr.String())
+			}
+			loaded, loadErr := store.Load()
+			if loadErr != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != existing {
+				t.Fatalf("different-owner attach changed registry: entries=%#v err=%v", loaded.Entries, loadErr)
+			}
+			if _, statErr := os.Stat(called); !os.IsNotExist(statErr) {
+				t.Fatalf("different-owner attach touched AMQ: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestAttachIsIdempotentForSamePhysicalCmuxOwner(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("cmux adapter requires macOS")
@@ -292,6 +343,11 @@ func TestReattachPreservesRegistryWhenWakeTargetCannotChange(t *testing.T) {
 		"--me", "codex",
 		"--no-start",
 	)
+	before, err := registry.New(registryPath).Load()
+	if err != nil || len(before.Entries) != 1 {
+		t.Fatalf("Load(before reattach) entries=%#v err=%v", before.Entries, err)
+	}
+	t.Setenv(amq.WakeOwnerEnvironment, `{"pid":5252,"process_start":"other-start","boot_id":"boot-2"}`)
 	fakeAMQ := filepath.Join(dir, "amq")
 	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\necho 'existing wake target differs' >&2\nexit 7\n"), 0o700); err != nil {
 		t.Fatalf("write fake AMQ: %v", err)
@@ -320,8 +376,8 @@ func TestReattachPreservesRegistryWhenWakeTargetCannotChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(loaded.Entries) != 1 || loaded.Entries[0].Target != oldTarget {
-		t.Fatalf("entries = %#v, want old target restored", loaded.Entries)
+	if len(loaded.Entries) != 1 || loaded.Entries[0] != before.Entries[0] {
+		t.Fatalf("entries = %#v, want exact old owner row %#v restored", loaded.Entries, before.Entries)
 	}
 }
 

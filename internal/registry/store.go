@@ -62,6 +62,7 @@ type Store struct {
 
 var ErrCorrupt = errors.New("registry file is corrupt")
 var ErrTargetOwned = errors.New("adapter target is already owned")
+var ErrWakeOwnerChangeRequiresReattach = errors.New("wake owner change requires transactional reattach")
 
 type EntryUpdate struct {
 	Before Entry
@@ -270,6 +271,9 @@ func (s *Store) Upsert(entry Entry) (Entry, error) {
 		replaced := false
 		for i := range file.Entries {
 			if file.Entries[i].ID == prepared.ID {
+				if file.Entries[i].WakeOwner != prepared.WakeOwner {
+					return fmt.Errorf("%w: entry %q already has a different owner", ErrWakeOwnerChangeRequiresReattach, prepared.ID)
+				}
 				file.Entries[i] = prepared
 				replaced = true
 				break
