@@ -17,6 +17,6 @@ func statIdentity(info os.FileInfo) (device, inode uint64, uid, gid uint32, err 
 	return 0, 0, 0, 0, errors.New("stable executable stat identity is unsupported on this platform")
 }
 
-func commandContext(ctx context.Context, expected Identity, args ...string) (*exec.Cmd, func(), error) {
+func commandContext(ctx context.Context, expected Identity, args ...string) (*exec.Cmd, func() error, error) {
 	return nil, nil, errors.New("verified descriptor execution is unsupported on this platform")
 }

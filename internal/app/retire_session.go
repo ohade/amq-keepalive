@@ -203,20 +203,28 @@ func (a App) retireSessionWithOptions(ctx context.Context, opts retireSessionOpt
 			}
 		}
 
-		// The adapter target is external to AMQ's metadata transaction. Narrow
-		// that unavoidable race by re-proving the whole plan absent after every
-		// exact intent is durable and immediately before the first mutation.
-		// A failure leaves the root frozen by those intents for a safe retry.
+		// The adapter target is external to AMQ's metadata transaction. When
+		// any work remains, narrow that unavoidable race by re-proving every
+		// member of the frozen plan absent immediately before the next
+		// mutation. Exact receipts suppress duplicate mutation, but they do
+		// not remove their members from the whole-root safety barrier: a
+		// receipted sibling may have reappeared since plan construction.
+		hasUnresolved := false
 		for _, member := range current.Members {
-			if member.receipt.Active() {
-				continue
+			if !member.receipt.Active() {
+				hasUnresolved = true
+				break
 			}
-			probeErr := selected.Probe(ctx, member.Target)
-			switch {
-			case probeErr == nil:
-				return fmt.Errorf("manual retirement target reappeared for agent %s after durable enrollment; no wake retirement signals were sent and the root remains pending", member.Agent)
-			case !errors.Is(probeErr, adapter.ErrTargetNotFound):
-				return fmt.Errorf("manual retirement target absence became ambiguous for agent %s after durable enrollment; no wake retirement signals were sent and the root remains pending: %w", member.Agent, probeErr)
+		}
+		if hasUnresolved {
+			for _, member := range current.Members {
+				probeErr := selected.Probe(ctx, member.Target)
+				switch {
+				case probeErr == nil:
+					return fmt.Errorf("manual retirement target reappeared for agent %s after durable enrollment; no wake retirement signals were sent and the root remains pending", member.Agent)
+				case !errors.Is(probeErr, adapter.ErrTargetNotFound):
+					return fmt.Errorf("manual retirement target absence became ambiguous for agent %s after durable enrollment; no wake retirement signals were sent and the root remains pending: %w", member.Agent, probeErr)
+				}
 			}
 		}
 
