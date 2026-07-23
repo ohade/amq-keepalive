@@ -13,9 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
 
-const DefaultLabel = "com.ohade.amq-keepalive"
+const (
+	DefaultLabel              = "com.ohade.amq-keepalive"
+	DefaultSupervisorInterval = time.Minute
+)
 
 type Options struct {
 	Label        string
@@ -24,6 +29,10 @@ type Options struct {
 	RegistryPath string
 	AMQPath      string
 	Interval     time.Duration
+	AutoGC       bool
+	OwnerGrace   time.Duration
+	Retention    time.Duration
+	GCTimeout    time.Duration
 	StdoutPath   string
 	StderrPath   string
 	Load         bool
@@ -106,7 +115,16 @@ func NormalizeOptions(opts Options) (Options, error) {
 		opts.RegistryPath = abs
 	}
 	if opts.Interval <= 0 {
-		opts.Interval = time.Minute
+		opts.Interval = DefaultSupervisorInterval
+	}
+	if opts.OwnerGrace < supervisor.MinOwnerGoneGrace {
+		opts.OwnerGrace = supervisor.MinOwnerGoneGrace
+	}
+	if opts.Retention < supervisor.MinRetiredRetention {
+		opts.Retention = supervisor.MinRetiredRetention
+	}
+	if opts.GCTimeout <= 0 || opts.GCTimeout > supervisor.MaxLifecycleTimeout {
+		opts.GCTimeout = supervisor.MaxLifecycleTimeout
 	}
 	if opts.PlistPath == "" {
 		path, err := DefaultPlistPath(opts.Label)
@@ -191,6 +209,10 @@ func BuildPlist(opts Options) []byte {
 		"--amq", opts.AMQPath,
 		"--self", opts.BinaryPath,
 		"--interval", opts.Interval.String(),
+		"--auto-gc=" + strconv.FormatBool(opts.AutoGC),
+		"--owner-gone-grace", opts.OwnerGrace.String(),
+		"--retired-retention", opts.Retention.String(),
+		"--gc-timeout", opts.GCTimeout.String(),
 	}
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)

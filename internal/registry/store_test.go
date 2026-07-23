@@ -1,14 +1,23 @@
 package registry
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/executable"
 )
+
+var _ = func(first, second Entry) bool { return first == second }
 
 func TestStoreUpsertRoundTripAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".amq-keepalive", "registry.json")
@@ -319,81 +328,68 @@ func TestStoreDoesNotChmodExistingCustomRegistryDir(t *testing.T) {
 	}
 }
 
-func TestStoreReplaceSessionAdapterRemovesAllEntriesForRootAndAgent(t *testing.T) {
+func TestStoreReplaceSessionAdapterFailsClosedBeforeMutatingMultipleLiveRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	store := New(path)
-
-	replaceMe, err := store.Upsert(Entry{
+	first := Entry{
+		ID:      EntryID("/tmp/amq-root", "codex", "file", "/tmp/old-inbox.txt"),
 		Root:    "/tmp/amq-root",
 		Agent:   "codex",
 		Adapter: "file",
 		Target:  "/tmp/old-inbox.txt",
-	})
-	if err != nil {
-		t.Fatalf("Upsert(replaceMe) error = %v", err)
+		State:   StateActive,
 	}
-	keepDifferentAgent, err := store.Upsert(Entry{
-		Root:    "/tmp/amq-root",
-		Agent:   "claude",
-		Adapter: "file",
-		Target:  "/tmp/claude-inbox.txt",
-	})
-	if err != nil {
-		t.Fatalf("Upsert(keepDifferentAgent) error = %v", err)
-	}
-	replaceDifferentAdapter, err := store.Upsert(Entry{
+	second := Entry{
+		ID:      EntryID("/tmp/amq-root", "codex", "ghostty", "ghostty:terminal:old"),
 		Root:    "/tmp/amq-root",
 		Agent:   "codex",
 		Adapter: "ghostty",
 		Target:  "ghostty:terminal:old",
-	})
+		State:   StateActive,
+	}
+	keep := Entry{
+		ID:      EntryID("/tmp/amq-root", "claude", "file", "/tmp/claude-inbox.txt"),
+		Root:    "/tmp/amq-root",
+		Agent:   "claude",
+		Adapter: "file",
+		Target:  "/tmp/claude-inbox.txt",
+		State:   StateActive,
+	}
+	if err := store.Save(File{SchemaVersion: SchemaVersion, Entries: []Entry{first, second, keep}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("Upsert(replaceDifferentAdapter) error = %v", err)
+		t.Fatal(err)
 	}
 
-	next, removed, err := store.ReplaceSessionAdapter(Entry{
+	_, removed, err := store.ReplaceSessionAdapter(Entry{
 		Root:    "/tmp/amq-root",
 		Agent:   "codex",
 		Adapter: "cmux",
 		Target:  "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3",
 	})
+	if !errors.Is(err, ErrAmbiguousSession) || len(removed) != 0 {
+		t.Fatalf("ReplaceSessionAdapter() removed=%#v error=%v, want fail-closed ambiguity", removed, err)
+	}
+	after, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("ReplaceSessionAdapter() error = %v", err)
+		t.Fatal(err)
 	}
-	if next.Adapter != "cmux" {
-		t.Fatalf("Adapter = %q, want cmux", next.Adapter)
-	}
-	removedIDs := map[string]bool{}
-	for _, entry := range removed {
-		removedIDs[entry.ID] = true
-	}
-	if len(removed) != 2 || !removedIDs[replaceMe.ID] || !removedIDs[replaceDifferentAdapter.ID] {
-		t.Fatalf("removed = %#v, want old file and Ghostty entries", removed)
-	}
-
-	loaded, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if len(loaded.Entries) != 2 {
-		t.Fatalf("entries = %d, want 2", len(loaded.Entries))
-	}
-	ids := map[string]bool{}
-	for _, entry := range loaded.Entries {
-		ids[entry.ID] = true
-		if entry.ID == replaceMe.ID || entry.ID == replaceDifferentAdapter.ID {
-			t.Fatalf("old matching entry still present: %#v", entry)
-		}
-	}
-	for _, want := range []string{keepDifferentAgent.ID, next.ID} {
-		if !ids[want] {
-			t.Fatalf("entry %q missing after replace; entries=%#v", want, loaded.Entries)
-		}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("registry changed on ambiguous replacement:\nbefore=%s\nafter=%s", before, after)
 	}
 }
 
 func TestStoreRestoresPreviousRowsOnlyWhileReservationIsUnchanged(t *testing.T) {
 	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	retired, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/history", State: StateRetired,
+		RetiredAt: time.Date(2026, 6, 26, 11, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("Upsert retired: %v", err)
+	}
 	previous, err := store.Upsert(Entry{Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/old"})
 	if err != nil {
 		t.Fatalf("Upsert previous: %v", err)
@@ -409,8 +405,14 @@ func TestStoreRestoresPreviousRowsOnlyWhileReservationIsUnchanged(t *testing.T) 
 		t.Fatalf("RestoreSessionAdapterIfUnchanged restored=%v err=%v", restored, err)
 	}
 	loaded, err := store.Load()
-	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != previous {
+	if err != nil || len(loaded.Entries) != 2 {
 		t.Fatalf("restored entries=%#v err=%v", loaded.Entries, err)
+	}
+	if got, ok := findTestEntry(loaded.Entries, retired.ID); !ok || got != retired {
+		t.Fatalf("retired history changed during restore: got=%#v ok=%v", got, ok)
+	}
+	if got, ok := findTestEntry(loaded.Entries, previous.ID); !ok || got != previous {
+		t.Fatalf("live row was not restored: got=%#v ok=%v", got, ok)
 	}
 
 	reservation, removed, err = store.ReplaceSessionAdapter(Entry{
@@ -511,6 +513,1407 @@ func TestStoreCorruptRegistryReturnsTypedError(t *testing.T) {
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Load() error = %v, want ErrCorrupt", err)
 	}
+}
+
+func TestStoreMigratesV1WithSecureBackupAndLegacyFailClosedState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active"}]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := New(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SchemaVersion != 2 || len(loaded.Entries) != 1 || !loaded.Entries[0].LegacyUnbound || loaded.Entries[0].WakeOwnerPresent {
+		t.Fatalf("migrated registry=%#v", loaded)
+	}
+	backup := path + ".v1.bak"
+	backupData, err := os.ReadFile(backup)
+	if err != nil || !bytes.Equal(backupData, v1) {
+		t.Fatalf("backup=%q err=%v", backupData, err)
+	}
+	if info, err := os.Stat(backup); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode=%v err=%v", info.Mode().Perm(), err)
+	}
+	var disk File
+	data, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(data, &disk) != nil || disk.SchemaVersion != 2 {
+		t.Fatalf("migrated disk=%q err=%v", data, err)
+	}
+}
+
+func TestStoreMigrationIgnoresCleanupFailureAfterDurableBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousRemove := removeMigrationTemp
+	removeMigrationTemp = func(string) error { return errors.New("injected temporary cleanup failure") }
+	t.Cleanup(func() { removeMigrationTemp = previousRemove })
+	loaded, err := New(path).Load()
+	if err != nil || loaded.SchemaVersion != SchemaVersion {
+		t.Fatalf("migration reported false failure: loaded=%#v err=%v", loaded, err)
+	}
+	backup, err := os.ReadFile(path + ".v1.bak")
+	if err != nil || !bytes.Equal(backup, v1) {
+		t.Fatalf("durable backup=%q err=%v", backup, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(dir, ".registry-v1-backup-*.tmp"))
+	if err != nil || len(temps) != 1 {
+		t.Fatalf("best-effort cleanup test did not retain exactly one injected temp: temps=%v err=%v", temps, err)
+	}
+}
+
+func TestStoreLoadPreviewMigratesV1OnlyInMemoryWithoutFilesystemWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active","wake_owner_present":true,"wake_binding":{"generation":"old","target_digest":"old"}}]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := New(path).LoadPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SchemaVersion != SchemaVersion || len(loaded.Entries) != 1 || !loaded.Entries[0].LegacyUnbound || loaded.Entries[0].WakeOwnerPresent || loaded.Entries[0].WakeBinding.Complete() {
+		t.Fatalf("preview migration=%#v", loaded)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(onDisk, v1) {
+		t.Fatalf("preview mutated registry: data=%q err=%v", onDisk, err)
+	}
+	for _, forbidden := range []string{path + ".lock", path + ".v1.bak"} {
+		if _, err := os.Lstat(forbidden); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("preview created %q: err=%v", forbidden, err)
+		}
+	}
+}
+
+func TestStoreLoadPreviewOfMissingRegistryDoesNotCreateParent(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "missing", "nested")
+	loaded, err := New(filepath.Join(parent, "registry.json")).LoadPreview()
+	if err != nil || loaded.SchemaVersion != SchemaVersion || len(loaded.Entries) != 0 {
+		t.Fatalf("LoadPreview()=%#v err=%v", loaded, err)
+	}
+	if _, err := os.Lstat(parent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("LoadPreview created parent %q: err=%v", parent, err)
+	}
+}
+
+func TestStoreLoadPreviewSchemaV2IsStrictAndBytePure(t *testing.T) {
+	validEntry := `{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active"}`
+	for name, raw := range map[string]string{
+		"nested duplicate key": `{"schema_version":2,"entries":[` + validEntry + `],"future":{"nested":{"key":1,"key":2}}}`,
+		"trailing document":    `{"schema_version":2,"entries":[` + validEntry + `]} {}`,
+		"future schema":        `{"schema_version":3,"entries":[` + validEntry + `]}`,
+		"missing entries":      `{"schema_version":2}`,
+		"null entries":         `{"schema_version":2,"entries":null}`,
+		"missing required":     `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","state":"active"}]}`,
+		"unknown state":        `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"future"}]}`,
+		"unknown transition":   `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active","reattach_transition":{"phase":"future"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "registry.json")
+			before := []byte(raw + "\n")
+			if err := os.WriteFile(path, before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(path).LoadPreview(); err == nil {
+				t.Fatal("corrupt schema-v2 registry was accepted")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("LoadPreview changed corrupt registry: before=%q after=%q err=%v", before, after, err)
+			}
+			if _, err := os.Stat(path + ".v1.bak"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("LoadPreview created backup for corrupt schema v2: %v", err)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "registry.json")
+	raw := []byte(`{"schema_version":2,"entries":[` + validEntry + `],"future":{"nested":true}}` + "\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := New(path).LoadPreview()
+	if err != nil || len(loaded.Entries) != 1 {
+		t.Fatalf("additive unknown fields rejected: file=%#v err=%v", loaded, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(raw, after) {
+		t.Fatalf("additive LoadPreview changed bytes: before=%q after=%q err=%v", raw, after, err)
+	}
+}
+
+func TestStoreSaveWritesEmptySchemaV2EntriesArray(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := New(path).Save(File{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(bytes.TrimSpace(envelope["entries"])); got != "[]" {
+		t.Fatalf("empty entries=%s, want []", got)
+	}
+	loaded, err := New(path).LoadPreview()
+	if err != nil || loaded.SchemaVersion != SchemaVersion || len(loaded.Entries) != 0 {
+		t.Fatalf("empty schema-v2 registry=%#v err=%v", loaded, err)
+	}
+}
+
+func TestStoreAmbiguousV1ReplacementDoesNotMigrateOrCreateBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[{"id":"one","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/one","state":"active"},{"id":"two","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/two","state":"active"}]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := New(path).ReplaceSessionAdapter(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/new",
+	})
+	if !errors.Is(err, ErrAmbiguousSession) {
+		t.Fatalf("ReplaceSessionAdapter() error=%v, want ErrAmbiguousSession", err)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(onDisk, v1) {
+		t.Fatalf("ambiguous replacement migrated v1: data=%q err=%v", onDisk, err)
+	}
+	if _, err := os.Lstat(path + ".v1.bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ambiguous replacement created backup: err=%v", err)
+	}
+}
+
+func TestStoreV1BackupConcurrentPublicationIsCompleteAndNoOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	store := New(path)
+	v1 := []byte(`{"schema_version":1,"entries":[{"id":"entry-1"}]}` + "\n")
+
+	const writers = 16
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.backupV1Registry(v1)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("backupV1Registry() error=%v", err)
+		}
+	}
+	backup, err := os.ReadFile(path + ".v1.bak")
+	if err != nil || !bytes.Equal(backup, v1) {
+		t.Fatalf("published backup=%q err=%v", backup, err)
+	}
+	info, err := os.Stat(path + ".v1.bak")
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup info=%v err=%v", info, err)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".registry-v1-backup-*.tmp"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("backup temp leftovers=%v err=%v", leftovers, err)
+	}
+}
+
+func TestStoreV1BackupPublicationFailureLeavesRegistryAndDestinationUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := path + ".v1.bak"
+	if err := os.Mkdir(backupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path).Load(); err == nil || !strings.Contains(err.Error(), "not a secure 0600 regular file") {
+		t.Fatalf("Load() error=%v, want secure destination refusal", err)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(onDisk, v1) {
+		t.Fatalf("failed backup publication changed registry: data=%q err=%v", onDisk, err)
+	}
+	info, err := os.Stat(backupPath)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("backup destination changed: info=%v err=%v", info, err)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".registry-v1-backup-*.tmp"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("backup temp leftovers=%v err=%v", leftovers, err)
+	}
+}
+
+func TestStoreRefusesV1MigrationWhenExistingBackupDoesNotMatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "registry.json")
+	v1 := []byte(`{"schema_version":1,"entries":[]}` + "\n")
+	if err := os.WriteFile(path, v1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".v1.bak", []byte("different\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path).Load(); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("Load() error=%v, want mismatched backup refusal", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, v1) {
+		t.Fatalf("v1 registry changed after refusal: data=%q err=%v", data, err)
+	}
+}
+
+func TestReplaceSessionAdapterPersistsComparableReattachTransition(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	old, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/old",
+		WakeOwnerPresent: true,
+		WakeOwner:        WakeOwner{PID: 42, ProcessStart: "start-1", BootID: "boot-1", SessionID: 42},
+		WakeBinding:      WakeBinding{Generation: "generation-1", TargetDigest: "sha256:target-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, removed, err := store.ReplaceSessionAdapter(Entry{Root: old.Root, Agent: old.Agent, Adapter: "file", Target: "/tmp/new"})
+	if err != nil || len(removed) != 1 {
+		t.Fatalf("next=%#v removed=%#v err=%v", next, removed, err)
+	}
+	transition := next.Transition
+	if transition.Phase != TransitionReserved || transition.Revision != 1 || transition.OldID != old.ID ||
+		transition.OldOwner != old.WakeOwner || transition.OldBinding != old.WakeBinding {
+		t.Fatalf("transition=%#v old=%#v", transition, old)
+	}
+	replacement, removedAgain, err := store.ReplaceSessionAdapter(Entry{
+		Root: old.Root, Agent: old.Agent, Adapter: "file", Target: "/tmp/newer",
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 84, ProcessStart: "start-2", BootID: "boot-1"},
+	})
+	if err != nil || len(removedAgain) != 1 {
+		t.Fatalf("replacement=%#v removed=%#v err=%v", replacement, removedAgain, err)
+	}
+	if replacement.Transition.Revision != 2 || replacement.Transition.OldID != old.ID ||
+		replacement.Transition.OldBinding != old.WakeBinding {
+		t.Fatalf("nested transition lost original exact wake: %#v", replacement.Transition)
+	}
+}
+
+func TestRetiredEntryDoesNotBlockImmediateTargetReplacement(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if _, err := store.Upsert(Entry{Root: "/tmp/old", Agent: "codex", Adapter: "file", Target: "/tmp/shared", State: StateRetired}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Upsert(Entry{Root: "/tmp/new", Agent: "claude", Adapter: "file", Target: "/tmp/shared"}); err != nil {
+		t.Fatalf("retired row blocked replacement: %v", err)
+	}
+}
+
+func TestReplaceSessionAdapterIgnoresRetiredHistoryWhenSelectingLiveTransition(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	retired, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/retired", State: StateRetired,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 10, ProcessStart: "old", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "retired-generation", TargetDigest: "retired-digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/live", State: StateActive,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 20, ProcessStart: "live", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "live-generation", TargetDigest: "live-digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, removed, err := store.ReplaceSessionAdapter(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/next",
+	})
+	if err != nil || len(removed) != 1 || removed[0] != live {
+		t.Fatalf("next=%#v removed=%#v err=%v", next, removed, err)
+	}
+	if next.Transition.OldID != live.ID || next.Transition.OldID == retired.ID || next.Transition.OldBinding != live.WakeBinding {
+		t.Fatalf("transition=%#v retired=%#v live=%#v", next.Transition, retired, live)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := findTestEntry(loaded.Entries, retired.ID); !ok || got != retired {
+		t.Fatalf("retired history was not preserved: got=%#v ok=%v entries=%#v", got, ok, loaded.Entries)
+	}
+}
+
+func TestReplaceSessionAdapterArchivesSameTupleRetiredHistoryWithStableIdentity(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	retired, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/same", State: StateRetired,
+		RetiredAt:   time.Date(2026, 6, 26, 11, 0, 0, 0, time.UTC),
+		WakeBinding: WakeBinding{Generation: "retired-generation", TargetDigest: "retired-digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, removed, err := store.ReplaceSessionAdapter(Entry{
+		Root: retired.Root, Agent: retired.Agent, Adapter: retired.Adapter, Target: retired.Target,
+	})
+	if err != nil || len(removed) != 0 {
+		t.Fatalf("ReplaceSessionAdapter() next=%#v removed=%#v err=%v", next, removed, err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 2 {
+		t.Fatalf("Load() entries=%#v err=%v", loaded.Entries, err)
+	}
+	var history Entry
+	for _, entry := range loaded.Entries {
+		if entry.State == StateRetired {
+			history = entry
+		}
+	}
+	if history.ID == "" || history.ID == retired.ID || !strings.HasPrefix(history.ID, "retired-") {
+		t.Fatalf("retired archival identity=%q original=%q", history.ID, retired.ID)
+	}
+	wantHistory := retired
+	wantHistory.ID = history.ID
+	if history != wantHistory {
+		t.Fatalf("archived history changed beyond identity:\ngot=%#v\nwant=%#v", history, wantHistory)
+	}
+
+	archiveID := history.ID
+	_, removed, err = store.ReplaceSessionAdapter(Entry{
+		Root: retired.Root, Agent: retired.Agent, Adapter: retired.Adapter, Target: retired.Target,
+	})
+	if err != nil || len(removed) != 1 || removed[0].ID != next.ID {
+		t.Fatalf("second replacement removed=%#v err=%v", removed, err)
+	}
+	loaded, err = store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := findTestEntry(loaded.Entries, archiveID); !ok || got != history {
+		t.Fatalf("archival identity was not immutable: got=%#v ok=%v", got, ok)
+	}
+
+	newerHistory := history
+	newerHistory.LastGCDecision = "retained"
+	if err := store.UpdateEntry(newerHistory); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := store.ForgetIfUnchanged(history); err != nil || removed {
+		t.Fatalf("stale archival CAS removed=%v err=%v", removed, err)
+	}
+	if removed, err := store.ForgetIfUnchanged(newerHistory); err != nil || !removed {
+		t.Fatalf("exact archival CAS removed=%v err=%v", removed, err)
+	}
+}
+
+func TestStoreUpsertPreservesRetiredHistoryOnSameTupleCollision(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	retired, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/same", State: StateRetired,
+		RetiredAt: time.Date(2026, 6, 26, 11, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := store.Upsert(Entry{
+		Root: retired.Root, Agent: retired.Agent, Adapter: retired.Adapter, Target: retired.Target, State: StateAttached,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 2 {
+		t.Fatalf("entries=%#v err=%v", loaded.Entries, err)
+	}
+	if got, ok := findTestEntry(loaded.Entries, live.ID); !ok || got.State == StateRetired {
+		t.Fatalf("live row missing after collision: got=%#v ok=%v", got, ok)
+	}
+	retiredCount := 0
+	for _, entry := range loaded.Entries {
+		if entry.State == StateRetired {
+			retiredCount++
+			if entry.ID == retired.ID {
+				t.Fatalf("retired row kept colliding logical ID: %#v", entry)
+			}
+		}
+	}
+	if retiredCount != 1 {
+		t.Fatalf("retired history count=%d entries=%#v", retiredCount, loaded.Entries)
+	}
+}
+
+func TestStoreGCRootBatchFreezesMembershipAndPreservesWindowMarkers(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	entries := []Entry{
+		{ID: "first", Root: "/tmp/root", Agent: "first", Adapter: "file", Target: "/tmp/first", State: StateActive, WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "one", BootID: "boot"}, WakeBinding: WakeBinding{Generation: "g1", TargetDigest: "d1"}},
+		{ID: "second", Root: "/tmp/root", Agent: "second", Adapter: "file", Target: "/tmp/second", State: StateActive, WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 2, ProcessStart: "two", BootID: "boot"}, WakeBinding: WakeBinding{Generation: "g2", TargetDigest: "d2"}},
+	}
+	if err := store.Save(File{Entries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	batch := GCRootBatch{ID: "batch-1", CanonicalRoot: "/tmp/root", StartedAt: now, Phase: GCRootBatchPreflight}
+	for _, entry := range entries {
+		batch.Members = append(batch.Members, GCRootBatchMember{
+			EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+			WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+		})
+	}
+	started, err := store.StartGCRootBatch(batch, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(started.GCRootBatches) != 1 {
+		t.Fatalf("started batches=%#v", started.GCRootBatches)
+	}
+	for _, entry := range started.Entries {
+		if !entry.LastGCRootBatchAt.Equal(now) {
+			t.Fatalf("entry %q marker=%s", entry.ID, entry.LastGCRootBatchAt)
+		}
+	}
+	if advanced, err := store.AdvanceGCRootBatch(batch.ID, GCRootBatchPreflight, GCRootBatchRetiring); err != nil || !advanced {
+		t.Fatalf("advanced=%v err=%v", advanced, err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.GCRootBatches) != 1 || loaded.GCRootBatches[0].Phase != GCRootBatchRetiring {
+		t.Fatalf("advanced file=%#v err=%v", loaded, err)
+	}
+	if finished, err := store.FinishGCRootBatch(batch.ID); err != nil || !finished {
+		t.Fatalf("finished=%v err=%v", finished, err)
+	}
+	loaded, err = store.Load()
+	if err != nil || len(loaded.GCRootBatches) != 0 {
+		t.Fatalf("finished file=%#v err=%v", loaded, err)
+	}
+	for _, entry := range loaded.Entries {
+		if !entry.LastGCRootBatchAt.Equal(now) {
+			t.Fatalf("finish erased rolling marker for %q", entry.ID)
+		}
+	}
+}
+
+func TestAbandonGCRootBatchIsAtomicAndQuarantinesUnresolvedMembers(t *testing.T) {
+	now := time.Date(2026, 7, 22, 14, 0, 0, 0, time.UTC)
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	entries := []Entry{
+		{ID: "retired", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "codex"), State: StateActive, WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "one", BootID: "boot"}, WakeBinding: WakeBinding{Generation: "g1", TargetDigest: "d1"}},
+		{ID: "unresolved", Root: root, Agent: "claude", Adapter: "file", Target: filepath.Join(root, "claude"), State: StateActive, WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 2, ProcessStart: "two", BootID: "boot"}, WakeBinding: WakeBinding{Generation: "g2", TargetDigest: "d2"}},
+	}
+	if err := store.Save(File{Entries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	batch := GCRootBatch{ID: "batch-abandon", CanonicalRoot: root, StartedAt: now, Phase: GCRootBatchPreflight}
+	for _, entry := range entries {
+		batch.Members = append(batch.Members, GCRootBatchMember{
+			EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+			WakeOwnerPresent: true, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+		})
+	}
+	if _, err := store.StartGCRootBatch(batch, entries); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceGCRootBatch(batch.ID, GCRootBatchPreflight, GCRootBatchRetiring); err != nil {
+		t.Fatal(err)
+	}
+	batch.Phase = GCRootBatchRetiring
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := loaded.Entries[0]
+	unresolved := loaded.Entries[1]
+	if retired.ID != "retired" {
+		retired, unresolved = unresolved, retired
+	}
+	retiredAfter := retired
+	retiredAfter.State = StateRetired
+	retiredAfter.RetiredAt = now
+	retiredAfter.RetirementOutcome = "already_retired"
+	retiredAfter.RetirementReason = "tombstone_match"
+	outcomes := []GCRootBatchAbandonOutcome{
+		{Before: retired, After: retiredAfter},
+		{Before: unresolved, After: unresolved, Quarantine: true},
+	}
+
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSave := saveAbandonedGCRootBatch
+	saveAbandonedGCRootBatch = func(*Store, File) error { return errors.New("injected save failure") }
+	_, abandonErr := store.AbandonGCRootBatch(batch, outcomes, now, "operator confirmed stuck batch")
+	saveAbandonedGCRootBatch = originalSave
+	if abandonErr == nil || !strings.Contains(abandonErr.Error(), "injected save failure") {
+		t.Fatalf("abandon error=%v", abandonErr)
+	}
+	afterFailure, err := os.ReadFile(store.Path)
+	if err != nil || !bytes.Equal(afterFailure, before) {
+		t.Fatalf("registry changed after failed atomic save: err=%v", err)
+	}
+
+	result, err := store.AbandonGCRootBatch(batch, outcomes, now, "operator confirmed stuck batch")
+	if err != nil || len(result.Retired) != 1 || len(result.Quarantined) != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	final, err := store.Load()
+	if err != nil || len(final.GCRootBatches) != 0 {
+		t.Fatalf("final batches=%#v err=%v", final.GCRootBatches, err)
+	}
+	for _, entry := range final.Entries {
+		switch entry.ID {
+		case "retired":
+			if entry.State != StateRetired || !entry.GCQuarantinedAt.IsZero() {
+				t.Fatalf("retired outcome=%#v", entry)
+			}
+		case "unresolved":
+			if entry.State == StateRetired || !entry.GCQuarantinedAt.Equal(now) || entry.GCQuarantineReason == "" {
+				t.Fatalf("quarantined outcome=%#v", entry)
+			}
+		}
+	}
+}
+
+func TestStoreGCRootBatchRejectsStaleOrOversizedMembership(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	entry := Entry{
+		ID: "entry", Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/target", State: StateActive,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "digest"},
+	}
+	if err := store.Save(File{Entries: []Entry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	member := GCRootBatchMember{
+		EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+	}
+	batch := GCRootBatch{ID: "batch", CanonicalRoot: entry.Root, StartedAt: time.Now().UTC(), Phase: GCRootBatchPreflight, Members: []GCRootBatchMember{member}}
+	stale := entry
+	stale.Target = "/tmp/changed"
+	if _, err := store.StartGCRootBatch(batch, []Entry{stale}); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("stale membership error=%v", err)
+	}
+	oversized := batch
+	oversized.ID = "oversized"
+	oversized.Members = make([]GCRootBatchMember, MaxGCRootBatchMembers+1)
+	for index := range oversized.Members {
+		oversized.Members[index] = member
+		oversized.Members[index].EntryID = fmt.Sprintf("entry-%d", index)
+	}
+	if _, err := store.StartGCRootBatch(oversized, nil); err == nil || !strings.Contains(err.Error(), "hard maximum") {
+		t.Fatalf("oversized membership error=%v", err)
+	}
+}
+
+func TestStoreLoadRejectsMalformedPersistedGCRootBatches(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalRegistryRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{
+		ID: "entry", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "target"), State: StateActive,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "digest"}, LastGCRootBatchAt: now,
+	}
+	member := GCRootBatchMember{
+		EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		WakeOwnerPresent: true, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+	}
+	valid := File{
+		SchemaVersion: SchemaVersion, Entries: []Entry{entry},
+		GCRootAttempts: []GCRootAttempt{{CanonicalRoot: canonical, StartedAt: now}},
+		GCRootBatches:  []GCRootBatch{{ID: "batch", CanonicalRoot: canonical, StartedAt: now, Phase: GCRootBatchRetiring, Members: []GCRootBatchMember{member}}},
+	}
+	cases := []struct {
+		name   string
+		mutate func(*File)
+		want   string
+	}{
+		{name: "unknown phase", mutate: func(file *File) { file.GCRootBatches[0].Phase = "unknown" }, want: "invalid phase"},
+		{name: "oversized", mutate: func(file *File) {
+			for index := 1; index <= MaxGCRootBatchMembers; index++ {
+				copy := member
+				copy.EntryID = fmt.Sprintf("entry-%d", index)
+				copy.Agent = fmt.Sprintf("agent-%d", index)
+				file.GCRootBatches[0].Members = append(file.GCRootBatches[0].Members, copy)
+			}
+		}, want: "hard maximum"},
+		{name: "wrong canonical root", mutate: func(file *File) { file.GCRootBatches[0].Members[0].Root = filepath.Join(dir, "other") }, want: "outside canonical root"},
+		{name: "weak binding", mutate: func(file *File) { file.GCRootBatches[0].Members[0].WakeBinding = WakeBinding{} }, want: "strong owner-bound"},
+		{name: "missing attempt", mutate: func(file *File) { file.GCRootAttempts = nil }, want: "lacks its durable"},
+		{name: "omitted listener", mutate: func(file *File) {
+			other := entry
+			other.ID, other.Agent, other.Target = "other", "claude", filepath.Join(root, "other")
+			file.Entries = append(file.Entries, other)
+		}, want: "omits current listener"},
+		{name: "transition activated after freeze", mutate: func(file *File) {
+			file.Entries[0].Transition = ReattachTransition{Phase: TransitionReserved}
+		}, want: "not transition-free"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			file := valid
+			file.Entries = append([]Entry(nil), valid.Entries...)
+			file.GCRootAttempts = append([]GCRootAttempt(nil), valid.GCRootAttempts...)
+			file.GCRootBatches = append([]GCRootBatch(nil), valid.GCRootBatches...)
+			file.GCRootBatches[0].Members = append([]GCRootBatchMember(nil), valid.GCRootBatches[0].Members...)
+			test.mutate(&file)
+			path := filepath.Join(t.TempDir(), "registry.json")
+			data, err := json.Marshal(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(path).Load(); err == nil || !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load error=%v, want corrupt containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateGCRootBatchRejectsSafetyInvariantMatrix(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := GCRootBatchMember{
+		EntryID: "entry", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "target"),
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "digest"},
+	}
+	valid := GCRootBatch{
+		ID: "batch", CanonicalRoot: root, StartedAt: now, Phase: GCRootBatchPreflight,
+		Members: []GCRootBatchMember{member},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*GCRootBatch)
+		want   string
+	}{
+		{name: "missing identity", mutate: func(batch *GCRootBatch) { batch.ID = "" }, want: "required"},
+		{name: "invalid phase", mutate: func(batch *GCRootBatch) { batch.Phase = "unknown" }, want: "invalid phase"},
+		{name: "empty membership", mutate: func(batch *GCRootBatch) { batch.Members = nil }, want: "no members"},
+		{name: "noncanonical root", mutate: func(batch *GCRootBatch) { batch.CanonicalRoot += "/." }, want: "canonical root"},
+		{name: "incomplete member", mutate: func(batch *GCRootBatch) { batch.Members[0].Target = "" }, want: "incomplete member"},
+		{name: "duplicate member", mutate: func(batch *GCRootBatch) { batch.Members = append(batch.Members, batch.Members[0]) }, want: "duplicate member"},
+		{name: "member outside root", mutate: func(batch *GCRootBatch) { batch.Members[0].Root = t.TempDir() }, want: "outside canonical root"},
+		{name: "weak owner", mutate: func(batch *GCRootBatch) { batch.Members[0].WakeOwnerPresent = false }, want: "strong owner-bound"},
+		{name: "duplicate agent", mutate: func(batch *GCRootBatch) {
+			other := batch.Members[0]
+			other.EntryID = "other"
+			other.Target = filepath.Join(root, "other")
+			batch.Members = append(batch.Members, other)
+		}, want: "multiple live members"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			batch := valid
+			batch.Members = append([]GCRootBatchMember(nil), valid.Members...)
+			test.mutate(&batch)
+			if err := validateGCRootBatch(batch); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateGCRootBatch error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateRegistryFileRejectsCoordinatorCorruptionMatrix(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{
+		ID: "entry", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "target"), State: StateActive,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "digest"}, LastGCRootBatchAt: now,
+	}
+	member := GCRootBatchMember{
+		EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+	}
+	valid := File{
+		Entries:        []Entry{entry},
+		GCRootAttempts: []GCRootAttempt{{CanonicalRoot: root, StartedAt: now}},
+		GCRootBatches: []GCRootBatch{{
+			ID: "batch", CanonicalRoot: root, StartedAt: now, Phase: GCRootBatchRetiring,
+			Members: []GCRootBatchMember{member},
+		}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*File)
+		want   string
+	}{
+		{name: "multiple active batches", mutate: func(file *File) { file.GCRootBatches = append(file.GCRootBatches, file.GCRootBatches[0]) }, want: "active GC root batches"},
+		{name: "too many attempts", mutate: func(file *File) {
+			file.GCRootBatches = nil
+			file.GCRootAttempts = make([]GCRootAttempt, MaxGCRootAttempts+1)
+		}, want: "hard maximum"},
+		{name: "invalid attempt", mutate: func(file *File) { file.GCRootAttempts[0].StartedAt = time.Time{} }, want: "invalid GC root attempt"},
+		{name: "duplicate attempt", mutate: func(file *File) { file.GCRootAttempts = append(file.GCRootAttempts, file.GCRootAttempts[0]) }, want: "duplicate GC root attempt"},
+		{name: "duplicate entry", mutate: func(file *File) {
+			file.GCRootBatches = nil
+			file.GCRootAttempts = nil
+			file.Entries = append(file.Entries, file.Entries[0])
+		}, want: "duplicate entry id"},
+		{name: "member row mismatch", mutate: func(file *File) { file.Entries[0].Target = filepath.Join(root, "changed") }, want: "does not match"},
+		{name: "active row has invalid root", mutate: func(file *File) {
+			other := entry
+			other.ID, other.Agent, other.Target, other.Root = "other", "claude", filepath.Join(root, "other"), ""
+			file.Entries = append(file.Entries, other)
+		}, want: "root is empty"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			file := valid
+			file.Entries = append([]Entry(nil), valid.Entries...)
+			file.GCRootAttempts = append([]GCRootAttempt(nil), valid.GCRootAttempts...)
+			file.GCRootBatches = append([]GCRootBatch(nil), valid.GCRootBatches...)
+			file.GCRootBatches[0].Members = append([]GCRootBatchMember(nil), valid.GCRootBatches[0].Members...)
+			test.mutate(&file)
+			if err := validateRegistryFile(file); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateRegistryFile error=%v, want %q", err, test.want)
+			}
+		})
+	}
+
+	retired := entry
+	retired.ID, retired.Agent, retired.Target, retired.State = "retired", "claude", filepath.Join(root, "retired"), StateRetired
+	withRetiredHistory := valid
+	withRetiredHistory.Entries = append([]Entry{entry}, retired)
+	if err := validateRegistryFile(withRetiredHistory); err != nil {
+		t.Fatalf("retired history outside frozen membership rejected: %v", err)
+	}
+}
+
+func TestAppendGCRootAttemptEnforcesRollingDistinctRootLimit(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	existing := []GCRootAttempt{
+		{CanonicalRoot: "/tmp/expired", StartedAt: now.Add(-GCRootAttemptWindow - time.Second)},
+		{CanonicalRoot: "/tmp/z", StartedAt: now},
+	}
+	next, err := appendGCRootAttempt(existing, "/tmp/a", now)
+	if err != nil || len(next) != 2 || next[0].CanonicalRoot != "/tmp/a" || next[1].CanonicalRoot != "/tmp/z" {
+		t.Fatalf("next=%#v err=%v", next, err)
+	}
+	if _, err := appendGCRootAttempt(next, "/tmp/a", now.Add(time.Second)); err == nil || !strings.Contains(err.Error(), "already consumed") {
+		t.Fatalf("duplicate attempt error=%v", err)
+	}
+	full := make([]GCRootAttempt, MaxGCRootAttempts)
+	for index := range full {
+		full[index] = GCRootAttempt{CanonicalRoot: fmt.Sprintf("/tmp/root-%d", index), StartedAt: now}
+	}
+	if _, err := appendGCRootAttempt(full, "/tmp/overflow", now); err == nil || !strings.Contains(err.Error(), "hard maximum") {
+		t.Fatalf("overflow attempt error=%v", err)
+	}
+}
+
+func TestStoreNormalizesFutureAttemptLedgerAndRecoversAfterOneWindow(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	file := File{SchemaVersion: SchemaVersion, Entries: []Entry{}}
+	for index := 0; index < MaxGCRootAttempts; index++ {
+		file.GCRootAttempts = append(file.GCRootAttempts, GCRootAttempt{
+			CanonicalRoot: fmt.Sprintf("/tmp/future-root-%d", index), StartedAt: now.Add(365 * 24 * time.Hour),
+		})
+	}
+	path := filepath.Join(t.TempDir(), "registry.json")
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := New(path)
+	store.Now = func() time.Time { return now }
+	loaded, err := store.Load()
+	if err != nil || len(loaded.GCRootAttempts) != MaxGCRootAttempts {
+		t.Fatalf("normalized load=%#v err=%v", loaded.GCRootAttempts, err)
+	}
+	for _, attempt := range loaded.GCRootAttempts {
+		if !attempt.StartedAt.Equal(now) {
+			t.Fatalf("future attempt was not clamped to bounded window: %#v", attempt)
+		}
+	}
+	if _, err := appendGCRootAttempt(loaded.GCRootAttempts, "/tmp/blocked-now", now); err == nil || !strings.Contains(err.Error(), "hard maximum") {
+		t.Fatalf("normalized future ledger did not fail closed in current window: %v", err)
+	}
+	later := now.Add(GCRootAttemptWindow + time.Second)
+	if next, err := appendGCRootAttempt(loaded.GCRootAttempts, "/tmp/recovered", later); err != nil || len(next) != 1 || next[0].CanonicalRoot != "/tmp/recovered" {
+		t.Fatalf("normalized future ledger remained wedged: next=%#v err=%v", next, err)
+	}
+	var onDisk File
+	persisted, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(persisted, &onDisk) != nil || !onDisk.GCRootAttempts[0].StartedAt.Equal(now) {
+		t.Fatalf("normalized ledger was not persisted: file=%#v err=%v", onDisk, err)
+	}
+}
+
+func TestStoreGCRootCoordinatorInputCASAndReplayGuards(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{
+		ID: "entry", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "target"), State: StateActive,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 1, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "digest"},
+	}
+	member := GCRootBatchMember{
+		EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+	}
+	batch := GCRootBatch{
+		ID: "batch", CanonicalRoot: root, StartedAt: now, Phase: GCRootBatchPreflight,
+		Members: []GCRootBatchMember{member},
+	}
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartGCRootBatch(batch, nil); err == nil || !strings.Contains(err.Error(), "expected 0 rows") {
+		t.Fatalf("expected-count error=%v", err)
+	}
+	emptyID := entry
+	emptyID.ID = ""
+	if _, err := store.StartGCRootBatch(batch, []Entry{emptyID}); err == nil || !strings.Contains(err.Error(), "entry id is required") {
+		t.Fatalf("empty expected id error=%v", err)
+	}
+	secondMember := member
+	secondMember.EntryID, secondMember.Agent, secondMember.Target = "second", "claude", filepath.Join(root, "second")
+	twoMemberBatch := batch
+	twoMemberBatch.Members = []GCRootBatchMember{member, secondMember}
+	if _, err := store.StartGCRootBatch(twoMemberBatch, []Entry{entry, entry}); err == nil || !strings.Contains(err.Error(), "duplicate expected") {
+		t.Fatalf("duplicate expected error=%v", err)
+	}
+	mismatch := batch
+	mismatch.Members = append([]GCRootBatchMember(nil), batch.Members...)
+	mismatch.Members[0].Target = filepath.Join(root, "other")
+	if _, err := store.StartGCRootBatch(mismatch, []Entry{entry}); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("member mismatch error=%v", err)
+	}
+	stale := entry
+	stale.Target = filepath.Join(root, "stale")
+	staleBatch := batch
+	staleBatch.Members = append([]GCRootBatchMember(nil), batch.Members...)
+	staleBatch.Members[0].Target = stale.Target
+	if _, err := store.StartGCRootBatch(staleBatch, []Entry{stale}); err == nil || !strings.Contains(err.Error(), "changed before membership") {
+		t.Fatalf("stale membership CAS error=%v", err)
+	}
+	if _, err := store.StartGCRootBatch(batch, []Entry{entry}); err != nil {
+		t.Fatalf("start valid batch: %v", err)
+	}
+	if _, err := store.StartGCRootBatch(batch, []Entry{entry}); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("second active batch error=%v", err)
+	}
+	if advanced, err := store.AdvanceGCRootBatch(batch.ID, GCRootBatchPreflight, GCRootBatchRetiring); err != nil || !advanced {
+		t.Fatalf("advance=%v err=%v", advanced, err)
+	}
+	if advanced, err := store.AdvanceGCRootBatch(batch.ID, GCRootBatchPreflight, GCRootBatchRetiring); err != nil || advanced {
+		t.Fatalf("idempotent advance=%v err=%v", advanced, err)
+	}
+	if _, err := store.AdvanceGCRootBatch(batch.ID, GCRootBatchPreflight, "done"); err == nil || !strings.Contains(err.Error(), "phase is") {
+		t.Fatalf("wrong-phase advance error=%v", err)
+	}
+	if _, err := store.AdvanceGCRootBatch("missing", GCRootBatchPreflight, GCRootBatchRetiring); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing advance error=%v", err)
+	}
+	if finished, err := store.FinishGCRootBatch(batch.ID); err != nil || !finished {
+		t.Fatalf("finish=%v err=%v", finished, err)
+	}
+	if finished, err := store.FinishGCRootBatch("missing"); err != nil || finished {
+		t.Fatalf("missing finish=%v err=%v", finished, err)
+	}
+}
+
+func TestStoreRecordGCRootAttemptValidatesUpdatesAndWindow(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{ID: "entry", Root: root, Agent: "codex", Adapter: "file", Target: filepath.Join(root, "target"), State: StateActive}
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordGCRootAttempt("", now, nil); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("empty root error=%v", err)
+	}
+	wrongID := EntryUpdate{Before: entry, After: entry}
+	wrongID.After.ID = "other"
+	if _, err := store.RecordGCRootAttempt(root, now, []EntryUpdate{wrongID}); err == nil || !strings.Contains(err.Error(), "unchanged entry id") {
+		t.Fatalf("changed id error=%v", err)
+	}
+	validUpdate := EntryUpdate{Before: entry, After: entry}
+	validUpdate.After.LastGCRootBatchAt = now
+	if _, err := store.RecordGCRootAttempt(root, now, []EntryUpdate{validUpdate, validUpdate}); err == nil || !strings.Contains(err.Error(), "duplicate update") {
+		t.Fatalf("duplicate update error=%v", err)
+	}
+	stale := validUpdate
+	stale.Before.Target = filepath.Join(root, "stale")
+	stale.After.Target = stale.Before.Target
+	if _, err := store.RecordGCRootAttempt(root, now, []EntryUpdate{stale}); err == nil || !strings.Contains(err.Error(), "changed before") {
+		t.Fatalf("stale update error=%v", err)
+	}
+	updated, err := store.RecordGCRootAttempt(root, now, []EntryUpdate{validUpdate})
+	if err != nil || len(updated.GCRootAttempts) != 1 || !updated.Entries[0].LastGCRootBatchAt.Equal(now) {
+		t.Fatalf("updated=%#v err=%v", updated, err)
+	}
+	if _, err := store.RecordGCRootAttempt(root, now.Add(time.Second), nil); err == nil || !strings.Contains(err.Error(), "already consumed") {
+		t.Fatalf("duplicate rolling root error=%v", err)
+	}
+}
+
+func TestPendingManualRetirementBlocksOrdinaryRegistryMutationPaths(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Store, Entry) error
+	}{
+		{name: "Save", run: func(store *Store, entry Entry) error {
+			changed := entry
+			changed.LastError = "ordinary writer"
+			return store.Save(File{Entries: []Entry{changed}})
+		}},
+		{name: "UpdateEntry", run: func(store *Store, entry Entry) error {
+			entry.ManualRetirementIntent = ManualRetirementIntent{}
+			return store.UpdateEntry(entry)
+		}},
+		{name: "Forget", run: func(store *Store, entry Entry) error {
+			_, err := store.Forget(entry.ID)
+			return err
+		}},
+		{name: "ForgetIfUnchanged", run: func(store *Store, entry Entry) error {
+			_, err := store.ForgetIfUnchanged(entry)
+			return err
+		}},
+		{name: "ForgetMany", run: func(store *Store, entry Entry) error {
+			_, err := store.ForgetMany([]string{entry.ID})
+			return err
+		}},
+		{name: "Upsert", run: func(store *Store, entry Entry) error {
+			_, err := store.Upsert(Entry{Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target})
+			return err
+		}},
+		{name: "ReplaceSessionAdapter", run: func(store *Store, entry Entry) error {
+			_, _, err := store.ReplaceSessionAdapter(Entry{Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target + "-next"})
+			return err
+		}},
+		{name: "RestoreSessionAdapterIfUnchanged", run: func(store *Store, entry Entry) error {
+			_, err := store.RestoreSessionAdapterIfUnchanged(entry, nil)
+			return err
+		}},
+		{name: "RecordGCRootAttempt", run: func(store *Store, entry Entry) error {
+			_, err := store.RecordGCRootAttempt(entry.Root, time.Now().UTC(), nil)
+			return err
+		}},
+		{name: "StartGCRootBatch", run: func(store *Store, entry Entry) error {
+			now := time.Now().UTC()
+			batch := GCRootBatch{
+				ID: "batch", CanonicalRoot: entry.Root, StartedAt: now, Phase: GCRootBatchPreflight,
+				Members: []GCRootBatchMember{{
+					EntryID: entry.ID, Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+					WakeOwnerPresent: entry.WakeOwnerPresent, WakeOwner: entry.WakeOwner, WakeBinding: entry.WakeBinding,
+				}},
+			}
+			_, err := store.StartGCRootBatch(batch, []Entry{entry})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entry := pendingManualRetirementTestEntry(t)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{entry}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.run(store, entry); err == nil {
+				t.Fatalf("%s unexpectedly mutated pending manual retirement", test.name)
+			}
+			loaded, err := store.Load()
+			if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != entry || len(loaded.GCRootBatches) != 0 || len(loaded.GCRootAttempts) != 0 {
+				t.Fatalf("%s changed pending row: file=%#v err=%v", test.name, loaded, err)
+			}
+		})
+	}
+}
+
+func TestUpdateEntriesAllowsOnlyExactPendingManualRetirementCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Entry)
+	}{
+		{name: "intent stripped", mutate: func(entry *Entry) {
+			entry.ManualRetirementIntent = ManualRetirementIntent{}
+		}},
+		{name: "receipt binding mismatch", mutate: func(entry *Entry) {
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+			entry.ManualRetirementReceipt.Generation = "other-generation"
+		}},
+		{name: "receipt semantics mismatch", mutate: func(entry *Entry) {
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+			entry.ManualRetirementReceipt.ReasonCode = "tombstone_match"
+		}},
+		{name: "missing-lock phase crossover", mutate: func(entry *Entry) {
+			entry.ManualRetirementIntent.ReasonCode = "manual_absent_eligible"
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+		}},
+		{name: "unrelated field drift", mutate: func(entry *Entry) {
+			*entry = completedManualRetirementTestEntry(*entry, "retired", "manual_retired")
+			entry.Target += "-changed"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := pendingManualRetirementTestEntry(t)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+				t.Fatal(err)
+			}
+			after := before
+			test.mutate(&after)
+			if result, err := store.UpdateEntries([]EntryUpdate{{Before: before, After: after}}); err == nil || result.Updated != 0 {
+				t.Fatalf("mismatched completion result=%#v err=%v", result, err)
+			}
+			loaded, err := store.Load()
+			if err != nil || loaded.Entries[0] != before {
+				t.Fatalf("mismatched completion changed row=%#v err=%v", loaded.Entries, err)
+			}
+		})
+	}
+
+	for _, completion := range []struct{ outcome, reason string }{{"retired", "manual_retired"}, {"already_retired", "tombstone_match"}} {
+		t.Run(completion.reason, func(t *testing.T) {
+			before := pendingManualRetirementTestEntry(t)
+			after := completedManualRetirementTestEntry(before, completion.outcome, completion.reason)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+				t.Fatal(err)
+			}
+			result, err := store.UpdateEntries([]EntryUpdate{{Before: before, After: after}})
+			if err != nil || result.Updated != 1 || result.Skipped != 0 {
+				t.Fatalf("exact completion result=%#v err=%v", result, err)
+			}
+			loaded, err := store.Load()
+			if err != nil || loaded.Entries[0] != after {
+				t.Fatalf("exact completion row=%#v err=%v", loaded.Entries, err)
+			}
+		})
+	}
+
+	t.Run("manual_absent_retired", func(t *testing.T) {
+		before := pendingManualRetirementTestEntry(t)
+		before.ManualRetirementIntent.ReasonCode = "manual_absent_eligible"
+		after := completedManualRetirementTestEntry(before, "retired", "manual_absent_retired")
+		store := New(filepath.Join(t.TempDir(), "registry.json"))
+		if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+			t.Fatal(err)
+		}
+		result, err := store.UpdateEntries([]EntryUpdate{{Before: before, After: after}})
+		if err != nil || result.Updated != 1 || result.Skipped != 0 {
+			t.Fatalf("exact absent completion result=%#v err=%v", result, err)
+		}
+		loaded, err := store.Load()
+		if err != nil || loaded.Entries[0].ManualRetirementReceipt.PreflightReasonCode != "manual_absent_eligible" {
+			t.Fatalf("absent receipt lost durable preflight pair: %#v err=%v", loaded.Entries, err)
+		}
+		for name, mutate := range map[string]func(*Entry){
+			"preflight tamper": func(entry *Entry) { entry.ManualRetirementReceipt.PreflightReasonCode = "manual_eligible" },
+			"completion crossover": func(entry *Entry) {
+				entry.ManualRetirementReceipt.ReasonCode = "manual_retired"
+				entry.RetirementReason = "manual_retired"
+				entry.LastGCReason = "manual_retired"
+			},
+			"lock tombstone crossover": func(entry *Entry) {
+				entry.ManualRetirementReceipt.ReasonCode = "tombstone_match"
+				entry.RetirementOutcome = "already_retired"
+				entry.RetirementReason = "tombstone_match"
+				entry.LastGCReason = "tombstone_match"
+			},
+		} {
+			t.Run(name+" fails restart validation", func(t *testing.T) {
+				candidate := loaded.Entries[0]
+				mutate(&candidate)
+				invalid := New(filepath.Join(t.TempDir(), "registry.json"))
+				data, err := json.Marshal(File{SchemaVersion: SchemaVersion, Entries: []Entry{candidate}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(invalid.Path, append(data, '\n'), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := invalid.Load(); err == nil {
+					t.Fatalf("tampered receipt accepted after restart: %#v", candidate.ManualRetirementReceipt)
+				}
+			})
+		}
+	})
+}
+
+func TestPendingManualRetirementFreezesCanonicalRootMembershipSiblingsAndGCArtifacts(t *testing.T) {
+	pending := pendingManualRetirementTestEntry(t)
+	sibling := pending
+	sibling.ID, sibling.Agent, sibling.Target = "sibling", "claude", filepath.Join(pending.Root, "sibling")
+	sibling.ManualRetirementIntent = ManualRetirementIntent{}
+	retired := sibling
+	retired.ID, retired.Agent, retired.Target, retired.State = "retired", "gemini", filepath.Join(pending.Root, "retired"), StateRetired
+	retired.RetiredAt = pending.ManualRetirementIntent.StartedAt.Add(-48 * time.Hour)
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{pending, sibling, retired}}); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := map[string]func(*File){
+		"sibling update":           func(file *File) { file.Entries[1].LastError = "changed" },
+		"retired evidence removal": func(file *File) { file.Entries = file.Entries[:2] },
+		"same-root addition": func(file *File) {
+			added := sibling
+			added.ID, added.Agent, added.Target = "added", "other", filepath.Join(pending.Root, "added")
+			file.Entries = append(file.Entries, added)
+		},
+		"root attempt": func(file *File) {
+			file.GCRootAttempts = append(file.GCRootAttempts, GCRootAttempt{CanonicalRoot: pending.Root, StartedAt: time.Now().UTC()})
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			candidate := baseline
+			candidate.Entries = append([]Entry(nil), baseline.Entries...)
+			candidate.GCRootAttempts = append([]GCRootAttempt(nil), baseline.GCRootAttempts...)
+			mutate(&candidate)
+			if err := store.Save(candidate); err == nil {
+				t.Fatal("frozen canonical root mutation succeeded")
+			}
+			loaded, err := store.Load()
+			if err != nil || !reflect.DeepEqual(loaded, baseline) {
+				t.Fatalf("frozen root changed: file=%#v err=%v", loaded, err)
+			}
+		})
+	}
+}
+
+func TestManualRetirementSamePlanEnrollmentAndSequentialReceipts(t *testing.T) {
+	first := pendingManualRetirementTestEntry(t)
+	second := first
+	second.ID, second.Agent, second.Target = "second", "claude", filepath.Join(first.Root, "second")
+	second.ManualRetirementIntent = ManualRetirementIntent{}
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{first, second}}); err != nil {
+		t.Fatal(err)
+	}
+	secondPending := second
+	secondPending.ManualRetirementIntent = first.ManualRetirementIntent
+	secondPending.ManualRetirementIntent.RowDigest = strings.Repeat("c", 64)
+	secondPending.ManualRetirementIntent.Agent = second.Agent
+	secondPending.ManualRetirementIntent.Target = second.Target
+	secondPending.ManualRetirementIntent.Generation = "generation-second"
+	secondPending.ManualRetirementIntent.TargetDigest = "sha256:digest-second"
+	result, err := store.UpdateEntries([]EntryUpdate{{Before: second, After: secondPending}})
+	if err != nil || result.Updated != 1 {
+		t.Fatalf("same-plan sibling enrollment result=%#v err=%v", result, err)
+	}
+	firstDone := completedManualRetirementTestEntry(first, "retired", "manual_retired")
+	if result, err = store.UpdateEntries([]EntryUpdate{{Before: first, After: firstDone}}); err != nil || result.Updated != 1 {
+		t.Fatalf("first exact completion result=%#v err=%v", result, err)
+	}
+	mutatedFirst := firstDone
+	mutatedFirst.LastError = "must remain frozen"
+	if err := store.UpdateEntry(mutatedFirst); err == nil {
+		t.Fatal("completed sibling changed while another plan member remained pending")
+	}
+	secondDone := completedManualRetirementTestEntry(secondPending, "already_retired", "tombstone_match")
+	if result, err = store.UpdateEntries([]EntryUpdate{{Before: secondPending, After: secondDone}}); err != nil || result.Updated != 1 {
+		t.Fatalf("second exact completion result=%#v err=%v", result, err)
+	}
+	if err := store.UpdateEntry(mutatedFirst); err != nil {
+		t.Fatalf("root remained frozen after final exact receipt: %v", err)
+	}
+}
+
+func TestEnrollManualRetirementIntentsIsWholeRootAtomicAndReplayable(t *testing.T) {
+	firstPending := pendingManualRetirementTestEntry(t)
+	first := firstPending
+	first.ManualRetirementIntent = ManualRetirementIntent{}
+	second := first
+	second.ID, second.Agent, second.Target = "second", "claude", filepath.Join(first.Root, "second")
+	secondPending := second
+	secondPending.ManualRetirementIntent = firstPending.ManualRetirementIntent
+	secondPending.ManualRetirementIntent.RowDigest = strings.Repeat("c", 64)
+	secondPending.ManualRetirementIntent.Agent = second.Agent
+	secondPending.ManualRetirementIntent.Target = second.Target
+	secondPending.ManualRetirementIntent.Generation = "generation-second"
+	secondPending.ManualRetirementIntent.TargetDigest = "sha256:digest-second"
+	retiredHistory := second
+	retiredHistory.ID, retiredHistory.Agent, retiredHistory.Target = "retired-history", "history", filepath.Join(first.Root, "history")
+	retiredHistory.State = StateRetired
+	retiredHistory.RetiredAt = firstPending.ManualRetirementIntent.StartedAt.Add(-time.Hour)
+
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{first, second, retiredHistory}}); err != nil {
+		t.Fatal(err)
+	}
+	racedSecond := second
+	racedSecond.LastError = "concurrent sibling update"
+	if result, err := store.UpdateEntries([]EntryUpdate{{Before: second, After: racedSecond}}); err != nil || result.Updated != 1 {
+		t.Fatalf("inject sibling race result=%#v err=%v", result, err)
+	}
+	if result, err := store.EnrollManualRetirementIntents(first.Root, []EntryUpdate{
+		{Before: first, After: firstPending},
+		{Before: second, After: secondPending},
+	}); err == nil || result.Updated != 0 {
+		t.Fatalf("stale whole-root enrollment result=%#v err=%v", result, err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("stale enrollment left a prefix: file=%#v err=%v", loaded, err)
+	}
+	for _, entry := range loaded.Entries {
+		if entry.ManualRetirementIntent.Active() {
+			t.Fatalf("stale enrollment left a prefix: file=%#v", loaded)
+		}
+	}
+
+	racedSecondPending := racedSecond
+	racedSecondPending.ManualRetirementIntent = secondPending.ManualRetirementIntent
+	updates := []EntryUpdate{
+		{Before: first, After: firstPending},
+		{Before: racedSecond, After: racedSecondPending},
+	}
+	result, err := store.EnrollManualRetirementIntents(first.Root, updates)
+	if err != nil || result.Updated != 2 || result.Skipped != 0 {
+		t.Fatalf("atomic enrollment result=%#v err=%v", result, err)
+	}
+	replay := []EntryUpdate{
+		{Before: firstPending, After: firstPending},
+		{Before: racedSecondPending, After: racedSecondPending},
+	}
+	result, err = store.EnrollManualRetirementIntents(first.Root, replay)
+	if err != nil || result.Updated != 0 || result.Skipped != 0 {
+		t.Fatalf("atomic enrollment replay result=%#v err=%v", result, err)
+	}
+	if _, err := store.EnrollManualRetirementIntents(first.Root, replay[:1]); err == nil {
+		t.Fatal("partial unresolved-root replay was accepted")
+	}
+}
+
+func TestExactManualRetirementCompletionWorksThroughSingleRowMutators(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Store, File, Entry) error
+	}{
+		{name: "Save", run: func(store *Store, file File, after Entry) error {
+			file.Entries[0] = after
+			return store.Save(file)
+		}},
+		{name: "UpdateEntry", run: func(store *Store, _ File, after Entry) error { return store.UpdateEntry(after) }},
+		{name: "Upsert", run: func(store *Store, _ File, after Entry) error {
+			_, err := store.Upsert(after)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := pendingManualRetirementTestEntry(t)
+			store := New(filepath.Join(t.TempDir(), "registry.json"))
+			if err := store.Save(File{Entries: []Entry{before}}); err != nil {
+				t.Fatal(err)
+			}
+			file, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			after := completedManualRetirementTestEntry(before, "retired", "manual_retired")
+			if err := test.run(store, file, after); err != nil {
+				t.Fatalf("exact completion failed: %v", err)
+			}
+			loaded, err := store.Load()
+			if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != after {
+				t.Fatalf("exact completion file=%#v err=%v", loaded, err)
+			}
+		})
+	}
+}
+
+func pendingManualRetirementTestEntry(t *testing.T) Entry {
+	t.Helper()
+	root, err := canonicalRegistryRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	entry := Entry{
+		Root: root, Agent: "worker", Adapter: "file", Target: filepath.Join(root, "target"),
+		State: StateDetached, LegacyUnbound: true,
+		WakeOwnerPresent: true, WakeOwner: WakeOwner{PID: 7, ProcessStart: "start", BootID: "boot"},
+		WakeBinding: WakeBinding{Generation: "generation", TargetDigest: "sha256:digest"},
+	}
+	entry.ID = EntryID(entry.Root, entry.Agent, entry.Adapter, entry.Target)
+	identity, err := executable.Capture("/bin/sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.ManualRetirementIntent = ManualRetirementIntent{
+		PlanID: strings.Repeat("a", 64), RowDigest: strings.Repeat("b", 64),
+		Root: entry.Root, Agent: entry.Agent, Adapter: entry.Adapter, Target: entry.Target,
+		AMQExecutable: identity.Path, InjectVia: identity.Path, AMQIdentity: identity, InjectIdentity: identity,
+		TimeoutNanos: int64(time.Second),
+		Generation:   "generation", TargetDigest: "sha256:digest", ReasonCode: "manual_eligible", StartedAt: now,
+	}
+	return entry
+}
+
+func completedManualRetirementTestEntry(before Entry, outcome, reason string) Entry {
+	after := before
+	completedAt := before.ManualRetirementIntent.StartedAt.Add(time.Second)
+	after.State = StateRetired
+	after.RetiredAt = completedAt
+	after.RetirementOutcome = outcome
+	after.RetirementReason = reason
+	after.OwnerGoneSince = time.Time{}
+	after.GCFailureCount = 0
+	after.GCBackoffUntil = time.Time{}
+	after.GCQuarantinedAt = time.Time{}
+	after.GCQuarantineReason = ""
+	after.LastGCDecision = "retired"
+	after.LastGCReason = reason
+	after.LastError = ""
+	after.ManualRetirementReceipt = ManualRetirementReceipt{
+		PlanID: before.ManualRetirementIntent.PlanID, RowDigest: before.ManualRetirementIntent.RowDigest,
+		Generation: before.ManualRetirementIntent.Generation, TargetDigest: before.ManualRetirementIntent.TargetDigest,
+		CompletedAt: completedAt, PreflightReasonCode: before.ManualRetirementIntent.ReasonCode, ReasonCode: reason,
+	}
+	after.ManualRetirementIntent = ManualRetirementIntent{}
+	return after
 }
 
 func findTestEntry(entries []Entry, id string) (Entry, bool) {

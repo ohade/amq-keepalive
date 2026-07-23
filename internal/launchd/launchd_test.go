@@ -8,7 +8,20 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
+
+func TestNormalizeOptionsUsesSharedSupervisorPolicyBounds(t *testing.T) {
+	opts, err := NormalizeOptions(Options{BinaryPath: "/bin/echo", AMQPath: "/bin/echo", RegistryPath: "/tmp/registry.json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Interval != DefaultSupervisorInterval || opts.OwnerGrace != supervisor.MinOwnerGoneGrace ||
+		opts.Retention != supervisor.MinRetiredRetention || opts.GCTimeout != supervisor.MaxLifecycleTimeout {
+		t.Fatalf("normalized policy=%#v", opts)
+	}
+}
 
 func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 	opts := Options{
@@ -17,10 +30,17 @@ func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 		RegistryPath: "/Users/test/.amq-keepalive/registry.json",
 		AMQPath:      "/opt/homebrew/bin/amq",
 		Interval:     15 * time.Second,
+		AutoGC:       true,
+		OwnerGrace:   7 * time.Minute,
+		Retention:    48 * time.Hour,
+		GCTimeout:    3 * time.Second,
 		StdoutPath:   "/Users/test/Library/Logs/amq-keepalive/out.log",
 		StderrPath:   "/Users/test/Library/Logs/amq-keepalive/err.log",
 	}
 	plist := BuildPlist(opts)
+	if bytes.Contains(plist, []byte("--gc-max-per-pass")) {
+		t.Fatalf("new plist emitted deprecated GC cap:\n%s", plist)
+	}
 
 	for _, want := range []string{
 		"<key>Label</key>",
@@ -35,6 +55,13 @@ func TestBuildPlistContainsSupervisorContract(t *testing.T) {
 		"<string>--self</string>",
 		"<string>--interval</string>",
 		"<string>15s</string>",
+		"<string>--auto-gc=true</string>",
+		"<string>--owner-gone-grace</string>",
+		"<string>7m0s</string>",
+		"<string>--retired-retention</string>",
+		"<string>48h0m0s</string>",
+		"<string>--gc-timeout</string>",
+		"<string>3s</string>",
 		"<key>RunAtLoad</key>",
 		"<true/>",
 		"<key>KeepAlive</key>",
