@@ -140,6 +140,36 @@ done
 	}
 }
 
+func TestWithWarningSinkNilRestoresVisibleDefault(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stderr
+	os.Stderr = writer
+	t.Cleanup(func() {
+		os.Stderr = previous
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+
+	cli := NewCLI("amq").WithWarningSink(nil)
+	if cli.wakeReadyWarningSink == nil {
+		t.Fatal("nil warning sink suppressed cleanup diagnostics")
+	}
+	cli.wakeReadyWarningSink(errors.New("visible cleanup warning"))
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "amq-keepalive warning: visible cleanup warning") {
+		t.Fatalf("stderr=%q, want visible warning", data)
+	}
+}
+
 type fakeWakeReadyCleanupFS struct {
 	entries   []os.DirEntry
 	openErr   error

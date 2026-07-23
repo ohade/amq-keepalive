@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +30,37 @@ const maxWakeBaselineBytes = 64 * 1024
 const maxLifecycleResultBytes = 64 * 1024
 const maxCLIOutputBytes = 64 * 1024
 
+const injectViaProofSchema = 1
+
 const CapabilityWakeGCV1 = "wake_gc_v1"
+
+type injectViaProof struct {
+	Schema       int    `json:"schema"`
+	Path         string `json:"path"`
+	SHA256       string `json:"sha256"`
+	Device       uint64 `json:"device"`
+	Inode        uint64 `json:"inode"`
+	Size         int64  `json:"size"`
+	Mode         uint32 `json:"mode"`
+	UID          uint32 `json:"uid"`
+	GID          uint32 `json:"gid"`
+	ModTimeNanos int64  `json:"mod_time_nanos"`
+}
+
+func encodeInjectViaProof(identity executable.Identity) (string, error) {
+	if !identity.Complete() {
+		return "", errors.New("inject-via proof requires a complete executable identity")
+	}
+	data, err := json.Marshal(injectViaProof{
+		Schema: injectViaProofSchema, Path: identity.Path, SHA256: identity.SHA256,
+		Device: identity.Device, Inode: identity.Inode, Size: identity.Size, Mode: identity.Mode,
+		UID: identity.UID, GID: identity.GID, ModTimeNanos: identity.ModTimeNanos,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode inject-via proof: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
 
 type Env struct {
 	SchemaVersion int               `json:"schema_version"`
@@ -217,21 +249,27 @@ type CLI struct {
 	wakeReadyCleanupNow  func() time.Time
 }
 
+func defaultWarningSink(err error) {
+	_, _ = fmt.Fprintf(os.Stderr, "amq-keepalive warning: %v\n", err)
+}
+
 func NewCLI(path string) CLI {
 	if path == "" {
 		path = "amq"
 	}
 	return CLI{
-		Path: path,
-		wakeReadyWarningSink: func(err error) {
-			_, _ = fmt.Fprintf(os.Stderr, "amq-keepalive warning: %v\n", err)
-		},
+		Path:                 path,
+		wakeReadyWarningSink: defaultWarningSink,
 	}
 }
 
 // WithWarningSink returns a copy that reports non-fatal maintenance warnings
-// to sink. A nil sink explicitly suppresses warnings.
+// to sink. A nil sink restores the visible stderr default; warnings cannot be
+// suppressed accidentally by forwarding an unset optional callback.
 func (c CLI) WithWarningSink(sink func(error)) CLI {
+	if sink == nil {
+		sink = defaultWarningSink
+	}
 	c.wakeReadyWarningSink = sink
 	return c
 }
@@ -609,11 +647,26 @@ func (c CLI) runExpected(ctx context.Context, amqIdentity, injectIdentity execut
 		return nil, "", fmt.Errorf("verify AMQ executable: %w", err)
 	}
 	defer cleanup()
-	// Revalidate inject-via only after AMQ is pinned and immediately before the
-	// subprocess inspects that target path.
-	if err := executable.Verify(injectIdentity); err != nil {
+	// Open inject-via only after AMQ is pinned. Keep the exact verified file
+	// description alive through child completion, and tell AMQ which inherited
+	// descriptor carries the corresponding identity capability. On Linux the
+	// pinned AMQ executable already occupies ExtraFiles[0], so the child fd must
+	// be derived rather than assumed to be 3.
+	injectFile, err := executable.OpenVerified(injectIdentity)
+	if err != nil {
 		return nil, "", fmt.Errorf("verify inject-via executable: %w", err)
 	}
+	defer func() { _ = injectFile.Close() }()
+	proof, err := encodeInjectViaProof(injectIdentity)
+	if err != nil {
+		return nil, "", err
+	}
+	childFD := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, injectFile)
+	cmd.Args = append(cmd.Args,
+		"--inject-via-proof", proof,
+		"--inject-via-proof-fd", strconv.Itoa(childFD),
+	)
 	return runCommand(cmd)
 }
 

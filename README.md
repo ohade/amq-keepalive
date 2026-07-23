@@ -108,6 +108,9 @@ supports `--accept-existing-wake` target verification and
 exact baseline manifests. Readiness-marker maintenance scans and removes only a
 bounded number per start; cleanup failures are aggregated as warnings and do
 not turn an otherwise-positive ready acknowledgement into a false failure.
+Custom warning sinks may replace the default diagnostic destination, but a nil
+sink restores visible stderr reporting instead of suppressing maintenance
+failures.
 Normal `attach` and `reattach` also require a strict
 `amq env --json` response advertising `wake_gc_v1` before any registry
 reservation or wake start; `--no-start` remains the explicit register-only
@@ -158,7 +161,11 @@ and lifecycle timeout. Use exactly the same options for apply; any row, target,
 path, executable content/metadata, or timeout drift invalidates the token before
 a signal. `--agents` must name every non-retired listener at that canonical root;
 an omitted same-adapter, mixed-adapter, or live sibling refuses the whole plan.
-Every manual preflight and mutation reopens and rehashes both files.
+Every manual preflight and mutation reopens and rehashes both files. Keepalive
+also holds the exact verified injector descriptor through AMQ child completion
+and passes its canonical identity token; AMQ revalidates that inherited
+descriptor and the current no-follow path under its lifecycle guard immediately
+before mutation. A same-path replacement therefore fails closed.
 Linux executes AMQ from the verified descriptor; macOS executes a private
 fsynced snapshot copied from that descriptor because Darwin rejects executable
 `/dev/fd` paths.
