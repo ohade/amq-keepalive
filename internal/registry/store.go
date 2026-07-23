@@ -34,6 +34,7 @@ type Entry struct {
 	Agent                  string    `json:"agent"`
 	Adapter                string    `json:"adapter"`
 	Target                 string    `json:"target"`
+	WakeOwner              string    `json:"wake_owner,omitempty"`
 	BaselineFile           string    `json:"baseline_file,omitempty"`
 	BaselineDigest         string    `json:"baseline_digest,omitempty"`
 	State                  State     `json:"state"`
@@ -383,6 +384,9 @@ func (s *Store) prepareEntry(entry Entry) (Entry, error) {
 	}
 	if entry.Target == "" {
 		return Entry{}, errors.New("entry target is required")
+	}
+	if strings.TrimSpace(entry.WakeOwner) == "" {
+		return Entry{}, errors.New("entry wake owner is required")
 	}
 	if entry.ID == "" {
 		entry.ID = EntryID(entry.Root, entry.Agent, entry.Adapter, entry.Target)

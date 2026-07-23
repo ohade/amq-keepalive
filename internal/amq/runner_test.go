@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const testWakeOwner = `{"pid":4242,"process_start":"owner-start","boot_id":"boot-1"}`
+
 func TestStartWakeWaitsForReadyFileAndPassesTarget(t *testing.T) {
 	dir := t.TempDir()
 	argsLog := filepath.Join(dir, "args.log")
@@ -36,6 +38,7 @@ printf ready > "$ready"
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
+		WakeOwner: testWakeOwner,
 		Timeout:   5 * time.Second,
 	})
 	if err != nil {
@@ -87,6 +90,7 @@ done
 	if err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
 		Adapter: "cmux", Target: "cmux:surface:abc", BaselineFile: baseline,
+		WakeOwner:      testWakeOwner,
 		BaselineDigest: digest, Timeout: 5 * time.Second,
 	}); err != nil {
 		t.Fatal(err)
@@ -118,6 +122,7 @@ func TestStartWakeRejectsChangedOrUnsafeBaselineBeforeExec(t *testing.T) {
 	}
 	err = NewCLI(filepath.Join(dir, "must-not-run")).StartWake(context.Background(), StartWakeRequest{
 		InjectVia: "/tmp/amq-keepalive", Adapter: "cmux", Target: "cmux:surface:abc",
+		WakeOwner:    testWakeOwner,
 		BaselineFile: baseline, BaselineDigest: digest,
 	})
 	if err == nil || !strings.Contains(err.Error(), "digest changed") {
@@ -144,6 +149,7 @@ exit 7
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
+		WakeOwner: testWakeOwner,
 		Timeout:   5 * time.Second,
 	})
 	if err == nil {
@@ -180,6 +186,7 @@ while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
 		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
 		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second,
+		WakeOwner: testWakeOwner,
 	})
 	if err != nil {
 		t.Fatalf("StartWake() error = %v", err)
@@ -232,6 +239,7 @@ done
 	err := NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
 		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
 		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second,
+		WakeOwner: testWakeOwner,
 	})
 	if err != nil {
 		t.Fatalf("StartWake() error = %v", err)
@@ -281,6 +289,7 @@ while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 		done <- NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
 			Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
 			Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", Timeout: 5 * time.Second,
+			WakeOwner: testWakeOwner,
 		})
 	}()
 	waitForFile(t, started, 2*time.Second)
@@ -311,6 +320,7 @@ sleep 0.2
 		InjectVia: "/tmp/amq-keepalive",
 		Adapter:   "ghostty",
 		Target:    "ghostty:terminal:abc",
+		WakeOwner: testWakeOwner,
 		Timeout:   50 * time.Millisecond,
 	})
 	if err == nil {

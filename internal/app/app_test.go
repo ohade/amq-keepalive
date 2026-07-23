@@ -17,6 +17,15 @@ import (
 	"github.com/ohade/amq-keepalive/internal/registry"
 )
 
+const testWakeOwner = `{"pid":4242,"process_start":"owner-start","boot_id":"boot-1"}`
+
+func TestMain(m *testing.M) {
+	if err := os.Setenv(amq.WakeOwnerEnvironment, testWakeOwner); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
+
 func TestHelpWritesUsageToStdoutAndExitsZero(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -29,6 +38,28 @@ func TestHelpWritesUsageToStdoutAndExitsZero(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	for _, removed := range []string{"gc", "retire-session"} {
+		if strings.Contains(stdout.String(), removed) {
+			t.Fatalf("help still advertises removed command %q: %s", removed, stdout.String())
+		}
+	}
+}
+
+func TestRemovedRetirementCommandsAndFlagAreRejected(t *testing.T) {
+	for _, command := range []string{"gc", "retire-session"} {
+		var stderr bytes.Buffer
+		code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{command})
+		if code != 2 || !strings.Contains(stderr.String(), "unknown command") {
+			t.Fatalf("%s code=%d stderr=%q, want removed command", command, code, stderr.String())
+		}
+	}
+	var stderr bytes.Buffer
+	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
+		"reattach", "--retire-detached",
+	})
+	if code != 1 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("retire-detached code=%d stderr=%q, want removed flag", code, stderr.String())
 	}
 }
 
@@ -116,8 +147,24 @@ func TestAttachPersistsValidatedBaselineBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Entries[0].BaselineFile != baseline || loaded.Entries[0].BaselineDigest != digest {
+	if loaded.Entries[0].BaselineFile != baseline ||
+		loaded.Entries[0].BaselineDigest != digest ||
+		loaded.Entries[0].WakeOwner != testWakeOwner {
 		t.Fatalf("persisted baseline binding = %+v", loaded.Entries[0])
+	}
+}
+
+func TestAttachNoStartRefusesMissingWakeOwner(t *testing.T) {
+	t.Setenv(amq.WakeOwnerEnvironment, "")
+	var stderr bytes.Buffer
+	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
+		"attach", "--registry", filepath.Join(t.TempDir(), "registry.json"),
+		"--adapter", "file", "--target", filepath.Join(t.TempDir(), "inbox.txt"),
+		"--root", "/tmp/amq-root", "--base-root", "/tmp", "--session", "amq-root",
+		"--me", "codex", "--no-start",
+	})
+	if code != 1 || !strings.Contains(stderr.String(), "AMQ_WAKE_OWNER is required") {
+		t.Fatalf("code=%d stderr=%q, want owner-bound refusal", code, stderr.String())
 	}
 }
 
@@ -154,7 +201,7 @@ func TestReattachRejectsDifferentSurfaceAliasOnOwnedPhysicalTTY(t *testing.T) {
 	firstTarget := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
 	secondTarget := "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2"
 	store := registry.New(registryPath)
-	if _, err := store.Upsert(registry.Entry{Root: "/tmp/first", Agent: "codex", Adapter: "cmux", Target: firstTarget}); err != nil {
+	if _, err := store.Upsert(registry.Entry{Root: "/tmp/first", Agent: "codex", Adapter: "cmux", Target: firstTarget, WakeOwner: testWakeOwner}); err != nil {
 		t.Fatalf("Upsert first owner: %v", err)
 	}
 	fakeCmux := filepath.Join(dir, "cmux")
@@ -473,305 +520,6 @@ while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
 	}
 }
 
-func TestReattachRetireDetachedHardGatesRetirementAndRestoresOldRow(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "probe-room")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	oldTarget := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
-	newTarget := "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2"
-	store := registry.New(registryPath)
-	if _, err := store.Upsert(registry.Entry{
-		Root: root, BaseRoot: dir, SessionName: "probe-room", Agent: "codex",
-		Adapter: "cmux", Target: oldTarget, State: registry.StateDetached,
-	}); err != nil {
-		t.Fatalf("Upsert old entry: %v", err)
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[{\"workspaces\":[{\"panes\":[{\"surfaces\":[{\"id\":\"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2\",\"tty\":\"ttys102\"}]}]}]}]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	argsLog := filepath.Join(dir, "amq-args.log")
-	firstStart := filepath.Join(dir, "first-start")
-	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
-	t.Setenv("AMQ_KEEPALIVE_FIRST_START", firstStart)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-printf 'CALL %s\n' "$*" >> "$AMQ_KEEPALIVE_ARGS_LOG"
-if [ "$1" = "wake" ] && [ "${2:-}" = "retire" ]; then
-  echo '{"status":"retired","agent":"codex","pid":4242}'
-  exit 0
-fi
-if [ ! -f "$AMQ_KEEPALIVE_FIRST_START" ]; then
-  : > "$AMQ_KEEPALIVE_FIRST_START"
-  echo 'existing wake target differs' >&2
-  exit 7
-fi
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "-ready-file" ]; then printf ready > "$arg"; fi
-  previous="$arg"
-done
-`), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	fakeKeepalive := filepath.Join(dir, "amq-keepalive")
-	if err := os.WriteFile(fakeKeepalive, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatalf("write fake keepalive: %v", err)
-	}
-	var stderr bytes.Buffer
-	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{"reattach",
-		"--registry", registryPath,
-		"--adapter", "cmux",
-		"--target", newTarget,
-		"--root", root,
-		"--base-root", dir,
-		"--session", "probe-room",
-		"--me", "codex",
-		"--amq", fakeAMQ,
-		"--self", fakeKeepalive,
-		"--retire-detached",
-	})
-	if code != 1 || !strings.Contains(stderr.String(), "identity-safe-retire") || !strings.Contains(stderr.String(), "#235") {
-		t.Fatalf("code=%d stderr=%s, want retirement capability gate", code, stderr.String())
-	}
-	loaded, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(loaded.Entries) != 1 || loaded.Entries[0].Target != oldTarget {
-		t.Fatalf("entries = %#v, want old row restored", loaded.Entries)
-	}
-	data, err := os.ReadFile(argsLog)
-	if err != nil {
-		t.Fatalf("read args log: %v", err)
-	}
-	log := string(data)
-	if strings.Count(log, "CALL wake -root") != 1 || strings.Contains(log, "wake retire") || !strings.Contains(log, newTarget) {
-		t.Fatalf("retirement gate must make one non-destructive start attempt and no retire call:\n%s", log)
-	}
-}
-
-func TestReattachRetireDetachedStartsWhenOldTargetMissingAndWakeLockAlreadyAbsent(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "missing-lock-room")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	oldTarget := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
-	newTarget := "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2"
-	store := registry.New(registryPath)
-	if _, err := store.Upsert(registry.Entry{
-		Root: root, BaseRoot: dir, SessionName: "missing-lock-room", Agent: "codex",
-		Adapter: "cmux", Target: oldTarget, State: registry.StateDetached,
-	}); err != nil {
-		t.Fatalf("Upsert old entry: %v", err)
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[{\"workspaces\":[{\"panes\":[{\"surfaces\":[{\"id\":\"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2\",\"tty\":\"ttys102\"}]}]}]}]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	argsLog := filepath.Join(dir, "amq-args.log")
-	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-printf 'CALL %s\n' "$*" >> "$AMQ_KEEPALIVE_ARGS_LOG"
-if [ "$1" = "wake" ] && [ "${2:-}" = "retire" ]; then
-  echo '{"status":"refused","reason":"no wake lock present; wake process absence cannot be proven"}'
-  exit 1
-fi
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "-ready-file" ]; then printf ready > "$arg"; fi
-  previous="$arg"
-done
-`), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	fakeKeepalive := filepath.Join(dir, "amq-keepalive")
-	if err := os.WriteFile(fakeKeepalive, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatalf("write fake keepalive: %v", err)
-	}
-	runApp(t, "reattach",
-		"--registry", registryPath,
-		"--adapter", "cmux",
-		"--target", newTarget,
-		"--root", root,
-		"--base-root", dir,
-		"--session", "missing-lock-room",
-		"--me", "codex",
-		"--amq", fakeAMQ,
-		"--self", fakeKeepalive,
-		"--retire-detached",
-	)
-	loaded, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(loaded.Entries) != 1 || loaded.Entries[0].Target != newTarget || loaded.Entries[0].State != registry.StateActive {
-		t.Fatalf("entries = %#v, want one active new target", loaded.Entries)
-	}
-	data, err := os.ReadFile(argsLog)
-	if err != nil {
-		t.Fatalf("read args log: %v", err)
-	}
-	log := string(data)
-	if strings.Contains(log, "wake retire") {
-		t.Fatalf("already-absent wake should start directly without retirement:\n%s", log)
-	}
-	if starts := strings.Count(log, "CALL wake -root"); starts != 1 {
-		t.Fatalf("wake starts = %d, want 1:\n%s", starts, log)
-	}
-}
-
-func TestReattachRetireDetachedDoesNotRetryThroughUnsafeRetirement(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "retire-race-room")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	oldTarget := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
-	newTarget := "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2"
-	store := registry.New(registryPath)
-	if _, err := store.Upsert(registry.Entry{
-		Root: root, BaseRoot: dir, SessionName: "retire-race-room", Agent: "codex",
-		Adapter: "cmux", Target: oldTarget, State: registry.StateDetached,
-	}); err != nil {
-		t.Fatalf("Upsert old entry: %v", err)
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[{\"workspaces\":[{\"panes\":[{\"surfaces\":[{\"id\":\"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2\",\"tty\":\"ttys102\"}]}]}]}]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	argsLog := filepath.Join(dir, "amq-args.log")
-	firstStart := filepath.Join(dir, "first-start")
-	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
-	t.Setenv("AMQ_KEEPALIVE_FIRST_START", firstStart)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-printf 'CALL %s\n' "$*" >> "$AMQ_KEEPALIVE_ARGS_LOG"
-if [ "$1" = "wake" ] && [ "${2:-}" = "retire" ]; then
-  echo '{"status":"refused","reason":"no wake lock present; wake process absence cannot be proven"}'
-  exit 1
-fi
-if [ ! -f "$AMQ_KEEPALIVE_FIRST_START" ]; then
-  : > "$AMQ_KEEPALIVE_FIRST_START"
-  echo 'existing wake target differs' >&2
-  exit 7
-fi
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "-ready-file" ]; then printf ready > "$arg"; fi
-  previous="$arg"
-done
-`), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	fakeKeepalive := filepath.Join(dir, "amq-keepalive")
-	if err := os.WriteFile(fakeKeepalive, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatalf("write fake keepalive: %v", err)
-	}
-	var stderr bytes.Buffer
-	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{"reattach",
-		"--registry", registryPath,
-		"--adapter", "cmux",
-		"--target", newTarget,
-		"--root", root,
-		"--base-root", dir,
-		"--session", "retire-race-room",
-		"--me", "codex",
-		"--amq", fakeAMQ,
-		"--self", fakeKeepalive,
-		"--retire-detached",
-	})
-	if code != 1 || !strings.Contains(stderr.String(), "identity-safe-retire") {
-		t.Fatalf("code=%d stderr=%s, want retirement capability gate", code, stderr.String())
-	}
-	loaded, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(loaded.Entries) != 1 || loaded.Entries[0].Target != oldTarget {
-		t.Fatalf("entries = %#v, want old row restored", loaded.Entries)
-	}
-	data, err := os.ReadFile(argsLog)
-	if err != nil {
-		t.Fatalf("read args log: %v", err)
-	}
-	log := string(data)
-	if starts := strings.Count(log, "CALL wake -root"); starts != 1 {
-		t.Fatalf("wake starts = %d, want one non-destructive attempt:\n%s", starts, log)
-	}
-	if strings.Contains(log, "wake retire") {
-		t.Fatalf("unsafe wake retire was invoked:\n%s", log)
-	}
-}
-
-func TestReattachRetireDetachedNeverRetargetsLiveCmuxWake(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "active-room")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	oldTarget := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
-	newTarget := "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2"
-	store := registry.New(registryPath)
-	if _, err := store.Upsert(registry.Entry{Root: root, BaseRoot: dir, SessionName: "active-room", Agent: "codex", Adapter: "cmux", Target: oldTarget}); err != nil {
-		t.Fatalf("Upsert old entry: %v", err)
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[{\"workspaces\":[{\"panes\":[{\"surfaces\":[{\"id\":\"F901D722-6789-4BBB-9818-C4E97F20BEB3\",\"tty\":\"ttys101\"},{\"id\":\"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2\",\"tty\":\"ttys102\"}]}]}]}]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	argsLog := filepath.Join(dir, "amq-args.log")
-	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nprintf 'CALL %s\\n' \"$*\" >> \"$AMQ_KEEPALIVE_ARGS_LOG\"\necho 'existing wake target differs' >&2\nexit 7\n"), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	var stderr bytes.Buffer
-	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
-		"reattach", "--registry", registryPath, "--adapter", "cmux", "--target", newTarget,
-		"--root", root, "--base-root", dir, "--session", "active-room", "--me", "codex",
-		"--amq", fakeAMQ, "--self", filepath.Join(dir, "amq-keepalive"), "--retire-detached",
-	})
-	if code != 1 || !strings.Contains(stderr.String(), "amq wake exited before becoming ready") {
-		t.Fatalf("code=%d stderr=%s", code, stderr.String())
-	}
-	loaded, err := store.Load()
-	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].Target != oldTarget {
-		t.Fatalf("live target registry changed: entries=%#v err=%v", loaded.Entries, err)
-	}
-	data, err := os.ReadFile(argsLog)
-	if err != nil {
-		t.Fatalf("read args log: %v", err)
-	}
-	if strings.Contains(string(data), "wake retire") {
-		t.Fatalf("live old target was retired:\n%s", data)
-	}
-}
-
 func TestNormalizeAMQPathsUsesAbsoluteBaseSessionRoot(t *testing.T) {
 	root, base := normalizeAMQPaths(".agent-mail/team-upgrader_v3", "/Users/test/git/.agent-mail", "team-upgrader_v3")
 	if root != "/Users/test/git/.agent-mail/team-upgrader_v3" {
@@ -779,188 +527,6 @@ func TestNormalizeAMQPathsUsesAbsoluteBaseSessionRoot(t *testing.T) {
 	}
 	if base != "/Users/test/git/.agent-mail" {
 		t.Fatalf("base = %q, want absolute base root", base)
-	}
-}
-
-func TestRetireSessionHardGatePreservesAllEntriesAndInvokesNoAMQ(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "dashboard")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	store := registry.New(registryPath)
-	entries := []registry.Entry{
-		{Root: root, BaseRoot: dir, SessionName: "dashboard", Agent: "codex", Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", State: registry.StateDetached},
-		{Root: root, BaseRoot: dir, SessionName: "dashboard", Agent: "claude", Adapter: "cmux", Target: "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2", State: registry.StateDetached},
-		{Root: root, BaseRoot: dir, SessionName: "dashboard", Agent: "observer", Adapter: "file", Target: filepath.Join(dir, "observer.txt"), State: registry.StateActive},
-	}
-	for _, entry := range entries {
-		if _, err := store.Upsert(entry); err != nil {
-			t.Fatalf("Upsert(%s): %v", entry.Agent, err)
-		}
-	}
-
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	argsLog := filepath.Join(dir, "amq-args.log")
-	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-printf '%s\n' "$@" >> "$AMQ_KEEPALIVE_ARGS_LOG"
-agent=""
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "-me" ]; then agent="$arg"; fi
-  previous="$arg"
-done
-printf '{"status":"retired","agent":"%s","pid":4242}\n' "$agent"
-`), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	fakeKeepalive := filepath.Join(dir, "amq-keepalive")
-	if err := os.WriteFile(fakeKeepalive, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatalf("write fake keepalive: %v", err)
-	}
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := (App{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
-		"retire-session",
-		"--registry", registryPath,
-		"--root", root,
-		"--agents", "codex,claude",
-		"--adapter", "cmux",
-		"--amq", fakeAMQ,
-		"--self", fakeKeepalive,
-	})
-	if code != 1 || !strings.Contains(stderr.String(), "identity-safe-retire") || !strings.Contains(stderr.String(), "#235") {
-		t.Fatalf("retire-session code=%d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-	}
-	loaded, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if len(loaded.Entries) != 3 {
-		t.Fatalf("entries after gated retirement = %#v, want all preserved", loaded.Entries)
-	}
-	if data, err := os.ReadFile(argsLog); err == nil && len(data) > 0 {
-		t.Fatalf("gated retire-session invoked AMQ: %s", data)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("inspect AMQ log: %v", err)
-	}
-}
-
-func TestRetireSessionRefusesWhenTargetStillExists(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "dashboard")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	store := registry.New(registryPath)
-	for _, entry := range []registry.Entry{
-		{Root: root, Agent: "codex", Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", State: registry.StateDetached},
-		{Root: root, Agent: "claude", Adapter: "cmux", Target: "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2", State: registry.StateDetached},
-	} {
-		if _, err := store.Upsert(entry); err != nil {
-			t.Fatalf("Upsert: %v", err)
-		}
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[{\"workspaces\":[{\"panes\":[{\"surfaces\":[{\"id\":\"F901D722-6789-4BBB-9818-C4E97F20BEB3\",\"tty\":\"ttys101\"},{\"id\":\"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2\",\"tty\":\"ttys102\"}]}]}]}]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\nexit 99\n"), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	var stderr bytes.Buffer
-	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
-		"retire-session", "--registry", registryPath, "--root", root, "--amq", fakeAMQ,
-	})
-	if code != 1 || !strings.Contains(stderr.String(), "still exists") {
-		t.Fatalf("code=%d stderr=%s", code, stderr.String())
-	}
-	loaded, err := store.Load()
-	if err != nil || len(loaded.Entries) != 2 {
-		t.Fatalf("registry changed after refusal: entries=%#v err=%v", loaded.Entries, err)
-	}
-}
-
-func TestRetireSessionGatePreventsPartialRetirement(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, "dashboard")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatalf("MkdirAll root: %v", err)
-	}
-	registryPath := filepath.Join(dir, "registry.json")
-	store := registry.New(registryPath)
-	for _, entry := range []registry.Entry{
-		{Root: root, Agent: "codex", Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", State: registry.StateDetached},
-		{Root: root, Agent: "claude", Adapter: "cmux", Target: "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2", State: registry.StateDetached},
-	} {
-		if _, err := store.Upsert(entry); err != nil {
-			t.Fatalf("Upsert: %v", err)
-		}
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\necho '{\"windows\":[]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	argsLog := filepath.Join(dir, "amq-args.log")
-	t.Setenv("AMQ_KEEPALIVE_ARGS_LOG", argsLog)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-printf '%s\n' "$@" >> "$AMQ_KEEPALIVE_ARGS_LOG"
-agent=""
-previous=""
-for arg in "$@"; do
-  if [ "$previous" = "-me" ]; then agent="$arg"; fi
-  previous="$arg"
-done
-if [ "$agent" = "claude" ]; then
-  printf '%s\n' '{"status":"refused","agent":"claude","reason":"target changed"}'
-  exit 7
-fi
-printf '%s\n' '{"status":"retired","agent":"codex","pid":4242}'
-`), 0o700); err != nil {
-		t.Fatalf("write fake AMQ: %v", err)
-	}
-	fakeKeepalive := filepath.Join(dir, "amq-keepalive")
-	if err := os.WriteFile(fakeKeepalive, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatalf("write fake keepalive: %v", err)
-	}
-	var stderr bytes.Buffer
-	code := (App{Stdout: &bytes.Buffer{}, Stderr: &stderr}).Run(context.Background(), []string{
-		"retire-session", "--registry", registryPath, "--root", root,
-		"--amq", fakeAMQ, "--self", fakeKeepalive,
-	})
-	if code != 1 || !strings.Contains(stderr.String(), "identity-safe-retire") {
-		t.Fatalf("code=%d stderr=%s", code, stderr.String())
-	}
-	loaded, err := store.Load()
-	if err != nil || len(loaded.Entries) != 2 {
-		t.Fatalf("retirement gate changed registry: entries=%#v err=%v", loaded.Entries, err)
-	}
-	if data, err := os.ReadFile(argsLog); err == nil && len(data) > 0 {
-		t.Fatalf("retirement gate invoked AMQ: %s", data)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("inspect AMQ log: %v", err)
 	}
 }
 
@@ -1003,10 +569,8 @@ func TestSuperviseWarnsOncePerPersistentFailureTransition(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, "registry.json")
 	_, err := registry.New(registryPath).Upsert(registry.Entry{
-		Root:    "/tmp/amq-root",
-		Agent:   "codex",
-		Adapter: "file",
-		Target:  filepath.Join(dir, "inbox.txt"),
+		Root: "/tmp/amq-root", Agent: "codex", Adapter: "file", Target: filepath.Join(dir, "inbox.txt"),
+		WakeOwner: testWakeOwner,
 	})
 	if err != nil {
 		t.Fatalf("Upsert() error = %v", err)
@@ -1072,7 +636,7 @@ func TestSuperviseCancellationStopsLaterStartsAndLeavesRegistryUnchanged(t *test
 			t.Fatalf("write target: %v", err)
 		}
 		if _, err := store.Upsert(registry.Entry{
-			Root: fmt.Sprintf("/tmp/cancel-%d", index), Agent: "codex", Adapter: "file", Target: target,
+			Root: fmt.Sprintf("/tmp/cancel-%d", index), Agent: "codex", Adapter: "file", Target: target, WakeOwner: testWakeOwner,
 		}); err != nil {
 			t.Fatalf("Upsert: %v", err)
 		}
@@ -1110,7 +674,7 @@ func TestSuperviseBatchesCmuxInventoryAndDefersHealthyEntries(t *testing.T) {
 		"cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2",
 	}
 	for i, target := range targets {
-		if _, err := store.Upsert(registry.Entry{Root: filepath.Join(dir, string(rune('a'+i))), Agent: "codex", Adapter: "cmux", Target: target}); err != nil {
+		if _, err := store.Upsert(registry.Entry{Root: filepath.Join(dir, string(rune('a'+i))), Agent: "codex", Adapter: "cmux", Target: target, WakeOwner: testWakeOwner}); err != nil {
 			t.Fatalf("Upsert(%s): %v", target, err)
 		}
 	}
@@ -1152,7 +716,7 @@ func TestSuperviseFailsClosedWhenOneRegisteredSurfaceHasLiveTTYAlias(t *testing.
 	store := registry.New(registryPath)
 	if _, err := store.Upsert(registry.Entry{
 		Root: "/tmp/tty-owner", Agent: "codex", Adapter: "cmux",
-		Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", State: registry.StateActive,
+		Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", WakeOwner: testWakeOwner, State: registry.StateActive,
 	}); err != nil {
 		t.Fatalf("Upsert registered owner: %v", err)
 	}
@@ -1233,132 +797,6 @@ func TestContinuousSuperviseDoesNotEmitPerPassJSON(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("continuous supervisor emitted per-pass stdout:\n%s", stdout.String())
-	}
-}
-
-func TestGCDryRunIsNonMutatingAndApplyIsIdentitySafetyGated(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	registryPath := filepath.Join(dir, "registry.json")
-	target := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
-	store := registry.New(registryPath)
-	entry, err := store.Upsert(registry.Entry{
-		Root: "/tmp/old-session", Agent: "codex", Adapter: "cmux", Target: target,
-		State: registry.StateDetached, DetachedSince: time.Now().Add(-48 * time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-	calls := filepath.Join(dir, "cmux-calls.log")
-	t.Setenv("AMQ_KEEPALIVE_CMUX_CALLS", calls)
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AMQ_KEEPALIVE_CMUX_CALLS\"\nprintf '%s\\n' '{\"windows\":[]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	var dry bytes.Buffer
-	code := (App{Stdout: &dry, Stderr: &bytes.Buffer{}}).Run(context.Background(), []string{
-		"gc", "--registry", registryPath, "--min-detached-age", "0",
-	})
-	if code != 0 || !strings.Contains(dry.String(), `"status": "candidate"`) || !strings.Contains(dry.String(), `"applied": false`) {
-		t.Fatalf("dry-run code=%d output=%s", code, dry.String())
-	}
-	loaded, err := store.Load()
-	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].ID != entry.ID {
-		t.Fatalf("dry-run mutated registry: entries=%#v err=%v", loaded.Entries, err)
-	}
-
-	amqCalls := filepath.Join(dir, "amq-calls.log")
-	t.Setenv("AMQ_KEEPALIVE_AMQ_CALLS", amqCalls)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-printf '%s\n' "$*" >> "$AMQ_KEEPALIVE_AMQ_CALLS"
-printf '%s\n' '{"status":"retired","agent":"codex","pid":4242}'
-`), 0o700); err != nil {
-		t.Fatalf("write fake amq: %v", err)
-	}
-	var applied bytes.Buffer
-	var applyErr bytes.Buffer
-	code = (App{Stdout: &applied, Stderr: &applyErr}).Run(context.Background(), []string{
-		"gc", "--registry", registryPath, "--min-detached-age", "0", "--apply",
-		"--amq", fakeAMQ, "--self", "/bin/amq-keepalive",
-	})
-	if code != 1 || applied.Len() != 0 || !strings.Contains(applyErr.String(), "identity-safe-retire") || !strings.Contains(applyErr.String(), "#235") {
-		t.Fatalf("apply code=%d stdout=%s stderr=%s", code, applied.String(), applyErr.String())
-	}
-	loaded, err = store.Load()
-	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].ID != entry.ID {
-		t.Fatalf("apply registry entries=%#v err=%v", loaded.Entries, err)
-	}
-	if data, err := os.ReadFile(amqCalls); err == nil && len(data) > 0 {
-		t.Fatalf("gated gc apply invoked AMQ: %s", data)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("inspect AMQ log: %v", err)
-	}
-	data, err := os.ReadFile(calls)
-	if err != nil || strings.Count(strings.TrimSpace(string(data)), "system.tree") != 1 {
-		t.Fatalf("cmux inventory calls = %q err=%v, want dry-run only", data, err)
-	}
-}
-
-func TestGCDryRunExcludesPhysicalTTYOwnershipCollisions(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("cmux adapter requires macOS")
-	}
-	dir := t.TempDir()
-	registryPath := filepath.Join(dir, "registry.json")
-	store := registry.New(registryPath)
-	for index, target := range []string{
-		"cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3",
-		"cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2",
-	} {
-		if _, err := store.Upsert(registry.Entry{
-			Root: fmt.Sprintf("/tmp/gc-collision-%d", index), Agent: fmt.Sprintf("agent-%d", index),
-			Adapter: "cmux", Target: target, State: registry.StateDetached,
-			DetachedSince: time.Now().Add(-48 * time.Hour),
-		}); err != nil {
-			t.Fatalf("Upsert collision row: %v", err)
-		}
-	}
-	fakeCmux := filepath.Join(dir, "cmux")
-	if err := os.WriteFile(fakeCmux, []byte("#!/bin/sh\nprintf '%s\\n' '{\"windows\":[{\"workspaces\":[{\"panes\":[{\"surfaces\":[{\"id\":\"F901D722-6789-4BBB-9818-C4E97F20BEB3\",\"tty\":\"ttys011\"},{\"id\":\"B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2\",\"tty\":\"/dev/ttys011\"}]}]}]}]}'\n"), 0o700); err != nil {
-		t.Fatalf("write fake cmux: %v", err)
-	}
-	t.Setenv("CMUX_BUNDLED_CLI_PATH", fakeCmux)
-	var stdout bytes.Buffer
-	code := (App{Stdout: &stdout, Stderr: &bytes.Buffer{}}).Run(context.Background(), []string{
-		"gc", "--registry", registryPath, "--min-detached-age", "0",
-	})
-	if code != 0 || strings.Count(stdout.String(), `"status": "skipped"`) != 2 ||
-		!strings.Contains(stdout.String(), "2 live surface aliases") {
-		t.Fatalf("code=%d output=%s, want both aliases excluded", code, stdout.String())
-	}
-}
-
-func TestGCApplyGateRunsBeforeAMQInvocation(t *testing.T) {
-	dir := t.TempDir()
-	registryPath := filepath.Join(dir, "registry.json")
-	called := filepath.Join(dir, "amq-called")
-	t.Setenv("AMQ_KEEPALIVE_CALLED", called)
-	fakeAMQ := filepath.Join(dir, "amq")
-	if err := os.WriteFile(fakeAMQ, []byte(`#!/bin/sh
-: > "$AMQ_KEEPALIVE_CALLED"
-exit 99
-`), 0o700); err != nil {
-		t.Fatalf("write fake amq: %v", err)
-	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	code := (App{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
-		"gc", "--registry", registryPath, "--min-detached-age", "0", "--apply", "--amq", fakeAMQ,
-	})
-	if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "identity-safe-retire") {
-		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-	}
-	if _, err := os.Stat(called); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("gated gc apply invoked AMQ: stat=%v", err)
 	}
 }
 

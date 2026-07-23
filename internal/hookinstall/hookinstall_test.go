@@ -351,8 +351,10 @@ func TestSessionStartScriptAutoSelectsExactCmuxSurfaceAndLogsFailure(t *testing.
 	dir := t.TempDir()
 	scriptPath := writeSessionStartScript(t, dir)
 	argsPath := filepath.Join(dir, "args.log")
+	ownerPath := filepath.Join(dir, "owner.log")
 	binaryPath := writeExecutableBody(t, filepath.Join(dir, "amq-keepalive"), `#!/bin/sh
 printf '%s\n' "$@" > "$AMQ_KEEPALIVE_CAPTURE"
+printf '%s' "$AMQ_WAKE_OWNER" > "$AMQ_KEEPALIVE_OWNER_CAPTURE"
 echo 'existing wake target differs' >&2
 exit 7
 `)
@@ -369,6 +371,7 @@ exit 7
 	),
 		"AMQ_KEEPALIVE_BIN="+binaryPath,
 		"AMQ_KEEPALIVE_CAPTURE="+argsPath,
+		"AMQ_KEEPALIVE_OWNER_CAPTURE="+ownerPath,
 		"AMQ_KEEPALIVE_LOG="+logPath,
 		"AMQ_KEEPALIVE_TIMEOUT_SECONDS=2",
 		"AMQ_KEEPALIVE_CMUX="+cmuxPath,
@@ -398,6 +401,13 @@ exit 7
 		if !strings.Contains(argsText, want) {
 			t.Fatalf("args missing %q:\n%s", want, argsText)
 		}
+	}
+	ownerData, err := os.ReadFile(ownerPath)
+	if err != nil {
+		t.Fatalf("read owner capture: %v", err)
+	}
+	if string(ownerData) != `{"pid":4242,"process_start":"owner-start","boot_id":"boot-1"}` {
+		t.Fatalf("SessionStart owner = %q, want deferred owner", ownerData)
 	}
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
@@ -587,7 +597,7 @@ func withoutEnv(env []string, keys ...string) []string {
 func sessionStartCleanEnv() []string {
 	return withoutEnv(os.Environ(),
 		"AM_ROOT", "AM_BASE_ROOT", "AM_SESSION", "AM_ME",
-		"AMQ_WAKE_BASELINE_FILE", "AMQ_WAKE_BASELINE_ERROR",
+		"AMQ_WAKE_BASELINE_FILE", "AMQ_WAKE_BASELINE_ERROR", "AMQ_WAKE_OWNER",
 		"AMQ_KEEPALIVE_ROOT", "AMQ_KEEPALIVE_BASE_ROOT", "AMQ_KEEPALIVE_SESSION", "AMQ_KEEPALIVE_ME",
 		"AMQ_KEEPALIVE_BIN", "AMQ_KEEPALIVE_AMQ", "AMQ_KEEPALIVE_ADAPTER", "AMQ_KEEPALIVE_TARGET",
 		"AMQ_KEEPALIVE_CMUX", "AMQ_KEEPALIVE_LOG", "AMQ_KEEPALIVE_TIMEOUT_SECONDS",
@@ -612,6 +622,7 @@ func sessionStartTestEnv(t *testing.T, dir, presenceSource string) []string {
 		"AM_SESSION=collab",
 		"AM_ME=codex",
 		"AMQ_WAKE_BASELINE_FILE="+baseline,
+		`AMQ_WAKE_OWNER={"pid":4242,"process_start":"owner-start","boot_id":"boot-1"}`,
 		"AMQ_KEEPALIVE_AMQ="+amqPath,
 	)
 }
