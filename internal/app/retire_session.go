@@ -332,6 +332,29 @@ func buildRetireSessionPlan(ctx context.Context, file registry.File, opts retire
 			pending: entry.ManualRetirementIntent, receipt: entry.ManualRetirementReceipt,
 		})
 	}
+	memberIDs := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		memberIDs[member.EntryID] = struct{}{}
+	}
+	for _, entry := range file.Entries {
+		// Retired history from an older plan is not a current listener. An exact
+		// receipt from the plan being replayed remains part of that plan and must
+		// still be named, just like every unresolved row.
+		if entry.State == registry.StateRetired &&
+			(!opts.Apply || opts.ConfirmPlan == "" || entry.ManualRetirementReceipt.PlanID != opts.ConfirmPlan) {
+			continue
+		}
+		entryRoot, pathErr := canonicalRetireSessionRoot(entry.Root)
+		if pathErr != nil {
+			return retireSessionPlan{}, fmt.Errorf("canonicalize registry root for entry %s: %w", entry.ID, pathErr)
+		}
+		if entryRoot != root {
+			continue
+		}
+		if _, included := memberIDs[entry.ID]; !included {
+			return retireSessionPlan{}, fmt.Errorf("retire-session requires exact whole-root membership: registry entry %s for agent %s and adapter %s at %s was omitted", entry.ID, entry.Agent, entry.Adapter, root)
+		}
+	}
 	plan := retireSessionPlan{
 		Schema: retireSessionPlanSchema, RegistryPath: registryPath, Root: root, Adapter: adapterName,
 		Agents: append([]string(nil), agents...), AMQExecutable: amqIdentity.Path,

@@ -1267,7 +1267,7 @@ func TestRetireSessionPreviewPreservesAllEntriesAndInvokesNoAMQ(t *testing.T) {
 	entries := []registry.Entry{
 		{Root: root, BaseRoot: dir, SessionName: "dashboard", Agent: "codex", Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3", State: registry.StateDetached},
 		{Root: root, BaseRoot: dir, SessionName: "dashboard", Agent: "claude", Adapter: "cmux", Target: "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2", State: registry.StateDetached},
-		{Root: root, BaseRoot: dir, SessionName: "dashboard", Agent: "observer", Adapter: "file", Target: filepath.Join(dir, "observer.txt"), State: registry.StateActive},
+		{Root: filepath.Join(dir, "observer-root"), BaseRoot: dir, SessionName: "observer", Agent: "observer", Adapter: "file", Target: filepath.Join(dir, "observer.txt"), State: registry.StateActive},
 	}
 	for _, entry := range entries {
 		if _, err := store.Upsert(entry); err != nil {
