@@ -78,8 +78,29 @@ func TestReconcilePreservesExactBaselineBinding(t *testing.T) {
 		t.Fatalf("result=%+v starts=%#v", result, wake.starts)
 	}
 	request := wake.starts[0]
-	if request.BaselineFile != entry.BaselineFile || request.BaselineDigest != entry.BaselineDigest {
-		t.Fatalf("baseline binding changed before wake start: %#v", request)
+	if request.BaselineFile != entry.BaselineFile ||
+		request.BaselineDigest != entry.BaselineDigest ||
+		request.WakeOwner != entry.WakeOwner {
+		t.Fatalf("owner/baseline binding changed before wake start: %#v", request)
+	}
+}
+
+func TestReconcileRefusesOwnerlessLegacyEntryWithoutTouchingAMQ(t *testing.T) {
+	now := fixedNow()
+	wake := &fakeWake{}
+	entry := testEntry()
+	entry.WakeOwner = ""
+
+	updated, result := testReconciler(wake, probeAdapter{}, now).Reconcile(context.Background(), entry)
+
+	if len(wake.starts) != 0 || result.AMQTouched {
+		t.Fatalf("ownerless legacy entry touched AMQ: starts=%#v result=%+v", wake.starts, result)
+	}
+	if result.Error == nil || !strings.Contains(result.Error.Error(), "managed wake owner unavailable") {
+		t.Fatalf("legacy result = %+v, want visible owner refusal", result)
+	}
+	if updated.State != registry.StateAttached || updated.FailureCount != 1 {
+		t.Fatalf("legacy updated entry = %+v, want retryable backoff", updated)
 	}
 }
 
@@ -315,12 +336,13 @@ func testReconciler(wake *fakeWake, adapter probeAdapter, now time.Time) Reconci
 
 func testEntry() registry.Entry {
 	return registry.Entry{
-		ID:      "entry-1",
-		Root:    "/tmp/amq-root",
-		Agent:   "codex",
-		Adapter: "file",
-		Target:  "/tmp/inbox.txt",
-		State:   registry.StateAttached,
+		ID:        "entry-1",
+		Root:      "/tmp/amq-root",
+		Agent:     "codex",
+		Adapter:   "file",
+		Target:    "/tmp/inbox.txt",
+		WakeOwner: `{"pid":4242,"process_start":"owner-start","boot_id":"boot-1"}`,
+		State:     registry.StateAttached,
 	}
 }
 

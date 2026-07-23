@@ -54,6 +54,7 @@ type StartWakeRequest struct {
 	InjectVia      string
 	Adapter        string
 	Target         string
+	WakeOwner      string
 	BaselineFile   string
 	BaselineDigest string
 	Timeout        time.Duration
@@ -117,6 +118,10 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	if req.Target == "" {
 		return errors.New("target is required")
 	}
+	wakeEnv, err := environmentWithWakeOwner(os.Environ(), req.WakeOwner)
+	if err != nil {
+		return fmt.Errorf("managed wake owner: %w", err)
+	}
 	baselineFile := strings.TrimSpace(req.BaselineFile)
 	if (baselineFile == "") != (strings.TrimSpace(req.BaselineDigest) == "") {
 		return errors.New("baseline file and digest must be set together")
@@ -163,6 +168,9 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	// supervisor receives SIGTERM. After spawning, cancellation never signals
 	// the child; a durable registry reservation lets a later pass converge.
 	cmd := exec.Command(c.Path, args...)
+	// Never inherit an ambient owner token. Only the exact owner persisted at
+	// attach time may authorize this managed wake or a later supervisor replay.
+	cmd.Env = wakeEnv
 	configureWakeProcess(cmd)
 	if err := ctx.Err(); err != nil {
 		_ = os.Remove(readyFile)

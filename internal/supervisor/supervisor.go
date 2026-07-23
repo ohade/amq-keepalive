@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -110,6 +111,16 @@ func (r Reconciler) checkLocalReadiness(ctx context.Context, entry registry.Entr
 		updated, result := r.markBackoff(entry, now, errors.New("amq runner is not configured"), ActionBackoff, false)
 		return updated, result, true
 	}
+	if err := amq.ValidateWakeOwner(entry.WakeOwner); err != nil {
+		updated, result := r.markBackoff(
+			entry,
+			now,
+			fmt.Errorf("managed wake owner unavailable; reattach from an owner-bound session: %w", err),
+			ActionBackoff,
+			false,
+		)
+		return updated, result, true
+	}
 	return entry, Result{}, false
 }
 
@@ -120,6 +131,7 @@ func (r Reconciler) ensureWake(ctx context.Context, entry registry.Entry, now ti
 		InjectVia:      r.InjectVia,
 		Adapter:        entry.Adapter,
 		Target:         entry.Target,
+		WakeOwner:      entry.WakeOwner,
 		BaselineFile:   entry.BaselineFile,
 		BaselineDigest: entry.BaselineDigest,
 		Timeout:        r.WakeTimeout,

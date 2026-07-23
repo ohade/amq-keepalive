@@ -7,8 +7,8 @@ M0 is intentionally small:
 
 - one static Go binary;
 - a private registry under `~/.amq-keepalive/`;
-- explicit `attach`, `reattach`, `supervise`, `inject`, `doctor`,
-  `gc`, `retire-session`, and `forget` commands;
+- explicit `attach`, `reattach`, `supervise`, `inject`, `doctor`, and
+  `forget` commands;
 - a fake `file` adapter for deterministic tests;
 - supervisor logic that only talks to AMQ through the public `amq` CLI.
 
@@ -66,23 +66,19 @@ CLI directory.
 ```sh
 go build ./cmd/amq-keepalive
 
-./amq-keepalive attach \
-  --adapter file \
-  --target /tmp/amq-keepalive-inbox.txt \
-  --no-start
-
 ./amq-keepalive supervise --once
 
 ./amq-keepalive doctor
 ```
 
-Ghostty attach:
+Owner-bound Ghostty attach, from a process launched by
+`amq coop exec --defer-wake`:
 
 ```sh
 ./amq-keepalive attach --adapter ghostty
 ```
 
-Session-start reattach:
+Session-start reattach, normally invoked by the installed hook:
 
 ```sh
 ./amq-keepalive reattach --adapter cmux
@@ -94,7 +90,10 @@ persists an inactive `attached` reservation before touching AMQ. That reservatio
 replaces prior entries for the same AMQ root and agent across all adapters and
 makes a crash or late readiness recoverable by the next supervisor pass. Startup
 then uses AMQ's internal
-`--accept-existing-wake` readiness contract: a live wake is accepted only when
+`--accept-existing-wake` readiness contract. Each registration persists the
+exact `AMQ_WAKE_OWNER` process identity produced by
+`amq coop exec --defer-wake`; supervisor restarts strip ambient owner metadata
+and replay only that registered identity. A live wake is accepted only when
 its `--inject-via` executable, ordered fixed arguments, owner, persisted floor,
 and generation-bound catch-up acknowledgement match. A differing target fails
 closed. A definite pre-readiness exit restores the prior rows; a
@@ -113,44 +112,8 @@ file to AMQ. If a live same-transport/same-owner wake has an older exact floor,
 AMQ performs its generation- and identity-safe baseline rotation; different
 injectors, arguments, owners, or unverified wakes are never signaled. Wake keeps
 floor messages unread, emits no receipts, and notifies arrivals after the floor.
-
-For a launcher recreating a terminal, add `--retire-detached`. This opt-in path
-looks up the prior registration for the same AMQ root and agent. If its adapter
-target is independently proven gone, it first asks AMQ's target-aware wake start
-to converge on the new exact target. An already-absent lock starts directly. If
-a live old wake blocks the exact-target start, this release stops: destructive
-retirement remains disabled in keepalive even though AMQ now has a low-level,
-identity-safe `wake retire` command. No `amq wake retire` subprocess is invoked,
-no active wake is retargeted to another terminal, and the prior registry rows
-are restored after the definite start failure.
-
-Safe detached-session retirement:
-
-```sh
-./amq-keepalive retire-session \
-  --root "$HOME/.agent-mail/dashboard" \
-  --adapter cmux \
-  --agents codex,claude
-```
-
-`retire-session` currently performs only its fail-closed preflight. It requires
-exactly one registry entry per requested agent and independently proves every
-registered cmux surface is missing, then returns the keepalive policy gate without
-signaling AMQ or changing the registry. It preserves the wakes and rows so callers
-can review low-level retirement separately or fall back to a new room.
-
-Detached registry cleanup is preview-first:
-
-```sh
-./amq-keepalive gc
-```
-
-`gc` defaults to a read-only JSON dry run and requires 24 hours of continuously
-proven detachment. Target collisions, live cmux TTY aliases, transient probe
-failures, and recent or legacy entries without a `detached_since` timestamp are
-excluded. `gc --apply` is deliberately hard-gated by the same keepalive policy
-boundary and invokes neither AMQ nor registry mutation. Use the JSON candidates
-for review only; do not treat them as proof that a wake process is safe to signal.
+Both `attach` and `reattach`, including `--no-start`, refuse to create a new
+registry row when that exact owner identity is absent or malformed.
 
 Supported hook install:
 
@@ -260,9 +223,8 @@ context-cancelable, and default signal handling is restored after the first sign
 
 - The tool does not parse AMQ mailbox, lock, presence, or target files.
 - The tool does not launch or resurrect terminal sessions.
-- Keepalive still disables destructive wake retirement by policy. AMQ exposes
-  an identity-safe low-level retire capability, but production keepalive code
-  contains no `wake retire` execution path in this release.
+- Keepalive has no session garbage collector or wake-retirement path. It never
+  deletes AMQ roots, mailboxes, messages, sibling handles, or wake state.
 - Adapter targets should use an explicit scheme shape:
   `<adapter>:<scheme>:<value>`. The supported terminal schemes are
   `ghostty:terminal:<id>` and `cmux:surface:<uuid>`.
@@ -275,11 +237,11 @@ context-cancelable, and default signal handling is restored after the first sign
 - `reattach` never retargets a live wake to another terminal implicitly. A
   matching live target is verified; the narrow SessionStart path may rotate only
   its baseline generation when transport and owner are exact. A differing live
-  target fails closed without signaling it. With explicit `--retire-detached`, a
-  saved target proven gone may attempt exact-target convergence; a blocking old
-  wake hits the keepalive policy gate with no retirement or retry. Stale/dead wake
-  locks otherwise restart from the persisted exact baseline, so downtime arrivals
-  stay eligible; keepalive does not invoke `amq wake repair` first.
+  target fails closed without signaling it. Stale/dead wake locks otherwise
+  restart from the persisted exact baseline and exact registered owner, so
+  downtime arrivals stay eligible; keepalive does not invoke
+  `amq wake repair` first. Legacy registry rows without an exact owner remain
+  readable but fail closed until an owner-bound SessionStart reattaches them.
 - A normalized `(adapter, target)` can have only one registry owner. Legacy
   collisions fail closed for every claimant; the supervisor never picks a winner.
   For cmux, the stronger rule is exactly one live surface UUID per canonical TTY.
