@@ -101,12 +101,61 @@ func TestInstallIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestInstallUpdatesManagedTimeoutWithoutDiscardingWrappedCommand(t *testing.T) {
+	dir := t.TempDir()
+	binaryPath := writeExecutable(t, filepath.Join(dir, "amq-keepalive"))
+	scriptPath := filepath.Join(dir, "hooks", "amq-keepalive-session-start.sh")
+	codexConfig := filepath.Join(dir, "hooks.json")
+	wrappedCommand := "HOME='/Users/test' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' " +
+		"AMQ_KEEPALIVE_BIN=" + shellQuote(binaryPath) + " '/bin/bash' " + shellQuote(scriptPath)
+	doc := map[string]interface{}{
+		"hooks": map[string]interface{}{
+			"SessionStart": []interface{}{
+				map[string]interface{}{
+					"hooks": []interface{}{
+						map[string]interface{}{
+							"type":    "command",
+							"command": wrappedCommand,
+							"timeout": 15,
+						},
+					},
+				},
+			},
+		},
+	}
+	mustWrite(t, codexConfig, []byte(mustMarshal(t, doc)+"\n"))
+
+	result, err := Install(Options{
+		Agent:       AgentCodex,
+		ScriptPath:  scriptPath,
+		BinaryPath:  binaryPath,
+		CodexConfig: codexConfig,
+		Timeout:     30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	if !result.Configs[AgentCodex].Changed {
+		t.Fatal("wrapped existing Codex hook changed = false, want timeout update")
+	}
+	installed := mustMarshal(t, readJSON(t, codexConfig))
+	if !strings.Contains(installed, "HOME='/Users/test'") {
+		t.Fatalf("wrapped command prefix was discarded:\n%s", installed)
+	}
+	if !strings.Contains(installed, "AMQ_KEEPALIVE_TIMEOUT_SECONDS='30'") {
+		t.Fatalf("managed timeout was not updated:\n%s", installed)
+	}
+	if !strings.Contains(installed, `"timeout": 35`) {
+		t.Fatalf("host hook timeout was not updated:\n%s", installed)
+	}
+}
+
 func TestInstallRecognizesWrappedExistingCodexScript(t *testing.T) {
 	dir := t.TempDir()
 	binaryPath := writeExecutable(t, filepath.Join(dir, "amq-keepalive"))
 	scriptPath := filepath.Join(dir, "hooks", "amq-keepalive-session-start.sh")
 	codexConfig := filepath.Join(dir, "hooks.json")
-	wrappedCommand := "HOME='/Users/test' AMQ_KEEPALIVE_AMQ='/opt/homebrew/bin/amq' " +
+	wrappedCommand := "HOME='/Users/test' AMQ_KEEPALIVE_AMQ='/opt/homebrew/bin/amq' AMQ_KEEPALIVE_TIMEOUT_SECONDS='10' " +
 		"AMQ_KEEPALIVE_BIN=" + shellQuote(binaryPath) + " '/bin/bash' " + shellQuote(scriptPath)
 	doc := map[string]interface{}{
 		"hooks": map[string]interface{}{
