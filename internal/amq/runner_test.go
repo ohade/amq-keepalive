@@ -401,6 +401,47 @@ exit 23
 	}
 }
 
+func TestStartWakeUsesRegularFileForLongLivedStderr(t *testing.T) {
+	dir := t.TempDir()
+	trigger := filepath.Join(dir, "trigger")
+	survived := filepath.Join(dir, "survived")
+	release := filepath.Join(dir, "release")
+	t.Setenv("AMQ_KEEPALIVE_TRIGGER", trigger)
+	t.Setenv("AMQ_KEEPALIVE_SURVIVED", survived)
+	t.Setenv("AMQ_KEEPALIVE_RELEASE", release)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+[ -f /dev/fd/2 ] || {
+  printf 'stderr is not a regular file\n' >&2
+  exit 41
+}
+ready=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-ready-file" ]; then ready="$arg"; fi
+  previous="$arg"
+done
+[ -n "$ready" ] || exit 11
+printf ready > "$ready"
+while [ ! -f "$AMQ_KEEPALIVE_TRIGGER" ]; do sleep 0.01; done
+printf 'post-launch diagnostic\n' >&2
+: > "$AMQ_KEEPALIVE_SURVIVED"
+while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.01; done
+`)
+
+	if err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
+		Adapter: "cmux", Target: "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3",
+		WakeOwner: testWakeOwner, Timeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("StartWake() error = %v", err)
+	}
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatalf("trigger post-launch stderr: %v", err)
+	}
+	waitForFile(t, survived, 2*time.Second)
+}
+
 func TestWaitForWakeReadyPrefersExitedChildOverCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -429,16 +470,24 @@ func TestWaitForWakeReadyPrefersExitedChildOverTimeout(t *testing.T) {
 	}
 }
 
-func TestBoundedCaptureReportsTruncationAndKeepsDraining(t *testing.T) {
-	capture := newBoundedCapture(8)
-	data := []byte("0123456789abcdef")
-	written, err := capture.Write(data)
-	if err != nil || written != len(data) {
-		t.Fatalf("Write() = (%d, %v), want (%d, nil)", written, err, len(data))
+func TestWakeStartupStderrReportsTruncationAndRemovesFile(t *testing.T) {
+	capture, err := newWakeStartupStderr(t.TempDir())
+	if err != nil {
+		t.Fatalf("newWakeStartupStderr() error = %v", err)
+	}
+	path := capture.file.Name()
+	data := strings.Repeat("x", maxWakeStartupStderrBytes+8)
+	if _, err := capture.file.WriteString(data); err != nil {
+		t.Fatalf("write startup stderr: %v", err)
 	}
 	got := capture.String()
-	if !strings.HasPrefix(got, "01234567") || !strings.Contains(got, "stderr truncated after 8 bytes") {
+	if len(got) < maxWakeStartupStderrBytes ||
+		!strings.Contains(got, "stderr truncated after 16384 bytes") {
 		t.Fatalf("String() = %q, want bounded prefix and truncation marker", got)
+	}
+	capture.Close()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("wake startup stderr file still exists after Close: %v", err)
 	}
 }
 

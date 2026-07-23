@@ -572,10 +572,11 @@ func validateEntryWakeOwner(entry Entry) error {
 }
 
 func validateWakeOwnerTransition(before, after Entry) error {
-	if err := validateEntryWakeOwner(after); err == nil {
-		return nil
-	} else if before.WakeOwner != after.WakeOwner {
-		return err
+	if before.WakeOwner != after.WakeOwner {
+		if err := validateEntryWakeOwner(after); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: entry %q already has a different owner", ErrWakeOwnerChangeRequiresReattach, before.ID)
 	}
 	return nil
 }

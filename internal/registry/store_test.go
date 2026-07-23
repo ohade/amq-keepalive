@@ -187,6 +187,29 @@ func TestStoreUpsertSameOwnerIsIdempotentAndReplaceMayChangeOwner(t *testing.T) 
 	}
 }
 
+func TestStoreUpdatePathsRejectValidOwnerChange(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	original, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", WakeOwner: testRegistryWakeOwner,
+	})
+	if err != nil {
+		t.Fatalf("Upsert(original): %v", err)
+	}
+	changed := original
+	changed.WakeOwner = `{"pid":5252,"process_start":"other-start","boot_id":"boot-2"}`
+
+	if err := store.UpdateEntry(changed); !errors.Is(err, ErrWakeOwnerChangeRequiresReattach) {
+		t.Fatalf("UpdateEntry(different valid owner) error = %v, want reattach requirement", err)
+	}
+	if _, err := store.UpdateEntries([]EntryUpdate{{Before: original, After: changed}}); !errors.Is(err, ErrWakeOwnerChangeRequiresReattach) {
+		t.Fatalf("UpdateEntries(different valid owner) error = %v, want reattach requirement", err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != original {
+		t.Fatalf("owner-changing updates mutated registry: entries=%#v err=%v", loaded.Entries, err)
+	}
+}
+
 func TestStoreAllowsMetadataUpdatesWithExactUnchangedLegacyOwner(t *testing.T) {
 	store := New(filepath.Join(t.TempDir(), "registry.json"))
 	legacy := Entry{

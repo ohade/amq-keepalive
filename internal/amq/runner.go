@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -144,10 +143,16 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	}
 
 	args := []string{"wake"}
-	_, readyFile, err := newWakeReadyPath()
+	readyDir, readyFile, err := newWakeReadyPath()
 	if err != nil {
 		return err
 	}
+	startupStderr, err := newWakeStartupStderr(readyDir)
+	if err != nil {
+		_ = os.Remove(readyFile)
+		return err
+	}
+	defer startupStderr.Close()
 
 	if req.Root != "" {
 		args = append(args, "-root", req.Root)
@@ -179,11 +184,11 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	// attach time may authorize this managed wake or a later supervisor replay.
 	cmd.Env = wakeEnv
 	configureWakeProcess(cmd)
-	// Capture startup diagnostics without inheriting the caller's PTY. The
-	// writer keeps draining after the cap so a noisy child cannot block or grow
-	// this process's memory without bound.
-	startupStderr := newBoundedCapture(maxWakeStartupStderrBytes)
-	cmd.Stderr = startupStderr
+	// Capture startup diagnostics without inheriting the caller's PTY. A
+	// regular file is required here: the wake outlives this launcher, so an
+	// os/exec pipe would lose its reader when the launcher exits and a later
+	// diagnostic write could terminate the wake with SIGPIPE.
+	cmd.Stderr = startupStderr.file
 	if err := ctx.Err(); err != nil {
 		_ = os.Remove(readyFile)
 		return err
@@ -338,43 +343,54 @@ type wakeProcessResult struct {
 	Stderr string
 }
 
-type boundedCapture struct {
-	mu        sync.Mutex
-	limit     int
-	data      []byte
-	truncated bool
+type wakeStartupStderr struct {
+	file *os.File
 }
 
-func newBoundedCapture(limit int) *boundedCapture {
-	return &boundedCapture{limit: limit}
+func newWakeStartupStderr(dir string) (*wakeStartupStderr, error) {
+	file, err := os.CreateTemp(dir, "wake-stderr-*")
+	if err != nil {
+		return nil, fmt.Errorf("create wake startup stderr file: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+		return nil, fmt.Errorf("secure wake startup stderr file: %w", err)
+	}
+	return &wakeStartupStderr{file: file}, nil
 }
 
-func (capture *boundedCapture) Write(data []byte) (int, error) {
-	capture.mu.Lock()
-	defer capture.mu.Unlock()
-
-	remaining := capture.limit - len(capture.data)
-	if remaining > len(data) {
-		remaining = len(data)
+func (capture *wakeStartupStderr) Close() {
+	if capture == nil || capture.file == nil {
+		return
 	}
-	if remaining > 0 {
-		capture.data = append(capture.data, data[:remaining]...)
-	}
-	if remaining < len(data) {
-		capture.truncated = true
-	}
-	return len(data), nil
+	path := capture.file.Name()
+	_ = capture.file.Close()
+	// On Unix the wake's inherited descriptor remains valid after unlink and
+	// the inode is reclaimed when the wake exits. On platforms which reject
+	// unlinking an open inherited file, the readiness scavenger removes it
+	// after the child releases the descriptor.
+	_ = os.Remove(path)
 }
 
-func (capture *boundedCapture) String() string {
-	capture.mu.Lock()
-	defer capture.mu.Unlock()
-
-	text := strings.TrimSpace(string(capture.data))
-	if !capture.truncated {
+func (capture *wakeStartupStderr) String() string {
+	if capture == nil || capture.file == nil {
+		return ""
+	}
+	data := make([]byte, maxWakeStartupStderrBytes+1)
+	n, err := capture.file.ReadAt(data, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ""
+	}
+	truncated := n > maxWakeStartupStderrBytes
+	if truncated {
+		n = maxWakeStartupStderrBytes
+	}
+	text := strings.TrimSpace(string(data[:n]))
+	if !truncated {
 		return text
 	}
-	marker := fmt.Sprintf("[stderr truncated after %d bytes]", capture.limit)
+	marker := fmt.Sprintf("[stderr truncated after %d bytes]", maxWakeStartupStderrBytes)
 	if text == "" {
 		return marker
 	}
