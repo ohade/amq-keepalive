@@ -105,7 +105,7 @@ func TestRetireSessionMissingLockContractPersistsAndReplaysExactBinding(t *testi
 	writes := 0
 	persistRetireSessionEntry = func(store *registry.Store, before, after registry.Entry) (registry.UpdateResult, error) {
 		writes++
-		if writes == 2 {
+		if writes == 1 {
 			return registry.UpdateResult{}, errors.New("injected completion persistence failure")
 		}
 		return originalPersist(store, before, after)
@@ -787,10 +787,15 @@ func TestRetireSessionPartialPersistenceReplayAndCASRace(t *testing.T) {
 
 func TestRetireSessionCrashReplayFailpoints(t *testing.T) {
 	originalPersist := persistRetireSessionEntry
-	t.Cleanup(func() { persistRetireSessionEntry = originalPersist })
-
-	t.Run("all bindings must persist before first signal", func(t *testing.T) {
+	originalEnrollment := persistRetireSessionIntents
+	t.Cleanup(func() {
 		persistRetireSessionEntry = originalPersist
+		persistRetireSessionIntents = originalEnrollment
+	})
+
+	t.Run("sibling CAS race enrolls no prefix and leaves root reusable", func(t *testing.T) {
+		persistRetireSessionEntry = originalPersist
+		persistRetireSessionIntents = originalEnrollment
 		dir := t.TempDir()
 		_, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")
 		lifecycle := &retireSessionTestLifecycle{}
@@ -800,19 +805,77 @@ func TestRetireSessionCrashReplayFailpoints(t *testing.T) {
 		}
 		opts.Apply = true
 		opts.ConfirmPlan = preview.(*retireSessionPlan).PlanID
-		calls := 0
-		persistRetireSessionEntry = func(store *registry.Store, before, after registry.Entry) (registry.UpdateResult, error) {
-			calls++
-			if calls == 2 {
-				return registry.UpdateResult{}, errors.New("injected second-intent persistence failure")
+		persistRetireSessionIntents = func(store *registry.Store, root string, updates []registry.EntryUpdate) (registry.UpdateResult, error) {
+			file, err := store.Load()
+			if err != nil {
+				return registry.UpdateResult{}, err
 			}
-			return originalPersist(store, before, after)
+			var before registry.Entry
+			for _, entry := range file.Entries {
+				if entry.Agent == "beta" {
+					before = entry
+					break
+				}
+			}
+			after := before
+			after.LastError = "concurrent sibling update"
+			if result, err := store.UpdateEntries([]registry.EntryUpdate{{Before: before, After: after}}); err != nil || result.Updated != 1 {
+				return result, errors.Join(errors.New("inject sibling CAS race"), err)
+			}
+			return originalEnrollment(store, root, updates)
 		}
 		if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{}); err == nil || !strings.Contains(err.Error(), "no wake retirement signals") {
-			t.Fatalf("intent failure error=%v", err)
+			t.Fatalf("sibling CAS race error=%v", err)
 		}
 		if lifecycle.signalCount != 0 || lifecycle.retirementCall != 0 {
-			t.Fatalf("intent failure signals=%d mutations=%d", lifecycle.signalCount, lifecycle.retirementCall)
+			t.Fatalf("sibling CAS race signals=%d mutations=%d", lifecycle.signalCount, lifecycle.retirementCall)
+		}
+		loaded, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range loaded.Entries {
+			if entry.ManualRetirementIntent.Active() {
+				t.Fatalf("sibling CAS race left a durable prefix: %#v", loaded.Entries)
+			}
+		}
+		persistRetireSessionIntents = originalEnrollment
+		repreviewOpts := opts
+		repreviewOpts.Apply = false
+		repreviewOpts.ConfirmPlan = ""
+		repreview, err := (App{}).retireSessionWithOptions(context.Background(), repreviewOpts, lifecycle, retireSessionTestAdapter{})
+		if err != nil {
+			t.Fatalf("root remained wedged after failed atomic enrollment: %v", err)
+		}
+		repreviewOpts.Apply = true
+		repreviewOpts.ConfirmPlan = repreview.(*retireSessionPlan).PlanID
+		retried, err := (App{}).retireSessionWithOptions(context.Background(), repreviewOpts, lifecycle, retireSessionTestAdapter{})
+		if err != nil || !retried.(*retireSessionApplyResult).Applied || len(retried.(*retireSessionApplyResult).Retired) != 2 {
+			t.Fatalf("root did not converge after fresh exact preview: result=%#v err=%v", retried, err)
+		}
+	})
+
+	t.Run("multi-member crash after atomic enrollment replays exact bindings", func(t *testing.T) {
+		persistRetireSessionEntry = originalPersist
+		persistRetireSessionIntents = originalEnrollment
+		dir := t.TempDir()
+		_, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")
+		lifecycle := &retireSessionTestLifecycle{}
+		preview, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.Apply = true
+		opts.ConfirmPlan = preview.(*retireSessionPlan).PlanID
+		persistRetireSessionIntents = func(store *registry.Store, root string, updates []registry.EntryUpdate) (registry.UpdateResult, error) {
+			result, err := originalEnrollment(store, root, updates)
+			if err != nil {
+				return result, err
+			}
+			return result, errors.New("injected crash after atomic enrollment")
+		}
+		if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{}); err == nil || !strings.Contains(err.Error(), "no wake retirement signals") {
+			t.Fatalf("post-enrollment crash error=%v", err)
 		}
 		loaded, err := store.Load()
 		if err != nil {
@@ -820,17 +883,27 @@ func TestRetireSessionCrashReplayFailpoints(t *testing.T) {
 		}
 		pending := 0
 		for _, entry := range loaded.Entries {
-			if entry.ManualRetirementIntent.Active() {
+			if entry.ManualRetirementIntent.Active() && entry.ManualRetirementIntent.PlanID == opts.ConfirmPlan {
 				pending++
 			}
 		}
-		if pending != 1 {
-			t.Fatalf("persisted intents=%d entries=%#v, want one durable prefix and zero signals", pending, loaded.Entries)
+		if pending != 2 || lifecycle.retirementCall != 0 || lifecycle.signalCount != 0 {
+			t.Fatalf("atomic crash entries=%#v mutations=%d signals=%d", loaded.Entries, lifecycle.retirementCall, lifecycle.signalCount)
+		}
+		persistRetireSessionIntents = originalEnrollment
+		requestCount := len(lifecycle.requests)
+		replayed, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{})
+		if err != nil || !replayed.(*retireSessionApplyResult).Applied || len(replayed.(*retireSessionApplyResult).Retired) != 2 {
+			t.Fatalf("atomic enrollment replay result=%#v err=%v", replayed, err)
+		}
+		if len(lifecycle.requests) != requestCount+2 || lifecycle.requests[requestCount].Check || lifecycle.requests[requestCount+1].Check {
+			t.Fatalf("atomic enrollment replay repeated an unbound preflight: %#v", lifecycle.requests[requestCount:])
 		}
 	})
 
 	t.Run("crash after intent before AMQ resumes exact binding", func(t *testing.T) {
 		persistRetireSessionEntry = originalPersist
+		persistRetireSessionIntents = originalEnrollment
 		dir := t.TempDir()
 		_, store, opts := setupLegacyRetireSession(t, dir, "alpha")
 		lifecycle := &retireSessionTestLifecycle{retireErrors: map[string]error{"alpha": errors.New("injected pre-signal crash")}}
@@ -871,6 +944,7 @@ func TestRetireSessionCrashReplayFailpoints(t *testing.T) {
 	} {
 		t.Run(failure.name, func(t *testing.T) {
 			persistRetireSessionEntry = originalPersist
+			persistRetireSessionIntents = originalEnrollment
 			dir := t.TempDir()
 			_, store, opts := setupLegacyRetireSession(t, dir, "alpha")
 			lifecycle := &retireSessionTestLifecycle{}
@@ -883,7 +957,7 @@ func TestRetireSessionCrashReplayFailpoints(t *testing.T) {
 			calls := 0
 			persistRetireSessionEntry = func(store *registry.Store, before, after registry.Entry) (registry.UpdateResult, error) {
 				calls++
-				if calls == 2 {
+				if calls == 1 {
 					return failure.fail()
 				}
 				return originalPersist(store, before, after)

@@ -82,6 +82,10 @@ var persistRetireSessionEntry = func(store *registry.Store, before, after regist
 	return store.UpdateEntries([]registry.EntryUpdate{{Before: before, After: after}})
 }
 
+var persistRetireSessionIntents = func(store *registry.Store, root string, updates []registry.EntryUpdate) (registry.UpdateResult, error) {
+	return store.EnrollManualRetirementIntents(root, updates)
+}
+
 func (a App) retireSessionWithOptions(ctx context.Context, opts retireSessionOptions, lifecycle retireSessionRetirer, selected adapter.Adapter) (any, error) {
 	if strings.TrimSpace(opts.RegistryPath) == "" {
 		return nil, errors.New("--registry is required")
@@ -160,27 +164,43 @@ func (a App) retireSessionWithOptions(ctx context.Context, opts retireSessionOpt
 			return fmt.Errorf("manual retirement preflight refused; no wake retirement signals were sent: %w", errors.Join(preflightErrors...))
 		}
 
-		// Every exact binding is durable before the first mutation. A crash in
-		// the mutation phase can therefore replay only bound requests and ask AMQ
-		// for an idempotent tombstone receipt; it never falls back to an unbound
-		// second signal.
+		// Enroll every unresolved member in one exact compare-and-save batch.
+		// The persistence layer verifies that this is the complete unresolved
+		// root membership before changing any row, so a sibling race or crash
+		// cannot leave a durable prefix which freezes the rest of the root.
+		enrollment := make([]registry.EntryUpdate, 0, len(current.Members))
+		enrolledEntries := make(map[string]registry.Entry, len(current.Members))
+		enrollmentTime := a.now()
+		newIntents := 0
 		for index := range current.Members {
 			member := &current.Members[index]
-			if member.receipt.Active() || member.pending.Active() {
+			if member.receipt.Active() {
 				continue
 			}
-			checked := preflight[member.Agent]
 			pendingEntry := member.entry
-			pendingEntry.ManualRetirementIntent = manualRetirementIntent(current, *member, checked, a.now())
-			cas, persistErr := persistRetireSessionEntry(store, member.entry, pendingEntry)
+			if !member.pending.Active() {
+				pendingEntry.ManualRetirementIntent = manualRetirementIntent(current, *member, preflight[member.Agent], enrollmentTime)
+				newIntents++
+			}
+			enrollment = append(enrollment, registry.EntryUpdate{Before: member.entry, After: pendingEntry})
+			enrolledEntries[member.EntryID] = pendingEntry
+		}
+		if len(enrollment) != 0 {
+			cas, persistErr := persistRetireSessionIntents(store, current.Root, enrollment)
 			if persistErr != nil {
-				return fmt.Errorf("manual retirement intent for agent %s was not persisted; no wake retirement signals were sent in this run: %w", member.Agent, persistErr)
+				return fmt.Errorf("whole-root manual retirement enrollment was not persisted; no wake retirement signals were sent in this run: %w", persistErr)
 			}
-			if cas.Updated != 1 || cas.Skipped != 0 {
-				return fmt.Errorf("registry row for agent %s changed before durable manual retirement intent; no wake retirement signals were sent in this run", member.Agent)
+			if cas.Updated != newIntents || cas.Skipped != 0 {
+				return errors.New("whole-root manual retirement enrollment changed unexpectedly; no wake retirement signals were sent in this run")
 			}
-			member.entry = pendingEntry
-			member.pending = pendingEntry.ManualRetirementIntent
+			for index := range current.Members {
+				member := &current.Members[index]
+				if member.receipt.Active() {
+					continue
+				}
+				member.entry = enrolledEntries[member.EntryID]
+				member.pending = member.entry.ManualRetirementIntent
+			}
 		}
 
 		// The adapter target is external to AMQ's metadata transaction. Narrow

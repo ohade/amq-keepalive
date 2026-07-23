@@ -715,18 +715,21 @@ func TestAMQProducerGoldenFixtures(t *testing.T) {
 		t.Fatalf("wake start failure fixture lost blocker proof: %v", err)
 	}
 
-	for _, fixture := range []string{
-		"wake-retire-manual-binding-mismatch-v1.json",
-		"wake-retire-manual-retirement-proof-mismatch-v1.json",
+	for _, fixture := range []struct {
+		name   string
+		reason string
+	}{
+		{"wake-retire-manual-binding-mismatch-v1.json", "manual_binding_mismatch"},
+		{"wake-retire-manual-retirement-proof-mismatch-v1.json", "manual_retirement_proof_mismatch"},
+		{"wake-retire-manual-inject-via-proof-mismatch-v1.json", "manual_inject_via_proof_mismatch"},
 	} {
-		data, err := os.ReadFile(filepath.Join("testdata", fixture))
+		data, err := os.ReadFile(filepath.Join("testdata", fixture.name))
 		if err != nil {
 			t.Fatal(err)
 		}
 		result, err := parseManualRetireResult(data)
-		if err != nil || result.Status != "refused" ||
-			(result.ReasonCode != "manual_binding_mismatch" && result.ReasonCode != "manual_retirement_proof_mismatch") {
-			t.Fatalf("manual refusal producer fixture %s result=%#v err=%v", fixture, result, err)
+		if err != nil || result.Status != "refused" || result.ReasonCode != fixture.reason {
+			t.Fatalf("manual refusal producer fixture %s result=%#v err=%v", fixture.name, result, err)
 		}
 	}
 
@@ -919,6 +922,37 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read first AMQ wake binding: %v; output=%s", err, firstOutput.String())
 	}
+	injectIdentity, err := executable.Capture(injector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatchedIdentity := injectIdentity
+	mismatchedIdentity.SHA256 = strings.Repeat("0", 64)
+	mismatchedProof, err := encodeInjectViaProof(mismatchedIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectDescriptor, err := os.Open(injector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectProofMismatchCommand := exec.Command(contractBin, "--no-update-check", "wake", "retire", "--json", "--manual", "--check",
+		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
+		"--inject-arg", "inject", "--inject-arg", "file", "--inject-arg", "contract-target",
+		"--inject-via-proof", mismatchedProof, "--inject-via-proof-fd", "3",
+	)
+	injectProofMismatchCommand.ExtraFiles = []*os.File{injectDescriptor}
+	injectProofMismatchData, injectProofMismatchErr := injectProofMismatchCommand.Output()
+	if closeErr := injectDescriptor.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if injectProofMismatchErr == nil {
+		t.Fatal("real AMQ producer accepted a mismatched inject-via proof descriptor")
+	}
+	injectProofMismatch, err := parseManualRetireResult(injectProofMismatchData)
+	if err != nil || injectProofMismatch.Status != "refused" || injectProofMismatch.ReasonCode != "manual_inject_via_proof_mismatch" {
+		t.Fatalf("real AMQ inject-via proof mismatch producer result=%#v err=%v output=%s", injectProofMismatch, err, injectProofMismatchData)
+	}
 	bindingMismatchCommand := exec.Command(contractBin, "wake", "retire", "--json", "--manual", "--check",
 		"--root", canonicalRoot, "--me", "worker", "--inject-via", injector,
 		"--inject-arg", "inject", "--inject-arg", "file", "--inject-arg", "contract-target",
@@ -956,10 +990,6 @@ func TestAMQBinaryProducerContracts(t *testing.T) {
 		t.Fatalf("AMQ ownerless blocker was accepted as owner-bound retirement proof: result=%#v", startFailure)
 	}
 	amqIdentity, err := executable.Capture(contractBin)
-	if err != nil {
-		t.Fatal(err)
-	}
-	injectIdentity, err := executable.Capture(injector)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1250,24 +1280,6 @@ func TestParseRetireResultStatusContract(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseRetireResult([]byte(body)); err == nil {
 				t.Fatalf("parseRetireResult(%q) succeeded", body)
-			}
-		})
-	}
-}
-
-func TestParseManualRetireResultAcceptsExactProducerRefusalEnums(t *testing.T) {
-	for _, reason := range []string{
-		"manual_mode_required", "manual_mode_conflict", "manual_binding_required",
-		"manual_refused", "manual_lock_missing", "manual_identity_unconfirmed", "manual_wake_unverified",
-		"manual_wake_creating", "manual_wake_unsupported", "manual_raw_wake", "manual_target_unverified",
-		"manual_target_missing", "manual_target_mismatch", "manual_wake_changed", "manual_binding_mismatch",
-		"manual_retirement_proof_mismatch", "manual_absent_refused", "manual_legacy_lock_unbound",
-	} {
-		t.Run(reason, func(t *testing.T) {
-			body := fmt.Sprintf(`{"schema":1,"status":"refused","reason_code":%q,"agent":"worker","root":"/tmp/root","lock":"/tmp/root/agents/worker/.wake.lock","target":"/tmp/inbox","generation":"generation-1","target_digest":"sha256:target-1"}`, reason)
-			result, err := parseManualRetireResult([]byte(body))
-			if err != nil || result.Status != "refused" || result.ReasonCode != reason {
-				t.Fatalf("producer refusal result=%#v err=%v", result, err)
 			}
 		})
 	}

@@ -1625,6 +1625,9 @@ func (a App) executeGCRootBatch(
 			}
 		}
 		if item.Status != supervisor.GCStatusRetired {
+			if err := a.logGCTransition(entry, updated, item); err != nil {
+				return results, true, err
+			}
 			for _, remaining := range entries[index+1:] {
 				if _, exists := results[remaining.ID]; !exists {
 					results[remaining.ID] = batchHaltedResult(remaining, "an earlier frozen member retirement failed; later members were not mutated")
@@ -1705,6 +1708,10 @@ func (a App) logGCTransition(previous, updated registry.Entry, result supervisor
 	if w == nil {
 		w = os.Stderr
 	}
+	detail := result.Reason
+	if result.Status == supervisor.GCStatusSkipped && updated.GCFailureCount > 0 && updated.LastError != "" {
+		detail = updated.LastError
+	}
 	if _, err := fmt.Fprintf(w,
 		"amq-keepalive gc: status=%s reason_code=%q root=%q agent=%q generation=%q reason=%q\n",
 		result.Status,
@@ -1712,7 +1719,7 @@ func (a App) logGCTransition(previous, updated registry.Entry, result supervisor
 		updated.Root,
 		updated.Agent,
 		updated.WakeBinding.Generation,
-		result.Reason,
+		detail,
 	); err != nil {
 		return fmt.Errorf("write GC transition diagnostic: %w", err)
 	}

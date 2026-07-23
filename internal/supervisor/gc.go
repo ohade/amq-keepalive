@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ohade/amq-keepalive/internal/amq"
 	"github.com/ohade/amq-keepalive/internal/registry"
@@ -26,6 +28,7 @@ const (
 	GCRootWindow          = registry.GCRootAttemptWindow
 	GCCatchUpInterval     = 5 * time.Second
 	GCRootTerminalBackoff = 15 * time.Minute
+	maxGCDiagnosticBytes  = 4096
 )
 
 type WakeLifecycle interface {
@@ -342,6 +345,9 @@ func markRetired(entry registry.Entry, now time.Time, result amq.RetireWakeResul
 }
 
 func gcFailure(entry registry.Entry, now time.Time, apply bool, result GCResult) (registry.Entry, GCResult) {
+	if result.Status == "" {
+		result.Status = GCStatusSkipped
+	}
 	if result.ReasonCode == "" {
 		result.ReasonCode = "lifecycle_error"
 	}
@@ -358,13 +364,50 @@ func gcFailure(entry registry.Entry, now time.Time, apply bool, result GCResult)
 		delay = 15 * time.Minute
 	}
 	entry.GCBackoffUntil = now.Add(delay)
+	entry.LastError = boundedGCDiagnostic(result.Reason)
+	if entry.LastError == "" {
+		entry.LastError = "AMQ lifecycle failure: " + result.ReasonCode
+	}
+	entry.LastGCDecision = result.Status
+	entry.LastGCReason = gcReasonKey(result)
 	return entry, result
 }
 
 func clearGCFailure(entry registry.Entry) registry.Entry {
 	entry.GCFailureCount = 0
 	entry.GCBackoffUntil = time.Time{}
+	entry.LastError = ""
 	return entry
+}
+
+func boundedGCDiagnostic(value string) string {
+	var result strings.Builder
+	result.Grow(min(len(value), maxGCDiagnosticBytes))
+	spacePending := false
+	truncated := false
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			spacePending = result.Len() != 0
+			continue
+		}
+		needed := utf8.RuneLen(r)
+		if spacePending {
+			needed++
+		}
+		if result.Len()+needed > maxGCDiagnosticBytes-3 {
+			truncated = true
+			break
+		}
+		if spacePending {
+			result.WriteByte(' ')
+			spacePending = false
+		}
+		result.WriteRune(r)
+	}
+	if truncated {
+		result.WriteString("...")
+	}
+	return result.String()
 }
 
 func gcReasonKey(result GCResult) string {

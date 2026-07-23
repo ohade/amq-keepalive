@@ -390,6 +390,9 @@ func TestRetirePreflightedOutcomeMatrix(t *testing.T) {
 			if updated.State != test.wantState || result.Status != test.wantStatus || updated.GCFailureCount != test.wantFails || len(wake.requests) != 1 || wake.requests[0].Check {
 				t.Fatalf("updated=%#v result=%#v requests=%#v", updated, result, wake.requests)
 			}
+			if test.wantFails != 0 && (updated.LastError == "" || updated.LastGCDecision != result.Status || updated.LastGCReason != result.ReasonCode) {
+				t.Fatalf("lifecycle failure diagnostics were not durable: updated=%#v result=%#v", updated, result)
+			}
 		})
 	}
 }
@@ -399,8 +402,15 @@ func TestGarbageCollectorSafetyHelpers(t *testing.T) {
 	entry := gcTestEntry()
 	entry.GCFailureCount = 5
 	updated, result := gcFailure(entry, now, true, GCResult{Reason: "boom"})
-	if result.ReasonCode != "lifecycle_error" || updated.GCFailureCount != 6 || !updated.GCBackoffUntil.Equal(now.Add(15*time.Minute)) {
+	if result.ReasonCode != "lifecycle_error" || updated.GCFailureCount != 6 || !updated.GCBackoffUntil.Equal(now.Add(15*time.Minute)) ||
+		updated.LastError != "boom" || updated.LastGCDecision != GCStatusSkipped || updated.LastGCReason != "lifecycle_error" {
 		t.Fatalf("updated=%#v result=%#v", updated, result)
+	}
+	unbounded := " unsafe\n" + strings.Repeat("x", maxGCDiagnosticBytes*2)
+	bounded, _ := gcFailure(entry, now, true, GCResult{Reason: unbounded})
+	if bounded.LastError == "" || len(bounded.LastError) > maxGCDiagnosticBytes || strings.ContainsAny(bounded.LastError, "\r\n") ||
+		!strings.HasSuffix(bounded.LastError, "...") {
+		t.Fatalf("bounded lifecycle detail len=%d value=%q", len(bounded.LastError), bounded.LastError)
 	}
 	if got := gcReasonKey(GCResult{Reason: "fallback"}); got != "fallback" {
 		t.Fatalf("gcReasonKey=%q", got)

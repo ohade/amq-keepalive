@@ -552,7 +552,8 @@ func TestRootBatchStopsOnFirstMutationErrorAndResumesAtFiveSeconds(t *testing.T)
 		t.Fatal(err)
 	}
 	first := &gcBatchScriptWake{tombstones: map[string]bool{}, failFirstMutation: true}
-	pass, err := (App{Stdout: io.Discard, Stderr: io.Discard, Now: func() time.Time { return now }}).superviseOnceWithGCState(
+	var firstStderr bytes.Buffer
+	pass, err := (App{Stdout: io.Discard, Stderr: &firstStderr, Now: func() time.Time { return now }}).superviseOnceWithGCState(
 		context.Background(), registryPath, first, "/bin/sh", time.Second, gcBatchPolicy(),
 	)
 	if err != nil {
@@ -566,12 +567,30 @@ func TestRootBatchStopsOnFirstMutationErrorAndResumesAtFiveSeconds(t *testing.T)
 		t.Fatal(err)
 	}
 	if len(failed.GCRootBatches) != 1 || failed.GCRootBatches[0].Phase != registry.GCRootBatchRetiring ||
-		!failed.Entries[0].GCBackoffUntil.Equal(now.Add(supervisor.GCCatchUpInterval)) {
+		!failed.Entries[0].GCBackoffUntil.Equal(now.Add(supervisor.GCCatchUpInterval)) ||
+		failed.Entries[0].LastGCDecision != supervisor.GCStatusSkipped || failed.Entries[0].LastGCReason != "internal_error" ||
+		!strings.Contains(failed.Entries[0].LastError, "injected lifecycle mutation failure") {
 		t.Fatalf("failed batch=%#v", failed)
+	}
+	if !strings.Contains(firstStderr.String(), "amq-keepalive gc:") ||
+		!strings.Contains(firstStderr.String(), "injected lifecycle mutation failure") {
+		t.Fatalf("first batch failure was not visible: %q", firstStderr.String())
+	}
+
+	repeated := &gcBatchScriptWake{tombstones: first.tombstones, failFirstMutation: true}
+	var repeatedStderr bytes.Buffer
+	pass, err = (App{Stdout: io.Discard, Stderr: &repeatedStderr, Now: func() time.Time { return now.Add(supervisor.GCCatchUpInterval) }}).superviseOnceWithGCState(
+		context.Background(), registryPath, repeated, "/bin/sh", time.Second, gcBatchPolicy(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repeated.checks) != 0 || len(repeated.mutations) != 1 || !pass.PendingGCRoots || repeatedStderr.Len() != 0 {
+		t.Fatalf("repeat checks=%d mutations=%d pass=%#v stderr=%q", len(repeated.checks), len(repeated.mutations), pass, repeatedStderr.String())
 	}
 
 	second := &gcBatchScriptWake{tombstones: first.tombstones}
-	pass, err = (App{Stdout: io.Discard, Stderr: io.Discard, Now: func() time.Time { return now.Add(supervisor.GCCatchUpInterval) }}).superviseOnceWithGCState(
+	pass, err = (App{Stdout: io.Discard, Stderr: io.Discard, Now: func() time.Time { return now.Add(2 * supervisor.GCCatchUpInterval) }}).superviseOnceWithGCState(
 		context.Background(), registryPath, second, "/bin/sh", time.Second, gcBatchPolicy(),
 	)
 	if err != nil {
