@@ -358,6 +358,49 @@ sleep 0.2
 	}
 }
 
+func TestStartWakeCancellationGraceReturnsRealChildFailure(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	t.Setenv("AMQ_KEEPALIVE_STARTED", started)
+	t.Setenv("AMQ_KEEPALIVE_RELEASE", release)
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+: > "$AMQ_KEEPALIVE_STARTED"
+while [ ! -f "$AMQ_KEEPALIVE_RELEASE" ]; do sleep 0.005; done
+printf 'owner claim rejected at cancellation edge\n' >&2
+exit 23
+`)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- NewCLI(fakeAMQ).StartWake(ctx, StartWakeRequest{
+			Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
+			Adapter: "ghostty", Target: "ghostty:terminal:abc", WakeOwner: testWakeOwner,
+			Timeout: 5 * time.Second,
+		})
+	}()
+	waitForFile(t, started, 2*time.Second)
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatalf("release child: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "exit status 23") || !strings.Contains(err.Error(), "owner claim rejected at cancellation edge") {
+			t.Fatalf("StartWake() error = %v, want real child exit and stderr", err)
+		}
+		if errors.Is(err, ErrWakeReadinessUncertain) || errors.Is(err, context.Canceled) {
+			t.Fatalf("StartWake() error = %v, concrete child failure was degraded to cancellation uncertainty", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartWake() did not return after child exit")
+	}
+}
+
 func TestWaitForWakeReadyPrefersExitedChildOverCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

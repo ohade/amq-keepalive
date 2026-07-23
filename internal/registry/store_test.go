@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -84,9 +85,10 @@ func TestStoreRejectsNewOwnerlessEntryButLoadsLegacyRows(t *testing.T) {
 		t.Fatalf("Upsert(ownerless) error = %v, want owner requirement", err)
 	}
 	ownerless.ID = EntryID(ownerless.Root, ownerless.Agent, ownerless.Adapter, ownerless.Target)
-	if err := store.Save(File{SchemaVersion: SchemaVersion, Entries: []Entry{ownerless}}); err != nil {
-		t.Fatalf("Save legacy row: %v", err)
+	if err := store.Save(File{SchemaVersion: SchemaVersion, Entries: []Entry{ownerless}}); err == nil || !strings.Contains(err.Error(), "wake owner is required") {
+		t.Fatalf("Save(ownerless) error = %v, want owner requirement", err)
 	}
+	writeRawRegistryFixture(t, store.Path, File{SchemaVersion: SchemaVersion, Entries: []Entry{ownerless}})
 	loaded, err := store.Load()
 	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0].WakeOwner != "" {
 		t.Fatalf("legacy row was not readable: entries=%#v err=%v", loaded.Entries, err)
@@ -108,9 +110,77 @@ func TestStoreRejectsMalformedNonblankWakeOwnerOnWritePaths(t *testing.T) {
 	if _, _, err := store.ReplaceSessionAdapter(malformed); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
 		t.Fatalf("ReplaceSessionAdapter(malformed owner) error = %v, want exact owner validation", err)
 	}
+	if err := store.Save(File{Entries: []Entry{malformed}}); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
+		t.Fatalf("Save(malformed owner) error = %v, want exact owner validation", err)
+	}
+	valid, err := store.Upsert(Entry{
+		Root: "/tmp/root", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", WakeOwner: testRegistryWakeOwner,
+	})
+	if err != nil {
+		t.Fatalf("Upsert(valid owner): %v", err)
+	}
+	malformed.ID = valid.ID
+	if err := store.UpdateEntry(malformed); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
+		t.Fatalf("UpdateEntry(malformed owner) error = %v, want exact owner validation", err)
+	}
+	if _, err := store.UpdateEntries([]EntryUpdate{{Before: valid, After: malformed}}); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
+		t.Fatalf("UpdateEntries(malformed owner) error = %v, want exact owner validation", err)
+	}
 	loaded, err := store.Load()
-	if err != nil || len(loaded.Entries) != 0 {
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != valid {
 		t.Fatalf("malformed owner mutated registry: entries=%#v err=%v", loaded.Entries, err)
+	}
+}
+
+func TestStoreAllowsMetadataUpdatesWithExactUnchangedLegacyOwner(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	legacy := Entry{
+		ID:   EntryID("/tmp/legacy", "codex", "file", "/tmp/inbox"),
+		Root: "/tmp/legacy", Agent: "codex", Adapter: "file", Target: "/tmp/inbox", State: StateActive,
+	}
+	writeRawRegistryFixture(t, store.Path, File{SchemaVersion: SchemaVersion, Entries: []Entry{legacy}})
+
+	updated := legacy
+	updated.LastError = "owner-bound reattach required"
+	if err := store.UpdateEntry(updated); err != nil {
+		t.Fatalf("UpdateEntry(exact legacy owner): %v", err)
+	}
+	next := updated
+	next.State = StateAttached
+	if _, err := store.UpdateEntries([]EntryUpdate{{Before: updated, After: next}}); err != nil {
+		t.Fatalf("UpdateEntries(exact legacy owner): %v", err)
+	}
+	changedOwner := next
+	changedOwner.WakeOwner = `{"pid":4242}`
+	if err := store.UpdateEntry(changedOwner); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
+		t.Fatalf("UpdateEntry(changed malformed owner) error = %v, want refusal", err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != next {
+		t.Fatalf("legacy metadata update entries=%#v err=%v, want unchanged owner", loaded.Entries, err)
+	}
+}
+
+func TestStoreRestoresExactLegacySnapshotIssuedByReplace(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	legacy := Entry{
+		ID:   EntryID("/tmp/legacy", "codex", "file", "/tmp/old"),
+		Root: "/tmp/legacy", Agent: "codex", Adapter: "file", Target: "/tmp/old", State: StateActive,
+	}
+	writeRawRegistryFixture(t, store.Path, File{SchemaVersion: SchemaVersion, Entries: []Entry{legacy}})
+	reservation, removed, err := store.ReplaceSessionAdapter(Entry{
+		Root: "/tmp/legacy", Agent: "codex", Adapter: "file", Target: "/tmp/new", WakeOwner: testRegistryWakeOwner,
+	})
+	if err != nil || len(removed) != 1 || removed[0] != legacy {
+		t.Fatalf("ReplaceSessionAdapter() reservation=%#v removed=%#v err=%v", reservation, removed, err)
+	}
+	restored, err := store.RestoreSessionAdapterIfUnchanged(reservation, removed)
+	if err != nil || !restored {
+		t.Fatalf("RestoreSessionAdapterIfUnchanged() restored=%v err=%v", restored, err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != legacy {
+		t.Fatalf("restored legacy entries=%#v err=%v", loaded.Entries, err)
 	}
 }
 
@@ -205,9 +275,7 @@ func TestStoreRejectsCanonicalCmuxTargetOwnedByLegacyLowercaseRow(t *testing.T) 
 		ID: EntryID("/tmp/first", "codex", "cmux", lower), Root: "/tmp/first", Agent: "codex",
 		Adapter: "cmux", Target: lower, State: StateActive,
 	}
-	if err := store.Save(File{SchemaVersion: SchemaVersion, Entries: []Entry{legacy}}); err != nil {
-		t.Fatalf("Save legacy row: %v", err)
-	}
+	writeRawRegistryFixture(t, store.Path, File{SchemaVersion: SchemaVersion, Entries: []Entry{legacy}})
 	upper := "cmux:surface:F901D722-6789-4BBB-9818-C4E97F20BEB3"
 	_, err := store.Upsert(Entry{Root: "/tmp/second", Agent: "claude", Adapter: "cmux", Target: upper, WakeOwner: testRegistryWakeOwner})
 	if !errors.Is(err, ErrTargetOwned) {
@@ -546,4 +614,15 @@ func findTestEntry(entries []Entry, id string) (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+func writeRawRegistryFixture(t *testing.T, path string, file File) {
+	t.Helper()
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatalf("marshal raw registry fixture: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write raw registry fixture: %v", err)
+	}
 }

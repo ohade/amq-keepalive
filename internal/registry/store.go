@@ -205,6 +205,11 @@ func (s *Store) Save(file File) error {
 	if s.Path == "" {
 		return errors.New("registry path is required")
 	}
+	for _, entry := range file.Entries {
+		if err := validateEntryWakeOwner(entry); err != nil {
+			return err
+		}
+	}
 	return s.withLock(func() error {
 		return s.saveUnlocked(file)
 	})
@@ -312,8 +317,10 @@ func (s *Store) ReplaceSessionAdapter(entry Entry) (Entry, []Entry, error) {
 
 // RestoreSessionAdapterIfUnchanged rolls back a pre-wake reattach reservation
 // only while that exact inactive row is still authoritative. It restores the
-// complete prior root/agent set atomically; a concurrent change wins and keeps
-// the recoverable reservation instead of being overwritten.
+// complete prior root/agent snapshot returned by ReplaceSessionAdapter,
+// including readable legacy rows, atomically. A concurrent change wins and
+// keeps the recoverable reservation instead of being overwritten. This is an
+// internal rollback path, not a general registry insertion API.
 func (s *Store) RestoreSessionAdapterIfUnchanged(expected Entry, previous []Entry) (bool, error) {
 	if expected.ID == "" {
 		return false, errors.New("expected reservation id is required")
@@ -387,8 +394,8 @@ func (s *Store) prepareEntry(entry Entry) (Entry, error) {
 	if entry.Target == "" {
 		return Entry{}, errors.New("entry target is required")
 	}
-	if err := amq.ValidateWakeOwner(entry.WakeOwner); err != nil {
-		return Entry{}, fmt.Errorf("entry wake owner: %w", err)
+	if err := validateEntryWakeOwner(entry); err != nil {
+		return Entry{}, err
 	}
 	if entry.ID == "" {
 		entry.ID = EntryID(entry.Root, entry.Agent, entry.Adapter, entry.Target)
@@ -410,6 +417,9 @@ func (s *Store) UpdateEntry(entry Entry) error {
 		}
 		for i := range file.Entries {
 			if file.Entries[i].ID == entry.ID {
+				if err := validateWakeOwnerTransition(file.Entries[i], entry); err != nil {
+					return err
+				}
 				file.Entries[i] = entry
 				return s.saveUnlocked(file)
 			}
@@ -434,6 +444,9 @@ func (s *Store) UpdateEntries(updates []EntryUpdate) (UpdateResult, error) {
 		}
 		if _, ok := seen[update.Before.ID]; ok {
 			return result, fmt.Errorf("batch update contains duplicate entry %q", update.Before.ID)
+		}
+		if err := validateWakeOwnerTransition(update.Before, update.After); err != nil {
+			return result, err
 		}
 		seen[update.Before.ID] = struct{}{}
 	}
@@ -545,6 +558,22 @@ func (s *Store) now() time.Time {
 		return s.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func validateEntryWakeOwner(entry Entry) error {
+	if err := amq.ValidateWakeOwner(entry.WakeOwner); err != nil {
+		return fmt.Errorf("entry wake owner: %w", err)
+	}
+	return nil
+}
+
+func validateWakeOwnerTransition(before, after Entry) error {
+	if err := validateEntryWakeOwner(after); err == nil {
+		return nil
+	} else if before.WakeOwner != after.WakeOwner {
+		return err
+	}
+	return nil
 }
 
 func sortEntries(entries []Entry) {

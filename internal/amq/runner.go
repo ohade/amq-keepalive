@@ -25,6 +25,11 @@ const staleWakeReadyMarkerAge = 24 * time.Hour
 const maxWakeBaselineBytes = 64 * 1024
 const maxWakeStartupStderrBytes = 16 * 1024
 
+// wakeProcessExitGrace gives exec.Wait a bounded window to publish a child
+// exit which raced the caller's timeout or cancellation. It is deliberately
+// short so cancellation remains prompt while preserving concrete diagnostics.
+const wakeProcessExitGrace = 100 * time.Millisecond
+
 type Env struct {
 	SchemaVersion int               `json:"schema_version"`
 	AMQVersion    string            `json:"amq_version"`
@@ -422,15 +427,43 @@ func waitForWakeReady(ctx context.Context, done <-chan wakeProcessResult, readyF
 		case result := <-done:
 			return finishWakeProcess(result, readyFile)
 		case <-ctx.Done():
-			if result, ok := pollWakeProcess(done); ok {
-				return finishWakeProcess(result, readyFile)
+			if processDone, err, observed := observeWakeDuringGrace(done, readyFile, wakeProcessExitGrace); observed {
+				return processDone, err
 			}
 			return false, ctx.Err()
 		case <-timer.C:
-			if result, ok := pollWakeProcess(done); ok {
-				return finishWakeProcess(result, readyFile)
+			if processDone, err, observed := observeWakeDuringGrace(done, readyFile, wakeProcessExitGrace); observed {
+				return processDone, err
 			}
 			return false, fmt.Errorf("timed out after %s waiting for amq wake readiness", timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+func observeWakeDuringGrace(done <-chan wakeProcessResult, readyFile string, grace time.Duration) (bool, error, bool) {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if wakeReadyFileExists(readyFile) {
+			return false, nil, true
+		}
+		select {
+		case result := <-done:
+			processDone, err := finishWakeProcess(result, readyFile)
+			return processDone, err, true
+		case <-timer.C:
+			if wakeReadyFileExists(readyFile) {
+				return false, nil, true
+			}
+			if result, ok := pollWakeProcess(done); ok {
+				processDone, err := finishWakeProcess(result, readyFile)
+				return processDone, err, true
+			}
+			return false, nil, false
 		case <-ticker.C:
 		}
 	}

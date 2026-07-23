@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -321,6 +322,36 @@ func TestReattachPreservesRegistryWhenWakeTargetCannotChange(t *testing.T) {
 	}
 	if len(loaded.Entries) != 1 || loaded.Entries[0].Target != oldTarget {
 		t.Fatalf("entries = %#v, want old target restored", loaded.Entries)
+	}
+}
+
+func TestFailedReattachRestoresExactLegacyOwnerlessEntry(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "registry.json")
+	oldTarget := filepath.Join(dir, "old-inbox.txt")
+	newTarget := filepath.Join(dir, "new-inbox.txt")
+	legacy := registry.Entry{
+		ID:   registry.EntryID("/tmp/amq-root", "codex", "file", oldTarget),
+		Root: "/tmp/amq-root", BaseRoot: "/tmp", SessionName: "amq-root",
+		Agent: "codex", Adapter: "file", Target: oldTarget, State: registry.StateActive,
+	}
+	writeRawRegistryFixture(t, registryPath, registry.File{SchemaVersion: registry.SchemaVersion, Entries: []registry.Entry{legacy}})
+	fakeAMQ := filepath.Join(dir, "amq")
+	if err := os.WriteFile(fakeAMQ, []byte("#!/bin/sh\necho 'existing wake target differs' >&2\nexit 7\n"), 0o700); err != nil {
+		t.Fatalf("write fake AMQ: %v", err)
+	}
+
+	code := (App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}).Run(context.Background(), []string{
+		"reattach", "--registry", registryPath, "--adapter", "file", "--target", newTarget,
+		"--root", "/tmp/amq-root", "--base-root", "/tmp", "--session", "amq-root",
+		"--me", "codex", "--amq", fakeAMQ, "--wake-ready-timeout", "5s",
+	})
+	if code != 1 {
+		t.Fatalf("reattach code = %d, want 1", code)
+	}
+	loaded, err := registry.New(registryPath).Load()
+	if err != nil || len(loaded.Entries) != 1 || loaded.Entries[0] != legacy {
+		t.Fatalf("failed reattach entries=%#v err=%v, want exact legacy snapshot", loaded.Entries, err)
 	}
 }
 
@@ -763,9 +794,7 @@ func TestSuperviseFailsClosedOnNormalizedTargetOwnershipCollision(t *testing.T) 
 		{ID: registry.EntryID("/tmp/one", "codex", "cmux", upper), Root: "/tmp/one", Agent: "codex", Adapter: "cmux", Target: upper, State: registry.StateActive},
 		{ID: registry.EntryID("/tmp/two", "claude", "cmux", lower), Root: "/tmp/two", Agent: "claude", Adapter: "cmux", Target: lower, State: registry.StateActive},
 	}
-	if err := registry.New(registryPath).Save(registry.File{Entries: entries}); err != nil {
-		t.Fatalf("Save legacy collision: %v", err)
-	}
+	writeRawRegistryFixture(t, registryPath, registry.File{SchemaVersion: registry.SchemaVersion, Entries: entries})
 	wake := &appCountingWake{}
 	results, err := (App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}).superviseOnce(
 		context.Background(), registryPath, wake, "/bin/amq-keepalive", time.Second,
@@ -779,6 +808,15 @@ func TestSuperviseFailsClosedOnNormalizedTargetOwnershipCollision(t *testing.T) 
 	for _, result := range results {
 		if result.Action != "backoff" || result.Error == nil || !strings.Contains(result.Error.Error(), "ownership collision") {
 			t.Fatalf("collision result = %+v, want fail-closed backoff", result)
+		}
+	}
+	loaded, err := registry.New(registryPath).Load()
+	if err != nil || len(loaded.Entries) != 2 {
+		t.Fatalf("Load supervised legacy entries=%#v err=%v", loaded.Entries, err)
+	}
+	for _, entry := range loaded.Entries {
+		if entry.WakeOwner != "" || entry.State != registry.StateAttached || !strings.Contains(entry.LastError, "ownership collision") {
+			t.Fatalf("legacy supervision did not fail closed without changing owner: %#v", entry)
 		}
 	}
 }
@@ -820,4 +858,15 @@ func waitForPath(t *testing.T, path string, timeout time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", path)
+}
+
+func writeRawRegistryFixture(t *testing.T, path string, file registry.File) {
+	t.Helper()
+	data, err := json.Marshal(file)
+	if err != nil {
+		t.Fatalf("marshal raw registry fixture: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write raw registry fixture: %v", err)
+	}
 }
