@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ohade/amq-keepalive/internal/amq"
 )
 
 const (
@@ -385,8 +387,8 @@ func (s *Store) prepareEntry(entry Entry) (Entry, error) {
 	if entry.Target == "" {
 		return Entry{}, errors.New("entry target is required")
 	}
-	if strings.TrimSpace(entry.WakeOwner) == "" {
-		return Entry{}, errors.New("entry wake owner is required")
+	if err := amq.ValidateWakeOwner(entry.WakeOwner); err != nil {
+		return Entry{}, fmt.Errorf("entry wake owner: %w", err)
 	}
 	if entry.ID == "" {
 		entry.ID = EntryID(entry.Root, entry.Agent, entry.Adapter, entry.Target)

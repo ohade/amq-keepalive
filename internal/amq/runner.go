@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,7 @@ var ErrWakeReadinessUncertain = errors.New("amq wake readiness is uncertain; chi
 const defaultWakeReadyTimeout = 10 * time.Second
 const staleWakeReadyMarkerAge = 24 * time.Hour
 const maxWakeBaselineBytes = 64 * 1024
+const maxWakeStartupStderrBytes = 16 * 1024
 
 type Env struct {
 	SchemaVersion int               `json:"schema_version"`
@@ -172,6 +174,11 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	// attach time may authorize this managed wake or a later supervisor replay.
 	cmd.Env = wakeEnv
 	configureWakeProcess(cmd)
+	// Capture startup diagnostics without inheriting the caller's PTY. The
+	// writer keeps draining after the cap so a noisy child cannot block or grow
+	// this process's memory without bound.
+	startupStderr := newBoundedCapture(maxWakeStartupStderrBytes)
+	cmd.Stderr = startupStderr
 	if err := ctx.Err(); err != nil {
 		_ = os.Remove(readyFile)
 		return err
@@ -188,7 +195,7 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		err := cmd.Wait()
 		ready := wakeReadyFileExists(readyFile)
 		_ = os.Remove(readyFile)
-		done <- wakeProcessResult{Err: err, Ready: ready}
+		done <- wakeProcessResult{Err: err, Ready: ready, Stderr: startupStderr.String()}
 	}()
 	if processDone, err := waitForWakeReady(ctx, done, readyFile, req.Timeout); err != nil {
 		// Readiness wins a cancellation/timeout race. Once AMQ has published the
@@ -201,10 +208,10 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		if !processDone {
 			select {
 			case result := <-done:
-				processDone = true
 				if result.Ready {
 					return nil
 				}
+				return wakeProcessExitError(result)
 			default:
 			}
 		}
@@ -321,8 +328,52 @@ func scavengeStaleWakeReadyMarkers(dir string, now time.Time) {
 }
 
 type wakeProcessResult struct {
-	Err   error
-	Ready bool
+	Err    error
+	Ready  bool
+	Stderr string
+}
+
+type boundedCapture struct {
+	mu        sync.Mutex
+	limit     int
+	data      []byte
+	truncated bool
+}
+
+func newBoundedCapture(limit int) *boundedCapture {
+	return &boundedCapture{limit: limit}
+}
+
+func (capture *boundedCapture) Write(data []byte) (int, error) {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+
+	remaining := capture.limit - len(capture.data)
+	if remaining > len(data) {
+		remaining = len(data)
+	}
+	if remaining > 0 {
+		capture.data = append(capture.data, data[:remaining]...)
+	}
+	if remaining < len(data) {
+		capture.truncated = true
+	}
+	return len(data), nil
+}
+
+func (capture *boundedCapture) String() string {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+
+	text := strings.TrimSpace(string(capture.data))
+	if !capture.truncated {
+		return text
+	}
+	marker := fmt.Sprintf("[stderr truncated after %d bytes]", capture.limit)
+	if text == "" {
+		return marker
+	}
+	return text + "\n" + marker
 }
 
 func (c CLI) run(ctx context.Context, args ...string) ([]byte, string, error) {
@@ -369,23 +420,61 @@ func waitForWakeReady(ctx context.Context, done <-chan wakeProcessResult, readyF
 		}
 		select {
 		case result := <-done:
-			if result.Ready || wakeReadyFileExists(readyFile) {
-				return true, nil
-			}
-			if result.Err == nil {
-				return true, errors.New("amq wake exited before becoming ready")
-			}
-			if strings.Contains(strings.ToLower(result.Err.Error()), "already") {
-				return true, ErrAlreadyRunning
-			}
-			return true, fmt.Errorf("amq wake exited before becoming ready: %w", result.Err)
+			return finishWakeProcess(result, readyFile)
 		case <-ctx.Done():
+			if result, ok := pollWakeProcess(done); ok {
+				return finishWakeProcess(result, readyFile)
+			}
 			return false, ctx.Err()
 		case <-timer.C:
+			if result, ok := pollWakeProcess(done); ok {
+				return finishWakeProcess(result, readyFile)
+			}
 			return false, fmt.Errorf("timed out after %s waiting for amq wake readiness", timeout)
 		case <-ticker.C:
 		}
 	}
+}
+
+func pollWakeProcess(done <-chan wakeProcessResult) (wakeProcessResult, bool) {
+	select {
+	case result := <-done:
+		return result, true
+	default:
+		return wakeProcessResult{}, false
+	}
+}
+
+func finishWakeProcess(result wakeProcessResult, readyFile string) (bool, error) {
+	if result.Ready || wakeReadyFileExists(readyFile) {
+		return true, nil
+	}
+	return true, wakeProcessExitError(result)
+}
+
+func wakeProcessExitError(result wakeProcessResult) error {
+	detail := strings.TrimSpace(result.Stderr)
+	combined := detail
+	if result.Err != nil {
+		combined += "\n" + result.Err.Error()
+	}
+	if strings.Contains(strings.ToLower(combined), "already") {
+		if detail == "" {
+			return ErrAlreadyRunning
+		}
+		return fmt.Errorf("%w: %s", ErrAlreadyRunning, detail)
+	}
+
+	var err error
+	if result.Err == nil {
+		err = errors.New("amq wake exited before becoming ready")
+	} else {
+		err = fmt.Errorf("amq wake exited before becoming ready: %w", result.Err)
+	}
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%w; stderr: %s", err, detail)
 }
 
 func wakeReadyFileExists(path string) bool {
