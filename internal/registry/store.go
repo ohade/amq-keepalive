@@ -1002,6 +1002,119 @@ func (s *Store) UpdateEntries(updates []EntryUpdate) (UpdateResult, error) {
 	return result, err
 }
 
+// EnrollManualRetirementIntents atomically compares and enrolls every
+// unresolved row in one canonical root. The full-root membership check and
+// all optimistic comparisons complete before the in-memory file is changed,
+// so a sibling race cannot leave a durable prefix of the plan enrolled.
+//
+// A replay supplies unchanged Before/After values for rows whose exact intent
+// is already durable. Those rows still participate in the membership and CAS
+// checks, while only newly enrolled rows are written.
+func (s *Store) EnrollManualRetirementIntents(canonicalRoot string, updates []EntryUpdate) (UpdateResult, error) {
+	var result UpdateResult
+	canonicalRoot, err := canonicalRegistryRoot(canonicalRoot)
+	if err != nil {
+		return result, fmt.Errorf("canonicalize manual retirement root: %w", err)
+	}
+	if len(updates) == 0 {
+		return result, errors.New("manual retirement enrollment requires at least one unresolved row")
+	}
+
+	seen := make(map[string]struct{}, len(updates))
+	var plan manualRetirementRootPlan
+	for _, update := range updates {
+		if update.Before.ID == "" || update.Before.ID != update.After.ID {
+			return result, errors.New("manual retirement enrollment requires one unchanged entry id")
+		}
+		if _, duplicate := seen[update.Before.ID]; duplicate {
+			return result, fmt.Errorf("manual retirement enrollment contains duplicate entry %q", update.Before.ID)
+		}
+		seen[update.Before.ID] = struct{}{}
+		if update.Before.State == StateRetired || update.After.State == StateRetired ||
+			update.Before.ManualRetirementReceipt.Active() || update.After.ManualRetirementReceipt.Active() ||
+			!update.After.ManualRetirementIntent.Active() {
+			return result, fmt.Errorf("manual retirement enrollment entry %q is not an unresolved exact intent", update.Before.ID)
+		}
+		entryRoot, rootErr := canonicalRegistryRoot(update.Before.Root)
+		if rootErr != nil || entryRoot != canonicalRoot || update.After.Root != update.Before.Root {
+			return result, fmt.Errorf("manual retirement enrollment entry %q is outside canonical root %q", update.Before.ID, canonicalRoot)
+		}
+		intent := update.After.ManualRetirementIntent
+		candidate := manualRetirementRootPlan{
+			PlanID: intent.PlanID, Root: intent.Root, AMQExecutable: intent.AMQExecutable,
+			InjectVia: intent.InjectVia, AMQIdentity: intent.AMQIdentity, InjectIdentity: intent.InjectIdentity,
+			TimeoutNanos: intent.TimeoutNanos,
+		}
+		if plan.PlanID == "" {
+			plan = candidate
+		} else if plan != candidate {
+			return result, errors.New("manual retirement enrollment contains incoherent root plans")
+		}
+		if update.Before == update.After {
+			if !update.Before.ManualRetirementIntent.Active() {
+				return result, fmt.Errorf("manual retirement enrollment entry %q is an invalid no-op", update.Before.ID)
+			}
+			continue
+		}
+		if update.Before.ManualRetirementIntent.Active() {
+			return result, fmt.Errorf("manual retirement enrollment entry %q changes an existing exact intent", update.Before.ID)
+		}
+		expected := update.Before
+		expected.ManualRetirementIntent = intent
+		if expected != update.After {
+			return result, fmt.Errorf("manual retirement enrollment entry %q changes fields outside its exact intent", update.Before.ID)
+		}
+	}
+
+	err = s.withLock(func() error {
+		file, loadErr := s.loadUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
+		byID := make(map[string]int, len(file.Entries))
+		unresolvedAtRoot := make(map[string]struct{})
+		for index, entry := range file.Entries {
+			byID[entry.ID] = index
+			if entry.State == StateRetired {
+				continue
+			}
+			entryRoot, rootErr := canonicalRegistryRoot(entry.Root)
+			if rootErr != nil {
+				return rootErr
+			}
+			if entryRoot == canonicalRoot {
+				unresolvedAtRoot[entry.ID] = struct{}{}
+			}
+		}
+		if len(unresolvedAtRoot) != len(updates) {
+			return fmt.Errorf("manual retirement enrollment expected %d unresolved root rows, found %d", len(updates), len(unresolvedAtRoot))
+		}
+		for id := range unresolvedAtRoot {
+			if _, included := seen[id]; !included {
+				return fmt.Errorf("manual retirement enrollment omits unresolved root entry %q", id)
+			}
+		}
+		for _, update := range updates {
+			index, ok := byID[update.Before.ID]
+			if !ok || file.Entries[index] != update.Before {
+				return fmt.Errorf("manual retirement enrollment entry %q changed before the root could be enrolled", update.Before.ID)
+			}
+		}
+		for _, update := range updates {
+			if update.Before == update.After {
+				continue
+			}
+			file.Entries[byID[update.Before.ID]] = update.After
+			result.Updated++
+		}
+		if result.Updated == 0 {
+			return nil
+		}
+		return s.saveUnlocked(file)
+	})
+	return result, err
+}
+
 // StartGCRootBatch atomically freezes the exact listener membership and marks
 // the selected root as having consumed a GC-window slot. expected must contain
 // every non-retired listener row in the canonical root selected by the caller.

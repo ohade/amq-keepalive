@@ -1761,6 +1761,72 @@ func TestManualRetirementSamePlanEnrollmentAndSequentialReceipts(t *testing.T) {
 	}
 }
 
+func TestEnrollManualRetirementIntentsIsWholeRootAtomicAndReplayable(t *testing.T) {
+	firstPending := pendingManualRetirementTestEntry(t)
+	first := firstPending
+	first.ManualRetirementIntent = ManualRetirementIntent{}
+	second := first
+	second.ID, second.Agent, second.Target = "second", "claude", filepath.Join(first.Root, "second")
+	secondPending := second
+	secondPending.ManualRetirementIntent = firstPending.ManualRetirementIntent
+	secondPending.ManualRetirementIntent.RowDigest = strings.Repeat("c", 64)
+	secondPending.ManualRetirementIntent.Agent = second.Agent
+	secondPending.ManualRetirementIntent.Target = second.Target
+	secondPending.ManualRetirementIntent.Generation = "generation-second"
+	secondPending.ManualRetirementIntent.TargetDigest = "sha256:digest-second"
+	retiredHistory := second
+	retiredHistory.ID, retiredHistory.Agent, retiredHistory.Target = "retired-history", "history", filepath.Join(first.Root, "history")
+	retiredHistory.State = StateRetired
+	retiredHistory.RetiredAt = firstPending.ManualRetirementIntent.StartedAt.Add(-time.Hour)
+
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	if err := store.Save(File{Entries: []Entry{first, second, retiredHistory}}); err != nil {
+		t.Fatal(err)
+	}
+	racedSecond := second
+	racedSecond.LastError = "concurrent sibling update"
+	if result, err := store.UpdateEntries([]EntryUpdate{{Before: second, After: racedSecond}}); err != nil || result.Updated != 1 {
+		t.Fatalf("inject sibling race result=%#v err=%v", result, err)
+	}
+	if result, err := store.EnrollManualRetirementIntents(first.Root, []EntryUpdate{
+		{Before: first, After: firstPending},
+		{Before: second, After: secondPending},
+	}); err == nil || result.Updated != 0 {
+		t.Fatalf("stale whole-root enrollment result=%#v err=%v", result, err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("stale enrollment left a prefix: file=%#v err=%v", loaded, err)
+	}
+	for _, entry := range loaded.Entries {
+		if entry.ManualRetirementIntent.Active() {
+			t.Fatalf("stale enrollment left a prefix: file=%#v", loaded)
+		}
+	}
+
+	racedSecondPending := racedSecond
+	racedSecondPending.ManualRetirementIntent = secondPending.ManualRetirementIntent
+	updates := []EntryUpdate{
+		{Before: first, After: firstPending},
+		{Before: racedSecond, After: racedSecondPending},
+	}
+	result, err := store.EnrollManualRetirementIntents(first.Root, updates)
+	if err != nil || result.Updated != 2 || result.Skipped != 0 {
+		t.Fatalf("atomic enrollment result=%#v err=%v", result, err)
+	}
+	replay := []EntryUpdate{
+		{Before: firstPending, After: firstPending},
+		{Before: racedSecondPending, After: racedSecondPending},
+	}
+	result, err = store.EnrollManualRetirementIntents(first.Root, replay)
+	if err != nil || result.Updated != 0 || result.Skipped != 0 {
+		t.Fatalf("atomic enrollment replay result=%#v err=%v", result, err)
+	}
+	if _, err := store.EnrollManualRetirementIntents(first.Root, replay[:1]); err == nil {
+		t.Fatal("partial unresolved-root replay was accepted")
+	}
+}
+
 func TestExactManualRetirementCompletionWorksThroughSingleRowMutators(t *testing.T) {
 	for _, test := range []struct {
 		name string

@@ -171,15 +171,18 @@ fsynced snapshot copied from that descriptor because Darwin rejects executable
 `/dev/fd` paths.
 
 Apply repeats target-absence proof under the registration lock, preflights every
-agent through AMQ's explicit manual-retirement contract, and durably saves every
-generation/digest-bound intent before sending the first signal. A static
-refusal therefore sends no retirement signals. Each successful result is saved
-immediately as a retained retired row without deleting mailbox, target, or
-baseline data. If keepalive crashes after AMQ records its tombstone but before
-the registry save, the pending intent blocks reattach and automatic GC for that
-root; repeating the exact confirmed command accepts only AMQ's matching
-idempotent receipt and cannot signal that wake twice. Missing, raw, unverified,
-changed, or mismatched wakes remain unresolved and are reported loudly.
+agent through AMQ's explicit manual-retirement contract, and atomically enrolls
+the complete unresolved root membership in one generation/digest-bound registry
+save before sending the first signal. A sibling compare-and-swap race enrolls
+no prefix, and a crash after that atomic save replays the exact durable intents
+without another unbound preflight. A static refusal therefore sends no
+retirement signals. Each successful result is saved immediately as a retained
+retired row without deleting mailbox, target, or baseline data. If keepalive
+crashes after AMQ records its tombstone but before the registry save, the
+pending intent blocks reattach and automatic GC for that root; repeating the
+exact confirmed command accepts only AMQ's matching idempotent receipt and
+cannot signal that wake twice. Missing, raw, unverified, changed, or mismatched
+wakes remain unresolved and are reported loudly.
 
 An absent `.wake.lock` is eligible only after two independent checks. Keepalive
 first proves through the selected adapter that the external target is absent.
@@ -420,7 +423,10 @@ context-cancelable, and default signal handling is restored after the first sign
 Any failed supervisor pass retries after five seconds, including failures before
 a durable GC coordinator can be discovered. Transition diagnostics are part of
 the observable contract: a failed stderr write is returned instead of silently
-discarding the diagnostic.
+discarding the diagnostic. A root-batch lifecycle failure also persists its
+bounded detail in `last_error` with the current GC decision and reason code; the
+daemon prints that failure on the first transition but suppresses identical
+five-second retry noise.
 
 `doctor` is registry-read-only: it uses the preview loader and creates no lock,
 backup, or migrated registry. Its JSON includes `active_gc_batch_id` and
