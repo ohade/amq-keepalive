@@ -271,6 +271,48 @@ func TestRetireSessionPreviewIsDeterministicAndBytePureForSchemaV1(t *testing.T)
 	}
 }
 
+func TestRetireSessionRequiresExactWholeRootMembership(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*registry.Entry)
+	}{
+		{name: "omitted same-adapter sibling"},
+		{name: "omitted mixed-adapter sibling", mutate: func(entry *registry.Entry) { entry.Adapter = "other" }},
+		{name: "omitted active sibling", mutate: func(entry *registry.Entry) { entry.State = registry.StateActive }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")
+			if test.mutate != nil {
+				file, err := store.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for index := range file.Entries {
+					if file.Entries[index].Agent == "beta" {
+						test.mutate(&file.Entries[index])
+					}
+				}
+				if err := store.Save(file); err != nil {
+					t.Fatal(err)
+				}
+			}
+			opts.Agents = "alpha"
+			lifecycle := &retireSessionTestLifecycle{}
+			if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, retireSessionTestAdapter{}); err == nil || !strings.Contains(err.Error(), "exact whole-root membership") {
+				t.Fatalf("omitted sibling error=%v", err)
+			}
+			if len(lifecycle.requests) != 0 {
+				t.Fatalf("omitted sibling invoked AMQ: %#v", lifecycle.requests)
+			}
+			loaded, err := store.Load()
+			if err != nil || len(loaded.Entries) != 2 {
+				t.Fatalf("omitted sibling changed registry: entries=%#v err=%v", loaded.Entries, err)
+			}
+		})
+	}
+}
+
 func TestRetireSessionTokenMismatchAndLiveTargetSignalNothing(t *testing.T) {
 	dir := t.TempDir()
 	root, store, opts := setupLegacyRetireSession(t, dir, "alpha")

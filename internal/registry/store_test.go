@@ -611,6 +611,8 @@ func TestStoreLoadPreviewSchemaV2IsStrictAndBytePure(t *testing.T) {
 		"nested duplicate key": `{"schema_version":2,"entries":[` + validEntry + `],"future":{"nested":{"key":1,"key":2}}}`,
 		"trailing document":    `{"schema_version":2,"entries":[` + validEntry + `]} {}`,
 		"future schema":        `{"schema_version":3,"entries":[` + validEntry + `]}`,
+		"missing entries":      `{"schema_version":2}`,
+		"null entries":         `{"schema_version":2,"entries":null}`,
 		"missing required":     `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","state":"active"}]}`,
 		"unknown state":        `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"future"}]}`,
 		"unknown transition":   `{"schema_version":2,"entries":[{"id":"entry-1","root":"/tmp/root","agent":"codex","adapter":"file","target":"/tmp/target","state":"active","reattach_transition":{"phase":"future"}}]}`,
@@ -646,6 +648,28 @@ func TestStoreLoadPreviewSchemaV2IsStrictAndBytePure(t *testing.T) {
 	after, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(raw, after) {
 		t.Fatalf("additive LoadPreview changed bytes: before=%q after=%q err=%v", raw, after, err)
+	}
+}
+
+func TestStoreSaveWritesEmptySchemaV2EntriesArray(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := New(path).Save(File{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(bytes.TrimSpace(envelope["entries"])); got != "[]" {
+		t.Fatalf("empty entries=%s, want []", got)
+	}
+	loaded, err := New(path).LoadPreview()
+	if err != nil || loaded.SchemaVersion != SchemaVersion || len(loaded.Entries) != 0 {
+		t.Fatalf("empty schema-v2 registry=%#v err=%v", loaded, err)
 	}
 }
 
@@ -1315,7 +1339,7 @@ func TestAppendGCRootAttemptEnforcesRollingDistinctRootLimit(t *testing.T) {
 
 func TestStoreNormalizesFutureAttemptLedgerAndRecoversAfterOneWindow(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
-	file := File{SchemaVersion: SchemaVersion}
+	file := File{SchemaVersion: SchemaVersion, Entries: []Entry{}}
 	for index := 0; index < MaxGCRootAttempts; index++ {
 		file.GCRootAttempts = append(file.GCRootAttempts, GCRootAttempt{
 			CanonicalRoot: fmt.Sprintf("/tmp/future-root-%d", index), StartedAt: now.Add(365 * 24 * time.Hour),

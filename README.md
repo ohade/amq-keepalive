@@ -156,7 +156,9 @@ row digests and normalized missing targets, canonical AMQ and keepalive
 executables, their SHA-256 content and stable stat/ownership/mode identities,
 and lifecycle timeout. Use exactly the same options for apply; any row, target,
 path, executable content/metadata, or timeout drift invalidates the token before
-a signal. Every manual preflight and mutation reopens and rehashes both files.
+a signal. `--agents` must name every non-retired listener at that canonical root;
+an omitted same-adapter, mixed-adapter, or live sibling refuses the whole plan.
+Every manual preflight and mutation reopens and rehashes both files.
 Linux executes AMQ from the verified descriptor; macOS executes a private
 fsynced snapshot copied from that descriptor because Darwin rejects executable
 `/dev/fd` paths.
@@ -293,6 +295,9 @@ hard failure, never a silent skip. The consumer accepts additive unknown JSON
 fields for forward compatibility while still rejecting missing required
 fields, duplicate keys at any nesting depth, unknown enum values, trailing JSON,
 and unsupported schemas.
+Schema-v2 registries require an explicit non-null top-level `entries` array;
+writers emit `[]` for an empty registry. Schema-v1 migration and additive
+unknown fields remain supported.
 
 Supported hook install:
 

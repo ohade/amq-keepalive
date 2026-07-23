@@ -466,6 +466,11 @@ func (s *Store) readRegistryUnlocked() (File, []byte, bool, error) {
 	if err := requireJSONEOF(decoder); err != nil {
 		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
+	if file.SchemaVersion == SchemaVersion {
+		if err := validateSchemaV2Envelope(data); err != nil {
+			return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
+		}
+	}
 	if file.SchemaVersion == 0 {
 		file.SchemaVersion = 1
 	}
@@ -487,6 +492,22 @@ func (s *Store) readRegistryUnlocked() (File, []byte, bool, error) {
 		return File{}, nil, false, fmt.Errorf("%w %q: %w", ErrCorrupt, s.Path, err)
 	}
 	return file, data, migrateV1, nil
+}
+
+func validateSchemaV2Envelope(data []byte) error {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	entries, ok := envelope["entries"]
+	if !ok {
+		return errors.New("registry schema v2 requires top-level entries")
+	}
+	entries = bytes.TrimSpace(entries)
+	if len(entries) == 0 || entries[0] != '[' {
+		return errors.New("registry schema v2 top-level entries must be an array")
+	}
+	return nil
 }
 
 func validateNoDuplicateJSONKeys(data []byte) error {
@@ -647,6 +668,9 @@ func (s *Store) Save(file File) error {
 
 func (s *Store) saveUnlocked(file File) error {
 	file.SchemaVersion = SchemaVersion
+	if file.Entries == nil {
+		file.Entries = []Entry{}
+	}
 	if err := validateRegistryFile(file); err != nil {
 		return fmt.Errorf("refusing invalid registry state: %w", err)
 	}
