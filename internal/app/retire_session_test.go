@@ -727,6 +727,70 @@ func TestRetireSessionPartialPersistenceReplayAndCASRace(t *testing.T) {
 		}
 	})
 
+	t.Run("mixed replay reprobes receipted sibling before pending mutation", func(t *testing.T) {
+		dir := t.TempDir()
+		_, store, opts := setupLegacyRetireSession(t, dir, "alpha", "beta")
+		replaying := false
+		alphaReplayProbes := 0
+		selected := retireSessionTestAdapter{probe: func(_ context.Context, target string) error {
+			if replaying && target == "surface-alpha" {
+				alphaReplayProbes++
+				if alphaReplayProbes == 3 {
+					return nil
+				}
+			}
+			return adapter.ErrTargetNotFound
+		}}
+		lifecycle := &retireSessionTestLifecycle{
+			retireResults: map[string]amq.RetireWakeResult{"beta": {
+				Schema: 1, Status: "refused", ReasonCode: "manual_wake_changed",
+				Root: opts.Root, Agent: "beta",
+			}},
+			retireErrors: map[string]error{"beta": errors.New("synthetic post-preflight race")},
+		}
+		value, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.Apply = true
+		opts.ConfirmPlan = value.(*retireSessionPlan).PlanID
+		if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, selected); err == nil {
+			t.Fatal("partial retirement unexpectedly succeeded")
+		}
+		loaded, err := store.Load()
+		mixed := make(map[string]registry.Entry, len(loaded.Entries))
+		for _, entry := range loaded.Entries {
+			mixed[entry.Agent] = entry
+		}
+		if err != nil || !mixed["alpha"].ManualRetirementReceipt.Active() ||
+			!mixed["beta"].ManualRetirementIntent.Active() {
+			t.Fatalf("mixed replay fixture was not durable: entries=%#v err=%v", loaded.Entries, err)
+		}
+
+		replaying = true
+		delete(lifecycle.retireErrors, "beta")
+		delete(lifecycle.retireResults, "beta")
+		mutationsBefore, signalsBefore := lifecycle.retirementCall, lifecycle.signalCount
+		if _, err := (App{}).retireSessionWithOptions(context.Background(), opts, lifecycle, selected); err == nil ||
+			!strings.Contains(err.Error(), "target reappeared for agent alpha") {
+			t.Fatalf("receipted sibling barrier error=%v", err)
+		}
+		if lifecycle.retirementCall != mutationsBefore || lifecycle.signalCount != signalsBefore {
+			t.Fatalf("mixed replay mutated after failed whole-root barrier: mutations=%d->%d signals=%d->%d",
+				mutationsBefore, lifecycle.retirementCall, signalsBefore, lifecycle.signalCount)
+		}
+		loaded, err = store.Load()
+		mixed = make(map[string]registry.Entry, len(loaded.Entries))
+		for _, entry := range loaded.Entries {
+			mixed[entry.Agent] = entry
+		}
+		if err != nil || !mixed["alpha"].ManualRetirementReceipt.Active() ||
+			!mixed["beta"].ManualRetirementIntent.Active() ||
+			mixed["beta"].ManualRetirementReceipt.Active() {
+			t.Fatalf("failed replay changed durable mixed state: entries=%#v err=%v", loaded.Entries, err)
+		}
+	})
+
 	t.Run("successful replay does not signal twice", func(t *testing.T) {
 		dir := t.TempDir()
 		_, _, opts := setupLegacyRetireSession(t, dir, "alpha")

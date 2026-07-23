@@ -91,8 +91,10 @@ func Verify(expected Identity) error {
 }
 
 // CommandContext executes the verified open descriptor where the platform
-// supports it. The returned cleanup must be called after Start or Run.
-func CommandContext(ctx context.Context, expected Identity, args ...string) (*exec.Cmd, func(), error) {
+// supports it. The returned cleanup must be called after Start or Run, and its
+// error must be surfaced so verified snapshots or descriptors cannot leak
+// silently.
+func CommandContext(ctx context.Context, expected Identity, args ...string) (*exec.Cmd, func() error, error) {
 	return commandContext(ctx, expected, args...)
 }
 

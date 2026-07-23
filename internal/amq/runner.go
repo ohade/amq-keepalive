@@ -637,7 +637,7 @@ func canonicalExecutablePath(path string) (string, error) {
 	return filepath.Clean(real), nil
 }
 
-func (c CLI) runExpected(ctx context.Context, amqIdentity, injectIdentity executable.Identity, args ...string) ([]byte, string, error) {
+func (c CLI) runExpected(ctx context.Context, amqIdentity, injectIdentity executable.Identity, args ...string) (stdout []byte, stderr string, resultErr error) {
 	// A Darwin verified snapshot must never become an updater target. The
 	// manual retirement path is short-lived and already release-pinned by its
 	// executable identity, so suppress AMQ's unrelated self-update check.
@@ -646,7 +646,9 @@ func (c CLI) runExpected(ctx context.Context, amqIdentity, injectIdentity execut
 	if err != nil {
 		return nil, "", fmt.Errorf("verify AMQ executable: %w", err)
 	}
-	defer cleanup()
+	defer func() {
+		resultErr = errors.Join(resultErr, cleanup())
+	}()
 	// Open inject-via only after AMQ is pinned. Keep the exact verified file
 	// description alive through child completion, and tell AMQ which inherited
 	// descriptor carries the corresponding identity capability. On Linux the
@@ -656,7 +658,9 @@ func (c CLI) runExpected(ctx context.Context, amqIdentity, injectIdentity execut
 	if err != nil {
 		return nil, "", fmt.Errorf("verify inject-via executable: %w", err)
 	}
-	defer func() { _ = injectFile.Close() }()
+	defer func() {
+		resultErr = errors.Join(resultErr, injectFile.Close())
+	}()
 	proof, err := encodeInjectViaProof(injectIdentity)
 	if err != nil {
 		return nil, "", err
