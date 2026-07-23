@@ -140,6 +140,7 @@ func TestStartWakeRejectsChangedOrUnsafeBaselineBeforeExec(t *testing.T) {
 func TestStartWakeFailsWhenProcessExitsBeforeReady(t *testing.T) {
 	dir := t.TempDir()
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf 'invalid wake owner for this session\n' >&2
 exit 7
 `)
 
@@ -157,6 +158,29 @@ exit 7
 	}
 	if !strings.Contains(err.Error(), "amq wake exited before becoming ready") {
 		t.Fatalf("error = %v, want readiness failure", err)
+	}
+	if !strings.Contains(err.Error(), "invalid wake owner for this session") {
+		t.Fatalf("error = %v, want actionable child stderr", err)
+	}
+}
+
+func TestStartWakeDetectsAlreadyOwnedFromCapturedStderr(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf 'wake is already owned by another process\n' >&2
+exit 7
+`)
+
+	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root: "/tmp/amq-root", Me: "codex", InjectVia: "/tmp/amq-keepalive",
+		Adapter: "ghostty", Target: "ghostty:terminal:abc", WakeOwner: testWakeOwner,
+		Timeout: 5 * time.Second,
+	})
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("StartWake() error = %v, want ErrAlreadyRunning", err)
+	}
+	if !strings.Contains(err.Error(), "already owned by another process") {
+		t.Fatalf("error = %v, want captured ownership detail", err)
 	}
 }
 
@@ -331,6 +355,47 @@ sleep 0.2
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("StartWake took %s, want timeout branch to return promptly", elapsed)
+	}
+}
+
+func TestWaitForWakeReadyPrefersExitedChildOverCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan wakeProcessResult, 1)
+	done <- wakeProcessResult{Err: errors.New("exit status 9"), Stderr: "specific wake refusal"}
+
+	processDone, err := waitForWakeReady(ctx, done, filepath.Join(t.TempDir(), "missing"), time.Second)
+	if !processDone {
+		t.Fatal("waitForWakeReady() processDone = false, want true")
+	}
+	if err == nil || !strings.Contains(err.Error(), "exit status 9") || !strings.Contains(err.Error(), "specific wake refusal") {
+		t.Fatalf("waitForWakeReady() error = %v, want actual child result", err)
+	}
+}
+
+func TestWaitForWakeReadyPrefersExitedChildOverTimeout(t *testing.T) {
+	done := make(chan wakeProcessResult, 1)
+	done <- wakeProcessResult{Err: errors.New("exit status 8"), Stderr: "timeout-edge refusal"}
+
+	processDone, err := waitForWakeReady(context.Background(), done, filepath.Join(t.TempDir(), "missing"), time.Nanosecond)
+	if !processDone {
+		t.Fatal("waitForWakeReady() processDone = false, want true")
+	}
+	if err == nil || !strings.Contains(err.Error(), "exit status 8") || !strings.Contains(err.Error(), "timeout-edge refusal") {
+		t.Fatalf("waitForWakeReady() error = %v, want actual child result", err)
+	}
+}
+
+func TestBoundedCaptureReportsTruncationAndKeepsDraining(t *testing.T) {
+	capture := newBoundedCapture(8)
+	data := []byte("0123456789abcdef")
+	written, err := capture.Write(data)
+	if err != nil || written != len(data) {
+		t.Fatalf("Write() = (%d, %v), want (%d, nil)", written, err, len(data))
+	}
+	got := capture.String()
+	if !strings.HasPrefix(got, "01234567") || !strings.Contains(got, "stderr truncated after 8 bytes") {
+		t.Fatalf("String() = %q, want bounded prefix and truncation marker", got)
 	}
 }
 

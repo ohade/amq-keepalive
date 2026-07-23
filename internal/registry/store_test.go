@@ -93,6 +93,27 @@ func TestStoreRejectsNewOwnerlessEntryButLoadsLegacyRows(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsMalformedNonblankWakeOwnerOnWritePaths(t *testing.T) {
+	store := New(filepath.Join(t.TempDir(), "registry.json"))
+	malformed := Entry{
+		Root:      "/tmp/root",
+		Agent:     "codex",
+		Adapter:   "file",
+		Target:    "/tmp/inbox",
+		WakeOwner: `{"pid":4242}`,
+	}
+	if _, err := store.Upsert(malformed); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
+		t.Fatalf("Upsert(malformed owner) error = %v, want exact owner validation", err)
+	}
+	if _, _, err := store.ReplaceSessionAdapter(malformed); err == nil || !strings.Contains(err.Error(), "wake owner process start is required") {
+		t.Fatalf("ReplaceSessionAdapter(malformed owner) error = %v, want exact owner validation", err)
+	}
+	loaded, err := store.Load()
+	if err != nil || len(loaded.Entries) != 0 {
+		t.Fatalf("malformed owner mutated registry: entries=%#v err=%v", loaded.Entries, err)
+	}
+}
+
 func TestStoreForget(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
 	store := New(path)
