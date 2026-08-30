@@ -62,6 +62,66 @@ printf ready > "$ready"
 	}
 }
 
+func TestStartWakeDoesNotInheritCoopOwnerToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AMQ_WAKE_OWNER", "owner-for-the-calling-session")
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+if [ "${AMQ_WAKE_OWNER+x}" = x ]; then
+  printf 'inherited AMQ_WAKE_OWNER\n' >&2
+  exit 12
+fi
+ready=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-ready-file" ]; then ready="$arg"; fi
+  previous="$arg"
+done
+printf ready > "$ready"
+`)
+
+	err := NewCLI(fakeAMQ).StartWake(context.Background(), StartWakeRequest{
+		Root:      "/tmp/amq-root",
+		Me:        "claude",
+		InjectVia: "/tmp/amq-keepalive",
+		Adapter:   "cmux",
+		Target:    "cmux:surface:B8A8C4A7-3C88-4DAD-93BE-97E9701D07D2",
+		Timeout:   5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("StartWake() error = %v", err)
+	}
+}
+
+func TestCheckWakeParsesSchemaTwoOwnerState(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '%s\n' '{"schema":2,"agent":"codex","root":"/tmp/amq-root","wake":{"status":"valid","live":true,"owner_bound":true}}'
+`)
+
+	result, err := NewCLI(fakeAMQ).CheckWake(context.Background(), "/tmp/amq-root", "codex")
+	if err != nil {
+		t.Fatalf("CheckWake() error = %v", err)
+	}
+	if result.Schema != 2 || !result.Wake.Live || !result.Wake.OwnerBound || result.Wake.Status != "valid" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestRecoverOwnerWakeParsesRecoveredResult(t *testing.T) {
+	dir := t.TempDir()
+	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh
+printf '%s\n' '{"status":"recovered","agent":"codex","root":"/tmp/amq-root","pid":4242,"owner_pid":4000,"owner_session":3999}'
+`)
+
+	result, err := NewCLI(fakeAMQ).RecoverOwnerWake(context.Background(), "/tmp/amq-root", "codex")
+	if err != nil {
+		t.Fatalf("RecoverOwnerWake() error = %v", err)
+	}
+	if result.Status != "recovered" || result.PID != 4242 || result.OwnerPID != 4000 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestStartWakeFailsWhenProcessExitsBeforeReady(t *testing.T) {
 	dir := t.TempDir()
 	fakeAMQ := writeExecutable(t, filepath.Join(dir, "amq"), `#!/bin/sh

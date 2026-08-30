@@ -58,17 +58,38 @@ CLI directory.
 ## Example
 
 ```sh
-go build ./cmd/amq-keepalive
+make build
 
-./amq-keepalive attach \
+./bin/amq-keepalive attach \
   --adapter file \
   --target /tmp/amq-keepalive-inbox.txt \
   --no-start
 
-./amq-keepalive supervise --once
+./bin/amq-keepalive supervise --once
 
-./amq-keepalive doctor
+./bin/amq-keepalive doctor
 ```
+
+## Version reporting
+
+`amq-keepalive -v`, `amq-keepalive --version`, and `amq-keepalive version`
+each print the build version as one line. `make build` stamps that version from
+`git describe --tags --always --dirty` and writes the binary to
+`./bin/amq-keepalive`.
+
+The equivalent direct build command is:
+
+```sh
+go build \
+  -ldflags "-X github.com/ohade/amq-keepalive/internal/app.Version=$(git describe --tags --always --dirty)" \
+  -o ./bin/amq-keepalive \
+  ./cmd/amq-keepalive
+```
+
+A plain `go build` has no explicit stamp. In that case the version command
+falls back to Go's embedded build information: the module version followed by
+`vcs.revision` and `vcs.modified` when those settings are available. If Go has
+no embedded build information, it reports `dev`.
 
 Ghostty attach:
 
@@ -94,7 +115,22 @@ new target to the supervisor. This keeps the registry from accumulating stale
 terminal ids or claiming a cmux attachment while Ghostty is still live. Use
 `--wake-ready-timeout` on `attach`, `reattach`, or `supervise` to adjust the
 readiness wait; the default is 10 seconds. This requires an AMQ build that
-supports `--accept-existing-wake` target verification.
+supports `--accept-existing-wake` target verification. Managed wake startup
+uses a fresh OS session so a short-lived launcher or hook cannot deliver
+`SIGHUP` after readiness. Callers creating a wake outside their own co-op
+ownership boundary must remove `AMQ_WAKE_OWNER`; callers running inside the
+matching co-op agent retain it.
+
+For a launcher recreating a terminal, add `--retire-detached`. This opt-in path
+looks up the prior registration for the same AMQ root and agent. If its adapter
+target is independently proven gone, it first asks AMQ's target-aware wake start
+to converge on the new exact target. An already-absent lock starts directly. A
+live old wake rejects that start without mutation, after which `amq wake retire`
+must revalidate the saved process and injector identity before one bounded retry.
+If the old wake exits during that handoff, the retry safely acquires the now-free
+lock. Registry replacement still happens only after wake readiness. A live old
+target, ambiguous probe, missing registry identity, or unresolved retirement/start
+mismatch fails closed; no active wake is retargeted.
 
 Safe detached-session retirement:
 
@@ -108,12 +144,16 @@ Safe detached-session retirement:
 `retire-session` is the inverse lifecycle path for a terminal workspace that
 was deleted while its AMQ wakes remained alive. Before touching AMQ it requires
 exactly one registry entry per requested agent and independently proves every
-registered cmux surface is missing. It then asks `amq wake retire` to verify the
-live process identity, unchanged lock, injector executable, adapter, and exact
-surface target before signaling. Only successfully retired entries are removed
-from the keepalive registry; the AMQ session directory, mailbox history, and
-saved wake target are preserved for fresh agents to reuse. Any ambiguous probe,
-target mismatch, unverified lock, or ownership race fails closed.
+registered cmux surface is missing. It reads AMQ's schema-2 wake classification,
+uses `amq wake recover-owner` for an owner-bound claim, and otherwise asks
+`amq wake retire` to verify the live process identity, unchanged lock, injector
+executable, adapter, and exact surface target before signaling. A proven-missing
+wake is already retired. Only successfully recovered, retired, or already-absent
+entries are removed from the keepalive registry; the AMQ session directory,
+mailbox history, and saved wake target are preserved for fresh agents to reuse.
+Any ambiguous probe, target mismatch, unverified lock, or ownership race fails
+closed. Older AMQ versions without schema-2 wake checks retain the exact
+`wake retire` path.
 
 Supported hook install:
 
@@ -207,7 +247,8 @@ and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
 
 - The tool does not parse AMQ mailbox, lock, presence, or target files.
 - The tool does not launch or resurrect terminal sessions.
-- `retire-session` delegates wake-lock identity verification and signaling to
+- `retire-session` delegates wake-lock classification, owner recovery, identity
+  verification, and signaling to `amq wake check`, `amq wake recover-owner`, and
   `amq wake retire`; keepalive still does not parse AMQ lock or target files.
 - Adapter targets should use an explicit scheme shape:
   `<adapter>:<scheme>:<value>`. The supported terminal schemes are
@@ -219,10 +260,13 @@ and `amq-keepalive inject <adapter> <target> <payload>` hands it to the adapter.
   terminal id survives process or machine restart. The recreated session
   registers its current target.
 - `reattach` never retargets a live wake implicitly. A matching live target is
-  verified, while a differing target fails closed and logs the mismatch without
-  changing the registry. Stale/dead wake locks are replaced by AMQ's target-aware
-  start using the registry target; keepalive does not resurrect an older saved
-  adapter through `amq wake repair` first.
+  verified, while a differing live target fails closed and logs the mismatch
+  without changing the registry. With explicit `--retire-detached`, only a saved
+  target proven gone enters bounded recovery: AMQ's target-aware start handles a
+  missing lock directly, while a blocking live old wake must be identity-checked
+  and retired before one retry. Stale/dead wake locks are otherwise replaced by
+  AMQ's target-aware start using the registry target; keepalive does not resurrect
+  an older saved adapter through `amq wake repair` first.
 - Supervisor failures emit a transition-only warning with root, agent, adapter,
   target, failure count, and error; repeated checks during the same backoff do
   not spam stderr.

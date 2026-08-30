@@ -47,6 +47,28 @@ type WakeRetireResult struct {
 	Error  string `json:"error,omitempty"`
 }
 
+type WakeCheckResult struct {
+	Schema int    `json:"schema"`
+	Agent  string `json:"agent"`
+	Root   string `json:"root"`
+	Wake   struct {
+		Status     string `json:"status"`
+		Live       bool   `json:"live"`
+		OwnerBound bool   `json:"owner_bound"`
+	} `json:"wake"`
+}
+
+type WakeOwnerRecoverResult struct {
+	Status       string `json:"status"`
+	Agent        string `json:"agent,omitempty"`
+	Root         string `json:"root,omitempty"`
+	PID          int    `json:"pid,omitempty"`
+	OwnerPID     int    `json:"owner_pid,omitempty"`
+	OwnerSession int    `json:"owner_session,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	NextAction   string `json:"next_action,omitempty"`
+}
+
 func (r WakeRepairResult) Text() string {
 	return strings.TrimSpace(strings.Join([]string{r.Status, r.Reason, r.Message, r.Error}, " "))
 }
@@ -157,6 +179,65 @@ func (c CLI) RetireWake(ctx context.Context, req RetireWakeRequest) (WakeRetireR
 	return result, nil
 }
 
+func (c CLI) CheckWake(ctx context.Context, root, me string) (WakeCheckResult, error) {
+	args := []string{"wake", "check", "-json", "-json-schema", "2"}
+	if root != "" {
+		args = append(args, "-root", root)
+	}
+	if me != "" {
+		args = append(args, "-me", me)
+	}
+	stdout, stderr, err := c.run(ctx, args...)
+	var result WakeCheckResult
+	if parseErr := json.Unmarshal(stdout, &result); parseErr != nil {
+		if err != nil {
+			return WakeCheckResult{}, fmt.Errorf("amq wake check failed: %w: %s", err, strings.TrimSpace(stderr))
+		}
+		return WakeCheckResult{}, fmt.Errorf("parse amq wake check: %w", parseErr)
+	}
+	if err != nil {
+		return result, fmt.Errorf("amq wake check failed: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	if result.Schema != 2 {
+		return result, fmt.Errorf("amq wake check returned schema %d, want 2", result.Schema)
+	}
+	if me != "" && result.Agent != me {
+		return result, fmt.Errorf("amq wake check returned agent %q, want %q", result.Agent, me)
+	}
+	if root != "" && filepath.Clean(result.Root) != filepath.Clean(root) {
+		return result, fmt.Errorf("amq wake check returned root %q, want %q", result.Root, root)
+	}
+	return result, nil
+}
+
+func (c CLI) RecoverOwnerWake(ctx context.Context, root, me string) (WakeOwnerRecoverResult, error) {
+	args := []string{"wake", "recover-owner", "-json"}
+	if root != "" {
+		args = append(args, "-root", root)
+	}
+	if me != "" {
+		args = append(args, "-me", me)
+	}
+	stdout, stderr, err := c.run(ctx, args...)
+	var result WakeOwnerRecoverResult
+	if parseErr := json.Unmarshal(stdout, &result); parseErr != nil {
+		if err != nil {
+			return WakeOwnerRecoverResult{}, fmt.Errorf("amq wake recover-owner failed: %w: %s", err, strings.TrimSpace(stderr))
+		}
+		return WakeOwnerRecoverResult{}, fmt.Errorf("parse amq wake recover-owner: %w", parseErr)
+	}
+	if err != nil {
+		return result, fmt.Errorf("amq wake recover-owner failed: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	if me != "" && result.Agent != me {
+		return result, fmt.Errorf("amq wake recover-owner returned agent %q, want %q", result.Agent, me)
+	}
+	if root != "" && filepath.Clean(result.Root) != filepath.Clean(root) {
+		return result, fmt.Errorf("amq wake recover-owner returned root %q, want %q", result.Root, root)
+	}
+	return result, nil
+}
+
 func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	if req.InjectVia == "" {
 		return errors.New("inject-via executable is required")
@@ -192,6 +273,16 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 	)
 
 	cmd := exec.CommandContext(ctx, c.Path, args...)
+	// amq-keepalive owns this managed wake. A caller may itself be running under
+	// `amq coop exec` and therefore carry an AMQ_WAKE_OWNER token for a different
+	// agent/root. Forwarding that token binds the new wake to the caller's
+	// lifecycle and makes exact target retirement impossible from its real
+	// surface. Plain managed wakes must remain ownerless.
+	cmd.Env = environmentWithout(os.Environ(), "AMQ_WAKE_OWNER")
+	// A managed wake must outlive short-lived launchers and SessionStart hooks.
+	// Starting it in a fresh OS session prevents their terminal teardown from
+	// delivering SIGHUP to the wake after readiness has already been reported.
+	cmd.SysProcAttr = detachedWakeSysProcAttr()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -212,6 +303,18 @@ func (c CLI) StartWake(ctx context.Context, req StartWakeRequest) error {
 		return err
 	}
 	return nil
+}
+
+func environmentWithout(environment []string, name string) []string {
+	prefix := name + "="
+	filtered := make([]string, 0, len(environment))
+	for _, item := range environment {
+		if strings.HasPrefix(item, prefix) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func (c CLI) run(ctx context.Context, args ...string) ([]byte, string, error) {
