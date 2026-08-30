@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -19,6 +20,11 @@ import (
 	"github.com/ohade/amq-keepalive/internal/registry"
 	"github.com/ohade/amq-keepalive/internal/supervisor"
 )
+
+const defaultVersion = "dev"
+
+// Version is replaced at build time with -ldflags "-X github.com/ohade/amq-keepalive/internal/app.Version=<value>".
+var Version = defaultVersion
 
 type App struct {
 	Stdout io.Writer
@@ -41,6 +47,9 @@ func (a App) Run(ctx context.Context, args []string) int {
 	switch args[0] {
 	case "-h", "--help", "help":
 		a.usage(a.Stdout)
+		return 0
+	case "-v", "--version", "version":
+		fmt.Fprintln(a.Stdout, resolvedVersion())
 		return 0
 	case "attach":
 		err = a.attach(ctx, args[1:])
@@ -75,18 +84,19 @@ func (a App) Run(ctx context.Context, args []string) int {
 }
 
 type registerOptions struct {
-	RegistryPath string
-	AdapterName  string
-	Target       string
-	Root         string
-	BaseRoot     string
-	SessionName  string
-	Me           string
-	AMQPath      string
-	Self         string
-	WakeTimeout  time.Duration
-	NoStart      bool
-	Replace      bool
+	RegistryPath   string
+	AdapterName    string
+	Target         string
+	Root           string
+	BaseRoot       string
+	SessionName    string
+	Me             string
+	AMQPath        string
+	Self           string
+	WakeTimeout    time.Duration
+	NoStart        bool
+	Replace        bool
+	RetireDetached bool
 }
 
 type registerResult struct {
@@ -120,22 +130,24 @@ func (a App) register(ctx context.Context, args []string, replace bool) error {
 	self := fs.String("self", executablePath(), "amq-keepalive executable path for --inject-via")
 	wakeTimeout := fs.Duration("wake-ready-timeout", 10*time.Second, "maximum time to wait for amq wake readiness")
 	noStart := fs.Bool("no-start", false, "register without starting/reconciling wake")
+	retireDetached := fs.Bool("retire-detached", false, "before reattach, retire an older registered wake only when its adapter target is proven gone")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	return a.registerWithOptions(ctx, registerOptions{
-		RegistryPath: *registryPath,
-		AdapterName:  *adapterName,
-		Target:       *target,
-		Root:         *root,
-		BaseRoot:     *baseRoot,
-		SessionName:  *sessionName,
-		Me:           *me,
-		AMQPath:      *amqPath,
-		Self:         *self,
-		WakeTimeout:  *wakeTimeout,
-		NoStart:      *noStart,
-		Replace:      replace,
+		RegistryPath:   *registryPath,
+		AdapterName:    *adapterName,
+		Target:         *target,
+		Root:           *root,
+		BaseRoot:       *baseRoot,
+		SessionName:    *sessionName,
+		Me:             *me,
+		AMQPath:        *amqPath,
+		Self:           *self,
+		WakeTimeout:    *wakeTimeout,
+		NoStart:        *noStart,
+		Replace:        replace,
+		RetireDetached: *retireDetached,
 	})
 }
 
@@ -207,11 +219,21 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 
 	if opts.Replace {
 		if !opts.NoStart {
-			updated, result := reconciler.StartFresh(ctx, next)
-			if result.Error != nil {
-				return result.Error
+			wakeStarted := false
+			if opts.RetireDetached {
+				var err error
+				next, wakeStarted, err = recoverDetachedRegistration(ctx, store, adapters, envCLI, reconciler, next, opts.Self)
+				if err != nil {
+					return err
+				}
 			}
-			next = updated
+			if !wakeStarted {
+				updated, result := reconciler.StartFresh(ctx, next)
+				if result.Error != nil {
+					return result.Error
+				}
+				next = updated
+			}
 		}
 		entry, removed, err := store.ReplaceSessionAdapter(next)
 		if err != nil {
@@ -235,6 +257,103 @@ func (a App) registerWithOptions(ctx context.Context, opts registerOptions) erro
 		}
 	}
 	return printJSON(a.Stdout, entry)
+}
+
+// recoverDetachedRegistration is the narrow recovery path for a recreated
+// terminal. It never retargets a live wake: the previously registered adapter
+// target must be independently proven absent. It first asks AMQ's atomic wake
+// start path to converge on the new exact target, which handles an already
+// absent lock without requiring retirement. If a live old wake blocks that
+// start, AMQ must verify and retire the exact saved injector identity before a
+// single retry. Registry replacement remains the caller's final step after
+// wake readiness.
+func recoverDetachedRegistration(
+	ctx context.Context,
+	store *registry.Store,
+	adapters adapter.Registry,
+	cli amq.CLI,
+	reconciler supervisor.Reconciler,
+	next registry.Entry,
+	self string,
+) (registry.Entry, bool, error) {
+	file, err := store.Load()
+	if err != nil {
+		return next, false, err
+	}
+	matches := make([]registry.Entry, 0, 1)
+	for _, entry := range file.Entries {
+		if entry.Root == next.Root && entry.Agent == next.Agent {
+			matches = append(matches, entry)
+		}
+	}
+	if len(matches) == 0 {
+		return next, false, nil
+	}
+	if len(matches) != 1 {
+		return next, false, fmt.Errorf("refusing detached wake recovery for %s at %s: expected one registry entry, found %d", next.Agent, next.Root, len(matches))
+	}
+	previous := matches[0]
+	if previous.Adapter == next.Adapter && previous.Target == next.Target {
+		return next, false, nil
+	}
+	previousAdapter, err := adapters.Get(previous.Adapter)
+	if err != nil {
+		return next, false, fmt.Errorf("load previous adapter %s: %w", previous.Adapter, err)
+	}
+	if normalizer, ok := previousAdapter.(adapter.TargetNormalizer); ok {
+		previous.Target, err = normalizer.NormalizeTarget(previous.Target)
+		if err != nil {
+			return next, false, fmt.Errorf("normalize previous target for %s: %w", previous.Agent, err)
+		}
+	}
+	probeErr := previousAdapter.Probe(ctx, previous.Target)
+	if probeErr == nil {
+		return next, false, nil
+	}
+	if !errors.Is(probeErr, adapter.ErrTargetNotFound) {
+		return next, false, fmt.Errorf("refusing detached wake recovery for %s because target absence is not proven: %w", previous.Agent, probeErr)
+	}
+
+	updated, initialStart := reconciler.StartFresh(ctx, next)
+	if initialStart.Error == nil {
+		return updated, true, nil
+	}
+
+	retired, err := cli.RetireWake(ctx, amq.RetireWakeRequest{
+		Root:      previous.Root,
+		Me:        previous.Agent,
+		InjectVia: self,
+		Adapter:   previous.Adapter,
+		Target:    previous.Target,
+	})
+	retireErr := err
+	if retireErr == nil && retired.Status != "retired" {
+		retireErr = fmt.Errorf("unexpected status %q", retired.Status)
+	}
+
+	// Retirement can race with an old wake exiting after the initial start
+	// attempt. Retry the atomic start once even when retirement reports that no
+	// lock remains. Any live mismatched or unverified lock still fails closed in
+	// AMQ's target-aware start path.
+	updated, retryStart := reconciler.StartFresh(ctx, next)
+	if retryStart.Error == nil {
+		return updated, true, nil
+	}
+	if retireErr != nil {
+		return next, false, fmt.Errorf(
+			"recover detached %s wake: initial start failed: %v; retirement failed: %v; retry start failed: %w",
+			previous.Agent,
+			initialStart.Error,
+			retireErr,
+			retryStart.Error,
+		)
+	}
+	return next, false, fmt.Errorf(
+		"recover detached %s wake: initial start failed: %v; exact retirement succeeded; retry start failed: %w",
+		previous.Agent,
+		initialStart.Error,
+		retryStart.Error,
+	)
 }
 
 func (a App) supervise(ctx context.Context, args []string) error {
@@ -490,6 +609,32 @@ func (a App) retireSession(ctx context.Context, args []string) error {
 		return nil
 	}
 	for _, entry := range entries {
+		checked, checkErr := cli.CheckWake(ctx, root, entry.Agent)
+		if checkErr == nil && checked.Wake.Status == "missing" && !checked.Wake.Live {
+			result.Entries = append(result.Entries, retiredSessionEntry{
+				ID: entry.ID, Agent: entry.Agent, Target: entry.Target, Status: "absent",
+			})
+			continue
+		}
+		if checkErr == nil && checked.Wake.OwnerBound {
+			recovered, recoverErr := cli.RecoverOwnerWake(ctx, root, entry.Agent)
+			if recoverErr != nil {
+				if forgetErr := forgetRetired(); forgetErr != nil {
+					return fmt.Errorf("recover %s owner-bound wake: %v; also failed to forget already-retired entries: %w", entry.Agent, recoverErr, forgetErr)
+				}
+				return fmt.Errorf("recover %s owner-bound wake: %w", entry.Agent, recoverErr)
+			}
+			if recovered.Status != "recovered" {
+				if forgetErr := forgetRetired(); forgetErr != nil {
+					return fmt.Errorf("recover %s owner-bound wake returned unexpected status %q; also failed to forget already-retired entries: %w", entry.Agent, recovered.Status, forgetErr)
+				}
+				return fmt.Errorf("recover %s owner-bound wake returned unexpected status %q", entry.Agent, recovered.Status)
+			}
+			result.Entries = append(result.Entries, retiredSessionEntry{
+				ID: entry.ID, Agent: entry.Agent, Target: entry.Target, Status: recovered.Status, PID: recovered.PID,
+			})
+			continue
+		}
 		retired, retireErr := cli.RetireWake(ctx, amq.RetireWakeRequest{
 			Root:      root,
 			Me:        entry.Agent,
@@ -632,7 +777,36 @@ func (a App) uninstallLaunchd(ctx context.Context, args []string) error {
 }
 
 func (a App) usage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: amq-keepalive <attach|reattach|supervise|inject|doctor|retire-session|forget|install-launchd|install-hook|uninstall> [options]")
+	fmt.Fprintln(writer, "usage: amq-keepalive <version|attach|reattach|supervise|inject|doctor|retire-session|forget|install-launchd|install-hook|uninstall> [options]")
+}
+
+func resolvedVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	return resolveVersion(Version, info, ok)
+}
+
+func resolveVersion(stamp string, info *debug.BuildInfo, ok bool) string {
+	if stamp != "" && stamp != defaultVersion {
+		return stamp
+	}
+	if !ok || info == nil {
+		return defaultVersion
+	}
+
+	version := info.Main.Version
+	if version == "" {
+		version = defaultVersion
+	}
+	settings := make(map[string]string, len(info.Settings))
+	for _, setting := range info.Settings {
+		settings[setting.Key] = setting.Value
+	}
+	for _, key := range []string{"vcs.revision", "vcs.modified"} {
+		if value := settings[key]; value != "" {
+			version += fmt.Sprintf(" %s=%s", key, value)
+		}
+	}
+	return version
 }
 
 func mustDefaultRegistryPath() string {
